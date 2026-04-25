@@ -91,20 +91,22 @@ Streaming spans propagate context properly — any `@prometa.tool` /
 `@prometa.agent` invoked from inside the stream consumer nests under
 the LLM span, not under whatever was active when `.create()` returned.
 
-### A note on the trace "Conversation" panel
+### How the trace "Conversation" panel populates
 
-The Prometa trace UI renders a **Conversation** panel that reads from a
-dedicated `prometa.conversation_turns` ClickHouse table. As of platform
-version compatible with this SDK release, **no ingest path writes to
-that table** — so the panel will show *"No conversation turns recorded
-for this trace."* even with auto-instrumentation enabled.
+The Prometa trace UI renders a **Conversation** panel that derives turns
+directly from the `gen_ai.prompt` / `gen_ai.completion` span attributes
+emitted by the integrations on this page. Each LLM span becomes a
+`user` turn (the latest user message extracted from `gen_ai.prompt`)
+followed by an `agent` turn (the completion). Token counts and
+timestamps come straight off the span — nothing else needs to be wired
+up on the platform side.
 
-The prompt/completion text is still captured as `gen_ai.prompt` /
-`gen_ai.completion` span attributes and is queryable from the Spans
-table, the trace export API, and any downstream LLM-as-a-Judge / replay
-tooling. The Conversation panel itself will start populating once the
-platform team wires the OTLP ingest handler to fan-out span attributes
-into `prometa.conversation_turns` (tracked separately).
+The **After preprocessing** vs **Raw** toggle is also rendered, but
+both modes show the same text until the platform's PII redactor /
+policy gate ships and starts populating the `prometa.conversation_turns`
+table. When that lands, the panel will switch back to reading the
+processed-vs-raw pair from that table; the SDK contract does not
+change.
 
 ## Configuration
 

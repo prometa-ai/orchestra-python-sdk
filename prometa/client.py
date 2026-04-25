@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 # Kept in sync with prometa.__version__ — surfaced as the OTLP
 # instrumentation-scope version so the platform can group spans by SDK
 # release for compatibility tracking.
-_SCOPE_VERSION = "0.2.0"
+_SCOPE_VERSION = "0.2.2"
 
 
 def _now_unix_nano() -> int:

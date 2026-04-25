@@ -51,8 +51,51 @@ Each decorated function emits a span with:
 - `prometa.kind` — `workflow | agent | tool | task`
 - `prometa.solution_id`, `prometa.stage`
 - `gen_ai.agent.name`, `gen_ai.agent.id`
+- `gen_ai.conversation.id` — when the producer opts into session grouping (see below)
 - Parent/child relationships across async/sync calls
 - Errors → span status `error` plus `error.message`
+
+## Grouping traces into conversational sessions
+
+A chat-style agent typically produces many traces per user conversation
+(one per message turn, one per background tool call, one per retry).
+The platform's **Session Explorer** groups all traces sharing a session
+id into one row, with aggregated cost, tokens, duration, and a
+side-by-side conversation timeline that spans the whole session.
+
+To opt in, stamp the session id on the current span — anywhere inside
+a `@prometa.workflow / .agent / .tool / .task` block:
+
+```python
+from prometa import set_session_id
+
+@prometa.workflow(name="handle-turn")
+async def handle_turn(conversation_id: str, user_message: str):
+    set_session_id(conversation_id)   # any opaque key your app uses
+    # ... do the work; nested spans inherit automatically
+```
+
+Or, when the id is known at decorator time, use the `session_id=` kwarg:
+
+```python
+@prometa.workflow(name="handle-turn", session_id=conversation_id)
+async def handle_turn(...): ...
+```
+
+Either form writes the OTel-standard `gen_ai.conversation.id` attribute
+onto the span; the platform ingest reads it (and accepts `session.id`
+or `prometa.session_id` as fallbacks for non-Prometa producers) and
+propagates it onto every span + the trace row at write time. Nothing
+else needs to be configured.
+
+**Use opaque ids, not user-identifying values.** The session id is
+indexed and visible to anyone with `traces:read` permission. Don't
+stuff emails, names, or PII in there.
+
+**Session retention** mirrors trace retention (currently 365 days).
+Long-running sessions touching old + new traces will appear truncated
+once the oldest member trace ages out — acceptable for chat workloads,
+flag if you have multi-week audit needs.
 
 ## LLM client auto-instrumentation
 

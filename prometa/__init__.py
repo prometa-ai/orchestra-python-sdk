@@ -28,8 +28,9 @@ Quick start:
 from .client import Prometa
 from .decorators import workflow, agent, tool, task
 from .budget import TokenBudget, BudgetExceededError
+from .session import set_session_id, get_session_id
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 __all__ = [
     "Prometa",
     "workflow",
@@ -38,4 +39,6 @@ __all__ = [
     "task",
     "TokenBudget",
     "BudgetExceededError",
+    "set_session_id",
+    "get_session_id",
 ]

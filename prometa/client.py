@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 # Kept in sync with prometa.__version__ — surfaced as the OTLP
 # instrumentation-scope version so the platform can group spans by SDK
 # release for compatibility tracking.
-_SCOPE_VERSION = "0.2.2"
+_SCOPE_VERSION = "0.3.0"
 
 
 def _now_unix_nano() -> int:
@@ -98,23 +98,37 @@ class Prometa:
     # Decorator entry points (also exported as module-level helpers)
     # ------------------------------------------------------------------
 
-    def workflow(self, name: Optional[str] = None) -> Callable:
-        return self._decorator("workflow", name)
+    def workflow(
+        self, name: Optional[str] = None, *, session_id: Optional[str] = None
+    ) -> Callable:
+        return self._decorator("workflow", name, session_id=session_id)
 
-    def agent(self, name: Optional[str] = None) -> Callable:
-        return self._decorator("agent", name)
+    def agent(
+        self, name: Optional[str] = None, *, session_id: Optional[str] = None
+    ) -> Callable:
+        return self._decorator("agent", name, session_id=session_id)
 
-    def tool(self, name: Optional[str] = None) -> Callable:
-        return self._decorator("tool", name)
+    def tool(
+        self, name: Optional[str] = None, *, session_id: Optional[str] = None
+    ) -> Callable:
+        return self._decorator("tool", name, session_id=session_id)
 
-    def task(self, name: Optional[str] = None) -> Callable:
-        return self._decorator("task", name)
+    def task(
+        self, name: Optional[str] = None, *, session_id: Optional[str] = None
+    ) -> Callable:
+        return self._decorator("task", name, session_id=session_id)
 
     # ------------------------------------------------------------------
     # Internal: decorator factory & manual span context
     # ------------------------------------------------------------------
 
-    def _decorator(self, kind: str, name: Optional[str]) -> Callable:
+    def _decorator(
+        self,
+        kind: str,
+        name: Optional[str],
+        *,
+        session_id: Optional[str] = None,
+    ) -> Callable:
         def wrap(fn: Callable) -> Callable:
             span_name = name or fn.__name__
             import asyncio
@@ -124,7 +138,7 @@ class Prometa:
 
                 @functools.wraps(fn)
                 async def aw(*args, **kwargs):
-                    with self._span(kind, span_name) as span:
+                    with self._span(kind, span_name, session_id=session_id) as span:
                         try:
                             return await fn(*args, **kwargs)
                         except Exception as e:
@@ -136,7 +150,7 @@ class Prometa:
 
             @functools.wraps(fn)
             def sw(*args, **kwargs):
-                with self._span(kind, span_name) as span:
+                with self._span(kind, span_name, session_id=session_id) as span:
                     try:
                         return fn(*args, **kwargs)
                     except Exception as e:
@@ -149,11 +163,29 @@ class Prometa:
         return wrap
 
     @contextmanager
-    def _span(self, kind: str, name: str) -> Iterator[_Span]:
+    def _span(
+        self,
+        kind: str,
+        name: str,
+        *,
+        session_id: Optional[str] = None,
+    ) -> Iterator[_Span]:
         from . import _context  # local to avoid circular at import time
 
         parent = _context.current_span()
         trace_id = parent.trace_id if parent else _new_id(32)
+        # Session id resolution order:
+        #   1. Explicit session_id passed to the decorator (most specific).
+        #   2. Inherit from parent span (set by an outer @workflow or
+        #      set_session_id() call on a higher span).
+        # If neither, the attribute stays empty and the trace gets no
+        # session grouping — which is the documented opt-out.
+        inherited_session = ""
+        if parent is not None:
+            inherited_session = parent.attributes.get(
+                "gen_ai.conversation.id", ""
+            )
+        effective_session = session_id or inherited_session
         span = _Span(
             name=name,
             kind=kind,
@@ -167,6 +199,11 @@ class Prometa:
                 "prometa.stage": self.stage,
                 "gen_ai.agent.name": self.agent_name,
                 "gen_ai.agent.id": self.agent_id,
+                **(
+                    {"gen_ai.conversation.id": effective_session}
+                    if effective_session
+                    else {}
+                ),
             },
         )
         token = _context.push(span)

@@ -29,7 +29,7 @@ from .client import Prometa
 from .decorators import workflow, agent, tool, task
 from .budget import TokenBudget, BudgetExceededError
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 __all__ = [
     "Prometa",
     "workflow",

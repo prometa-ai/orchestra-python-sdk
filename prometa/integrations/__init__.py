@@ -12,6 +12,9 @@ from . import crewai  # noqa: F401
 from . import semantic_kernel  # noqa: F401
 from . import mcp  # noqa: F401
 from . import vector  # noqa: F401
+from . import openai  # noqa: F401  (LLM-client patcher; distinct from openai_agents)
+from . import anthropic  # noqa: F401
+from . import google  # noqa: F401
 
 __all__ = [
     "langchain",
@@ -21,4 +24,7 @@ __all__ = [
     "semantic_kernel",
     "mcp",
     "vector",
+    "openai",
+    "anthropic",
+    "google",
 ]

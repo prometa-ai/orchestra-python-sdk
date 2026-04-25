@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 
+# Kept in sync with prometa.__version__ — surfaced as the OTLP
+# instrumentation-scope version so the platform can group spans by SDK
+# release for compatibility tracking.
+_SCOPE_VERSION = "0.2.0"
+
+
 def _now_unix_nano() -> int:
     return time.time_ns()
 
@@ -232,7 +238,7 @@ class Prometa:
                     },
                     "scopeSpans": [
                         {
-                            "scope": {"name": "prometa-sdk", "version": "0.1.0"},
+                            "scope": {"name": "prometa-sdk", "version": _SCOPE_VERSION},
                             "spans": [
                                 {
                                     "traceId": s.trace_id,

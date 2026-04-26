@@ -151,6 +151,33 @@ table. When that lands, the panel will switch back to reading the
 processed-vs-raw pair from that table; the SDK contract does not
 change.
 
+## Reliability & retry semantics
+
+The SDK ships traces over OTLP/JSON with **at-least-once** delivery: a
+background thread flushes the in-memory span buffer every
+`flush_interval_seconds` (default `2.0`), and on any send failure
+(network blip, timeout, slow server response) the spans are
+re-buffered and retried on the next flush.
+
+**The platform deduplicates by id at the storage layer.**
+`prometa.spans` and `prometa.traces` are backed by ClickHouse's
+`ReplacingMergeTree` (or `SharedReplacingMergeTree` on ClickHouse
+Cloud), keyed by `(trace_id, span_id)` and `(org_id, trace_id)`
+respectively. Any number of duplicate sends of the same span collapse
+to a single row during background merges; user-facing read paths
+(trace explorer, session explorer, conversation panel, cost panels)
+use `SELECT … FINAL` to enforce dedup at read time too. Cost and
+token aggregates are not inflated by retries.
+
+**Net: use the default `flush_interval_seconds=2.0`** even on
+long-running requests (RAG pipelines, multi-round tool loops, chat
+turns spanning tens of seconds). No consumer-side workaround needed.
+
+If you previously raised the interval (e.g. to `120.0`) to dodge
+platform-side double-counting in the cost / conversation panels, you
+can revert to the default. The platform-side dedup landed in the
+release alongside this SDK version (see CHANGELOG.md).
+
 ## Configuration
 
 | Param | Env var | Default |

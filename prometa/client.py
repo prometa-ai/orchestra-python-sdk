@@ -18,10 +18,28 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 
-# Kept in sync with prometa.__version__ — surfaced as the OTLP
-# instrumentation-scope version so the platform can group spans by SDK
-# release for compatibility tracking.
-_SCOPE_VERSION = "0.3.2"
+# OTLP instrumentation-scope version, surfaced so the platform can group
+# spans by SDK release for compatibility tracking. Derived at import
+# time from the installed package metadata (i.e. pyproject.toml's
+# version field) so it can never drift out of sync with the published
+# package — the prior hardcoded mirror was missed by the release
+# workflow's sed pass and got out of step on every release.
+#
+# Source-checkout fallback: when the package isn't pip-installed
+# (typical during development / running tests against the source
+# tree), `version("prometa-sdk")` raises PackageNotFoundError. Spans
+# emitted in that mode get scope.version="0.0.0+source", which is
+# informative on the platform side ("this came from a dev checkout,
+# not a release").
+try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    try:
+        _SCOPE_VERSION = _pkg_version("prometa-sdk")
+    except PackageNotFoundError:
+        _SCOPE_VERSION = "0.0.0+source"
+    del _pkg_version, PackageNotFoundError
+except ImportError:  # pragma: no cover — Python <3.8 fallback, not really reachable
+    _SCOPE_VERSION = "0.0.0+source"
 
 
 def _now_unix_nano() -> int:

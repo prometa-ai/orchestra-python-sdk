@@ -67,9 +67,23 @@ def _request_attrs(kwargs: dict) -> dict:
     messages = kwargs.get("messages")
     if messages is not None:
         out["gen_ai.prompt"] = _c.truncate(_c.safe_json(messages))
+        # Pre-extract the latest user-role message into a separate
+        # attribute so the trace UI's Conversation panel can surface
+        # the user's actual question even when the full messages JSON
+        # truncates mid-array (typical for long chat histories with
+        # multi-KB system prompts). Extraction happens BEFORE
+        # truncation, on the in-memory list, so it can never fail
+        # because of payload size.
+        user_text = _c.extract_last_user_text(messages)
+        if user_text:
+            out["gen_ai.prompt.user"] = _c.truncate(user_text)
     elif "input" in kwargs:  # responses API
-        out["gen_ai.prompt"] = _c.truncate(_c.safe_json(kwargs["input"]))
+        prompt_in = kwargs["input"]
+        out["gen_ai.prompt"] = _c.truncate(_c.safe_json(prompt_in))
         out["gen_ai.operation.name"] = "responses"
+        user_text = _c.extract_last_user_text(prompt_in)
+        if user_text:
+            out["gen_ai.prompt.user"] = _c.truncate(user_text)
     return out
 
 

@@ -77,6 +77,14 @@ def _request_attrs(kwargs: dict) -> dict:
         prompt_payload["messages"] = messages
     if prompt_payload:
         out["gen_ai.prompt"] = _c.truncate(_c.safe_json(prompt_payload))
+    # Pre-extract the latest user-role text from the messages array
+    # (system prompts go in a separate kwarg, never in `messages`, so
+    # only the messages list matters for "what did the user say"). See
+    # the openai integration's matching block for full rationale.
+    if messages:
+        user_text = _c.extract_last_user_text(messages)
+        if user_text:
+            out["gen_ai.prompt.user"] = _c.truncate(user_text)
     return out
 
 

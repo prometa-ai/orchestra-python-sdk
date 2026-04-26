@@ -60,6 +60,14 @@ def _request_attrs(args: tuple, kwargs: dict) -> dict:
     contents = kwargs.get("contents")
     if contents is not None:
         out["gen_ai.prompt"] = _c.truncate(_c.safe_json(contents))
+        # Pre-extract the latest user-role text. Gemini accepts both a
+        # bare string (single-turn convenience) and a list of Content
+        # objects with role+parts; extract_last_user_text handles both.
+        # See openai.py for the rationale on why we stamp this as a
+        # separate attribute.
+        user_text = _c.extract_last_user_text(contents)
+        if user_text:
+            out["gen_ai.prompt.user"] = _c.truncate(user_text)
     config = kwargs.get("config") or kwargs.get("generation_config")
     if config is not None:
         # config can be a dict or a pydantic model — extract a few common

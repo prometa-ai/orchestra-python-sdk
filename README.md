@@ -137,12 +137,23 @@ the LLM span, not under whatever was active when `.create()` returned.
 ### How the trace "Conversation" panel populates
 
 The Prometa trace UI renders a **Conversation** panel that derives turns
-directly from the `gen_ai.prompt` / `gen_ai.completion` span attributes
-emitted by the integrations on this page. Each LLM span becomes a
-`user` turn (the latest user message extracted from `gen_ai.prompt`)
-followed by an `agent` turn (the completion). Token counts and
-timestamps come straight off the span — nothing else needs to be wired
-up on the platform side.
+directly from the span attributes emitted by the integrations on this
+page. For each LLM span:
+
+- The user turn shows `gen_ai.prompt.user` — the latest `role: "user"`
+  message, pre-extracted by the SDK from the `messages` / `contents`
+  array at instrumentation time.
+- The agent turn shows `gen_ai.completion` — the assistant reply.
+
+Token counts and timestamps come straight off the span. Nothing else
+needs to be wired up on the platform side.
+
+`gen_ai.prompt` (the full messages-array JSON) is also captured for
+debugging — that's what downstream judge / replay tooling reads when
+it needs the complete prompt context, including system instructions
+and history. The Conversation panel intentionally surfaces only
+`gen_ai.prompt.user` to keep the chat view readable; the full payload
+is one click away on the span detail.
 
 The **After preprocessing** vs **Raw** toggle is also rendered, but
 both modes show the same text until the platform's PII redactor /

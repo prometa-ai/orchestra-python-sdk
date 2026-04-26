@@ -31,7 +31,17 @@ from ..client import Prometa, _Span, _new_id, _now_unix_nano
 # Cap individual prompt/completion attribute payloads. Real chat histories
 # can be tens of KB; the OTLP envelope and ClickHouse string columns both
 # tolerate that, but very long values inflate every trace fetch in the UI.
-MAX_TEXT_ATTR_BYTES = 8000
+#
+# Note (0.3.3): bumped 8000 → 32000 because chat histories with full
+# system prompts + multi-round tool results regularly exceeded the old
+# cap. When that happened, ``gen_ai.prompt`` was truncated mid-JSON, the
+# Prometa Conversation panel's JSON.parse failed, and the panel fell
+# back to rendering the raw (truncated) text — which begins with the
+# system prompt because OpenAI's messages array always has system first.
+# 32KB covers ~99% of realistic chat sessions; the new
+# ``gen_ai.prompt.user`` attribute below covers the rest by surfacing
+# the user's actual message even when the full payload truncates.
+MAX_TEXT_ATTR_BYTES = 32000
 
 
 def _client() -> Optional[Prometa]:
@@ -51,6 +61,97 @@ def safe_json(value: Any) -> str:
         return json.dumps(value, default=str, ensure_ascii=False)
     except Exception:
         return str(value)
+
+
+def extract_last_user_text(prompt: Any) -> Optional[str]:
+    """Extract the latest ``role: "user"`` text from a chat-style prompt.
+
+    This is a UI-friendly counterpart to the full ``gen_ai.prompt`` JSON
+    payload. We stamp it as a *separate* span attribute
+    (``gen_ai.prompt.user``) so the trace UI's Conversation panel can
+    surface the user's actual question reliably, even when the full
+    serialized messages array exceeds ``MAX_TEXT_ATTR_BYTES`` and gets
+    truncated mid-JSON.
+
+    Handles three common input shapes:
+
+    - **OpenAI / Anthropic-style chat**: ``[{role, content}, ...]``.
+      ``content`` may be a plain string or a list of multimodal parts
+      (each part either a string or ``{"type": ..., "text": ...}``).
+    - **Google Gemini**: ``[{role, parts: [{text}, ...]}]``. Same
+      pattern as above with ``parts`` instead of ``content``. Plain
+      ``str`` (Gemini's bare-string convenience form) is returned
+      verbatim.
+    - **Bare string**: returned as-is. Useful when the caller has
+      already pre-extracted the user message and is passing it
+      through.
+
+    Returns ``None`` if no user message is found — caller just omits
+    the ``gen_ai.prompt.user`` attribute in that case (e.g. tool-only
+    invocations, completion-API single-string prompts).
+    """
+    if prompt is None:
+        return None
+    if isinstance(prompt, str):
+        # Gemini-style bare prompt. Treat the whole thing as the user
+        # message; nothing else to disambiguate.
+        return prompt
+    if not isinstance(prompt, list):
+        return None
+    # Walk newest-to-oldest so a multi-turn conversation surfaces the
+    # turn the user just typed, not historical turns.
+    for msg in reversed(prompt):
+        role = _attr_or_key(msg, "role")
+        if role != "user":
+            continue
+        # OpenAI / Anthropic use "content"; Gemini uses "parts".
+        content = _attr_or_key(msg, "content")
+        if content is None:
+            content = _attr_or_key(msg, "parts")
+        text = _flatten_content(content)
+        if text:
+            return text
+    return None
+
+
+def _attr_or_key(obj: Any, name: str) -> Any:
+    """Read ``name`` from a dict or an object — SDK message types are
+    sometimes pydantic models, sometimes plain dicts, depending on which
+    library version the caller passes through."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _flatten_content(content: Any) -> Optional[str]:
+    """Coalesce a chat-message content field into a single string.
+
+    - ``str`` → returned as-is.
+    - ``list`` of strings → joined with newlines.
+    - ``list`` of multimodal parts (each a string or
+      ``{"type": ..., "text": ...}`` dict, or an SDK Part object with
+      ``.text``) → concatenated text parts only. Non-text parts (image,
+      audio) are skipped — the panel renders text and a "user message"
+      attribute is meaningless for non-text input.
+
+    Returns ``None`` when nothing useful is extractable so the caller
+    skips stamping the attribute.
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+                continue
+            text = _attr_or_key(p, "text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+    return None
 
 
 def open_manual_span(kind: str, name: str, base_attrs: dict) -> Optional[_Span]:

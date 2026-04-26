@@ -5,6 +5,51 @@ All notable changes to the `prometa-sdk` Python package.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-04-26
+
+### Fixed
+
+- **Conversation panel showing the system prompt instead of the user's
+  question** for traces with long chat histories. Root cause was
+  truncation: `gen_ai.prompt` (the JSON-serialized messages array) was
+  capped at 8KB, exceeded by realistic chat sessions with multi-KB
+  system prompts + tool-call rounds, then the platform's `JSON.parse`
+  failed on the truncated payload and the panel fell back to rendering
+  the raw text — which begins with the system message because OpenAI's
+  `messages` array always has system first.
+
+  Two complementary fixes:
+
+  1. The OpenAI / Anthropic / Google integrations now pre-extract the
+     latest user-role text into a separate `gen_ai.prompt.user` span
+     attribute. Extraction happens *before* JSON serialization /
+     truncation, on the in-memory list, so it can never be cut off.
+     The platform's Conversation panel reads this attribute first
+     (with `gen_ai.prompt` as fallback for older SDK versions).
+     Reference: [agent-hook-v2#40](https://github.com/caglarsubas/agent-hook-v2/pull/40).
+  2. `MAX_TEXT_ATTR_BYTES` raised from `8000` → `32000`. Most chat
+     sessions now fit the full payload without truncation, so the
+     `gen_ai.prompt` attribute is also more reliable for downstream
+     judge / replay tooling that wants the complete messages array.
+
+  Backward compatible: span attributes are additive, no config flag.
+  Old SDK versions continue to work; old platform versions ignore the
+  new attribute (it lands harmlessly in span metadata).
+
+  No SDK API change. Consumers do not need to touch their integration
+  code; `pip install -U prometa-sdk==0.3.3` is sufficient.
+
+### Internal
+
+- `_SCOPE_VERSION` (used as the OTLP instrumentation-scope version on
+  every emitted span) is now derived from `importlib.metadata.version`
+  at import time instead of being a hand-maintained mirror constant in
+  `client.py`. Eliminates the drift bug that mis-reported the SDK
+  version on every span across `0.3.0` / `0.3.1` / `0.3.2`. Reference:
+  [agent-hook-v2#39](https://github.com/caglarsubas/agent-hook-v2/pull/39).
+  (Released as part of `0.3.3` because it landed on `main` after the
+  `0.3.2` tag was cut.)
+
 ## [0.3.2] — 2026-04-26
 
 ### Documentation only — no SDK code changes

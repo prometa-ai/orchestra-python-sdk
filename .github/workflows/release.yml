@@ -1,0 +1,287 @@
+name: Release
+
+# ---------------------------------------------------------------------------
+# One-click Python SDK release. Click `Run workflow` in the Actions tab:
+#
+#   bump     = as-is | patch | minor | major    (default: as-is)
+#   version  = optional explicit version (overrides `bump`)
+#
+# Pick the right `bump` based on whether main was *already* bumped:
+#
+#   • `as-is`              — main's pyproject already has the version you
+#                            want to ship. The workflow tags it as-is and
+#                            publishes. No commit, no rewrite. THIS IS
+#                            THE RIGHT CHOICE WHEN A FEATURE PR ALREADY
+#                            BUMPED THE VERSION TO SIGNAL AN API CHANGE.
+#   • `patch/minor/major`  — main has the *previously* released version
+#                            and you want the workflow to advance it. The
+#                            workflow rewrites pyproject + __init__,
+#                            commits the bump to main, then tags +
+#                            publishes the new version.
+#
+# Mixing the two is what causes version-skip incidents (workflow runs
+# `patch` against main that was already bumped → produces an unexpected
+# +1, leaving the hand-bumped version on main but never tagged or
+# published). A pre-flight tag-existence check below also fails fast if
+# the chosen bump would clobber a version that's already been released.
+#
+# Examples:
+#   • A PR hand-bumps 0.3.3 → 0.4.0 in pyproject, lands on main.
+#     → Click `as-is`. Result: tag v0.4.0, publish 0.4.0.
+#   • Doc-only typo fix lands on main (no version bump).
+#     → Click `patch`. Result: workflow bumps 0.3.3 → 0.3.4, tags,
+#       publishes.
+#   • Want to skip a number for some reason.
+#     → Type the version explicitly in the `version` field.
+#
+# The job:
+#   1. Reads the current version from pyproject.toml (repo root).
+#   2. Computes the new version: as-is → use CURRENT; explicit version →
+#      use the typed value; otherwise apply +1 to the chosen position.
+#   3. Refuses to proceed if the resulting tag (`v<NEW>`) already
+#      exists locally or on origin — prevents accidental clobber of an
+#      already-published version.
+#   4. (Skipped for `as-is`.) Writes the new version into pyproject.toml
+#      AND prometa/__init__.py.
+#   5. (Skipped if there's no diff.) Commits the bump to `main` and
+#      pushes.
+#   6. Always pushes the `v<version>` tag and dispatches the `Publish`
+#      workflow against it — that handles the actual build + Trusted-
+#      Publishing upload to PyPI.
+#
+# NOTES
+# - Requires `contents: write` so the bot can push the version-bump
+#   commit back to `main`. If `main` has branch protection enabled, add
+#   `github-actions[bot]` to the branch-protection bypass list or switch
+#   this workflow to open a PR instead of pushing directly.
+# - The bump commit doesn't carry `[skip ci]` because GitHub applies
+#   the marker to BOTH the branch push and the tag push, killing the
+#   tag-triggered `publish.yml` run we actually need.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump level. Use `as-is` when the PR already bumped pyproject."
+        required: true
+        type: choice
+        default: as-is
+        options: [as-is, patch, minor, major]
+      version:
+        description: "Explicit version like 0.4.0 — overrides `bump` if set"
+        required: false
+        type: string
+
+permissions:
+  contents: write   # push the bump commit + tag to main
+  actions: write    # dispatch the downstream Publish workflow
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history so `git push origin main` works — shallow
+          # checkouts can trip up the push when the remote HEAD
+          # advances during the run.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compute new version
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          echo "Current version: $CURRENT"
+
+          # Mode resolution priority:
+          #   1. Explicit `version` input — operator typed a value, use it
+          #      verbatim (covers as-is by typing the current version too).
+          #   2. `bump: as-is` — publish CURRENT as-is, no rewrite, no
+          #      commit. Only the tag + publish step runs.
+          #   3. `bump: patch/minor/major` — apply +1 to the chosen
+          #      position; advances main by one commit before tagging.
+          if [ -n "${{ inputs.version }}" ]; then
+            NEW_VERSION="${{ inputs.version }}"
+            echo "Using explicit version override: $NEW_VERSION"
+          elif [ "${{ inputs.bump }}" = "as-is" ]; then
+            NEW_VERSION="$CURRENT"
+            echo "Releasing CURRENT as-is (no bump): $NEW_VERSION"
+          else
+            IFS=. read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+              *) echo "::error::unknown bump: ${{ inputs.bump }}" ; exit 1 ;;
+            esac
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+            echo "Bumped ($CURRENT → $NEW_VERSION) via ${{ inputs.bump }}"
+          fi
+
+          # Enforce MAJOR.MINOR.PATCH — pre-release / dev tags would
+          # break the `publish.yml` version-match regex.
+          if ! echo "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::new version '$NEW_VERSION' is not MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          # Equality with CURRENT is only an error in advance-mode. In
+          # `as-is` (or explicit-version-equals-current) mode it's the
+          # whole point — we're tagging what's already on main.
+          if [ "$NEW_VERSION" = "$CURRENT" ] \
+             && [ "${{ inputs.bump }}" != "as-is" ] \
+             && [ -z "${{ inputs.version }}" ]; then
+            echo "::error::new version equals current ($CURRENT); nothing to release"
+            exit 1
+          fi
+
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to clobber an existing tag
+        # Hard guard: if `v<NEW>` already exists locally OR on origin,
+        # the chosen bump would either (a) silently re-tag a published
+        # version with new content (bad) or (b) be a confused operator
+        # action. Either way: stop. Operator should pick a different
+        # `bump` level or use the explicit `version` field.
+        env:
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$NEW"
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists locally"
+            echo "::error::pick a different bump level or use the explicit version field"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG already exists on origin (probably already published)"
+            echo "::error::pick a different bump level or use the explicit version field"
+            exit 1
+          fi
+          echo "Tag $TAG is unused — proceeding."
+
+      - name: Update version files
+        # Skip in as-is mode (or when an explicit `version` input
+        # already matches main). The Verify step below catches any
+        # case where main isn't actually at the expected version.
+        if: inputs.bump != 'as-is'
+        env:
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # pyproject.toml: `version = "X.Y.Z"`
+          sed -i -E "s/^version = \"[^\"]+\"/version = \"$NEW\"/" pyproject.toml
+          # __init__.py:    `__version__ = "X.Y.Z"` (only if the file
+          # carries a __version__ — older snapshots may not).
+          if grep -qE '^__version__ = "[^"]+"' prometa/__init__.py; then
+            sed -i -E "s/^__version__ = \"[^\"]+\"/__version__ = \"$NEW\"/" prometa/__init__.py
+          fi
+
+          echo "--- pyproject.toml diff ---"
+          git diff -- pyproject.toml
+          echo "--- __init__.py diff ---"
+          git diff -- prometa/__init__.py
+
+      - name: Verify pyproject (and __init__ if present) match the version we're tagging
+        # Always runs. In advance-mode this checks the sed actually wrote
+        # what we expected. In as-is mode this checks main is genuinely
+        # at the version the operator expects to release — catches the
+        # "I forgot to merge the PR first" mistake before it tags.
+        env:
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYPROJECT_VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          if [ "$PYPROJECT_VERSION" != "$NEW" ]; then
+            echo "::error::pyproject version doesn't match release target"
+            echo "::error::  pyproject=$PYPROJECT_VERSION  expected=$NEW"
+            echo "::error::if you ran with bump=as-is, main probably isn't at the expected version"
+            echo "::error::if you ran with bump=patch/minor/major, the sed may have failed (quote-style change?)"
+            exit 1
+          fi
+          # __init__ carries __version__ in some snapshots, not others —
+          # only enforce equality when the file actually defines it.
+          if grep -qE '^__version__ = "[^"]+"' prometa/__init__.py; then
+            INIT_VERSION=$(python -c 'import re; m = re.search(r"__version__ = \"([^\"]+)\"", open("prometa/__init__.py").read()); print(m.group(1) if m else "")')
+            if [ "$INIT_VERSION" != "$NEW" ]; then
+              echo "::error::__init__ version ($INIT_VERSION) doesn't match release target ($NEW)"
+              exit 1
+            fi
+          fi
+
+      - name: Commit (if needed) + tag + push
+        env:
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add pyproject.toml prometa/__init__.py 2>/dev/null || true
+
+          # In as-is mode there's nothing to commit — main already has
+          # the version we're about to tag. `git diff --cached --quiet`
+          # exits 1 if the index has changes, 0 if clean; honor it.
+          if git diff --cached --quiet; then
+            echo "No version-file changes — releasing main as-is."
+          else
+            # No `[skip ci]` marker: GitHub applies it to BOTH the
+            # branch push and the tag push, killing the tag-triggered
+            # `publish.yml` run we actually need.
+            git commit -m "chore: bump to $NEW"
+            git push origin main
+          fi
+
+          git tag "v$NEW"
+          git push origin "v$NEW"
+
+      - name: Trigger Publish on the new tag
+        # GitHub's anti-loop guard blocks pushes made by GITHUB_TOKEN
+        # from triggering further workflows, so the tag we just pushed
+        # DOESN'T fire `publish.yml` via its normal `push: tags:`
+        # trigger. We work around it by explicitly dispatching that
+        # workflow with `--ref <tag>` — `workflow_dispatch` from
+        # GITHUB_TOKEN *does* fire workflows, and pinning the ref to
+        # the tag means `publish.yml`'s own `startsWith(github.ref,
+        # 'refs/tags/v')` guard evaluates true, so the real publish
+        # happens.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run publish.yml --ref "v$NEW"
+
+      - name: Summary
+        env:
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          {
+            echo "### Python SDK release triggered 🚀"
+            echo ""
+            echo "- **Version:** \`$NEW\`"
+            echo "- **Tag:** \`v$NEW\`"
+            echo ""
+            echo "The \`Publish\` workflow is now building + publishing to PyPI."
+            echo "Watch it here: [Actions → Publish](../../actions/workflows/publish.yml)"
+            echo ""
+            echo "Once green, verify with:"
+            echo '```'
+            echo "pip install prometa-sdk==$NEW"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

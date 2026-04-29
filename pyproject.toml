@@ -35,7 +35,7 @@ dev = ["pytest>=7", "ruff>=0.5"]
 [project.urls]
 Homepage = "https://prometa.io"
 Documentation = "https://prometa.io/docs/sdk/python"
-Source = "https://github.com/prometa/prometa-sdk-python"
+Source = "https://github.com/prometa-ai/orchestra-python-sdk"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prometa"]

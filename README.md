@@ -204,7 +204,7 @@ release alongside this SDK version (see CHANGELOG.md).
 
 ## Contributing
 
-Use a **`feat/...`** branch for each change set; open a PR to `main`. Merges are done manually by maintainers — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Use a **`feat/...`** branch for each change set, open a PR to **`main`**, and integrate **only** via GitHub’s PR merge (do not push `main` directly). Details: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

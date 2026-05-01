@@ -5,6 +5,12 @@ All notable changes to the `prometa-sdk` Python package.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] — 2026-05-01
+
+### Changed
+
+- Release automation now publishes to production PyPI (workflow no longer targets TestPyPI).
+
 ## [0.3.3] — 2026-04-26
 
 ### Fixed

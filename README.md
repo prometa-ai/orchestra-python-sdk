@@ -12,6 +12,8 @@ Prometa instance via OTLP/JSON.
 pip install prometa-sdk
 ```
 
+**Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source for this package (releases publish from GitHub Actions on tags `v*`, see `.github/workflows/publish.yml`). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
+
 ## Quick start
 
 ```python

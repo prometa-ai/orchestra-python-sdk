@@ -202,6 +202,10 @@ release alongside this SDK version (see CHANGELOG.md).
 | `stage` | — | `"development"` |
 | `flush_interval_seconds` | — | `2.0` |
 
+## Contributing
+
+Use a **`feat/...`** branch for each change set; open a PR to `main`. Merges are done manually by maintainers — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Apache-2.0

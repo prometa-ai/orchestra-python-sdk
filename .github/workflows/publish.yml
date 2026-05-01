@@ -1,3 +1,10 @@
+# Trusted publishing (OIDC → PyPI):
+#   GitHub: Settings → Environments → create `pypi` (matches `environment:` below).
+#   PyPI: Project prometa-sdk → Manage publishing → trusted publisher for this repo,
+#         workflow file `publish.yml`, environment `pypi`.
+# For TestPyPI only, add under `pypa/gh-action-pypi-publish`:
+#   repository-url: https://test.pypi.org/legacy/
+
 name: Publish package
 
 on:

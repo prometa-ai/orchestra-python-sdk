@@ -5,6 +5,21 @@ All notable changes to the `prometa-sdk` Python package.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Explicit data-flow refs between sibling spans.** New helpers
+  `set_input_ref(span_id)` / `set_output_ref(span_id)` /
+  `get_input_ref()` / `get_output_ref()` / `current_span_id()` let a
+  span declare "I consumed the output of span X" — typically used by a
+  tool span to reference the LLM whose `tool_call` it's executing.
+  Emitted as `prometa.input_ref` / `prometa.output_ref`; the platform
+  promotes them to dedicated columns and the trace UI surfaces them
+  as clickable rows in the Causal-context block. Required for
+  LLM-as-a-Judge traces to reason about flow rather than timing.
+  See `examples/data_flow_refs.py` for the capture-the-span pattern.
+
 ## [0.3.4] — 2026-05-01
 
 ### Changed

@@ -9,6 +9,47 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **AML v0.4 instrumentation contract — Phase 2 skeleton (4 of 18 helpers).**
+  New helpers map the agent's runtime behavior to the
+  Agentic Maturity Level (AML) feature catalog so the Prometa platform's
+  scoring engine can audit the agent against 41 features across six
+  capability domains. Strictly additive — no existing decorator or
+  integration changes.
+  - **`prometa.guardrail(type_, raw_input=…, raw_retrieved=…)`** context
+    manager — emits a `guardrail.check` span. Feeds AML A2 (ethical
+    guardrailing) and A3 (prompt-injection defense). The yielded handle
+    exposes `.verdict(outcome, confidence=…, classifier=…, categories=…)`
+    for the classifier result.
+  - **`prometa.pii_filter(direction, raw_input=…, raw_output=…)`** context
+    manager — emits a `pii.filter` span. Feeds AML A1 (PII filtering).
+    Handle: `.result(matches_found=…, match_categories=…, redacted=…)`.
+  - **`prometa.memory_read(scope, key)`** context manager — emits a
+    `memory.read` span. Feeds AML B3 / B4 / C6 / E3 / E4. Handle:
+    `.hit(source_record_id=…, user_visible=…)` or `.miss()`. Scope ∈
+    `working | episodic | profile | procedural | goal`.
+  - **`prometa.memory_write(scope, key, consent_id=…, ttl_seconds=…)`**
+    one-shot — emits a `memory.write` span. `consent_id` is required for
+    cross-session writes (B4 / E3) per AML A8.
+  - **`prometa.record_retry_attempt(attempt_number, backoff_ms, idempotency_key=…, outcome)`**
+    — emits a `retry.attempt` span. Feeds AML E6 (resilience). `outcome` ∈
+    `success | fail | exhausted`. SDK does not implement retry logic; this
+    just records what the customer's retry library did.
+  - **`prometa.record_circuit_breaker_state(target, from_state, to_state, failure_count=…)`**
+    — emits a `circuit_breaker.state` span on transitions. States ∈
+    `closed | open | half_open`.
+  - **`prometa.raw_channel`** module — process-wide toggle for dual-channel
+    raw-attribute capture. `enable()` / `disable()` / `is_enabled()`. When
+    enabled, helpers stamp `prometa.raw.input` / `prometa.raw.output` /
+    `prometa.raw.retrieved_content` so the platform can route them to
+    `prometa.spans_raw` (30-day TTL, access-gated). Off by default so an
+    accidental misconfiguration cannot leak raw PII upstream.
+  See `examples/aml_instrumentation.py` for end-to-end usage. Full
+  contract: <https://github.com/prometa-ai/agent-hook-v2/tree/main/resources/aml/phase-0>.
+  Remaining 14 of 18 helpers (prompt.render, auth.check, consent.check,
+  cache.lookup, retrieval.query attributes, plan.generate, confidence.score,
+  schema.validate, reviewer.invoke, event.trigger, model.route,
+  sentiment.classify) land in follow-up commits.
+
 - **Explicit data-flow refs between sibling spans.** New helpers
   `set_input_ref(span_id)` / `set_output_ref(span_id)` /
   `get_input_ref()` / `get_output_ref()` / `current_span_id()` let a

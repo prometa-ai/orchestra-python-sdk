@@ -68,14 +68,23 @@ from .refs import (
     current_span_id,
 )
 
-# AML v0.4 instrumentation helpers (Phase 2 — skeleton; 4 of 18 helpers).
-# See `resources/aml/phase-0/instrumentation-spec.yaml` in agent-hook-v2 for
-# the full SDK contract that the AML scoring engine consumes.
+# AML v0.4 instrumentation helpers — all 16 primitives from the contract
+# bundled at `resources/aml/phase-0/instrumentation-spec.yaml` in
+# agent-hook-v2. The AML scoring engine consumes these spans to score
+# agents against the 41-feature catalog.
 from .guardrails import guardrail, pii_filter
 from .memory import memory_read, memory_write
 from .resilience import record_retry_attempt, record_circuit_breaker_state
+from .prompt import prompt_render
+from .authz import auth_check, consent_check
+from .retrieval import cache_lookup, retrieval_query
+from .reasoning import plan_generate, confidence_score, schema_validate
+from .reviewer import reviewer_invoke
+from .events import event_trigger
+from .routing import model_route
+from .sentiment import sentiment_classify
 
-__version__ = "0.4.0a1"
+__version__ = "0.4.0"
 __all__ = [
     "Prometa",
     "workflow",
@@ -91,12 +100,29 @@ __all__ = [
     "get_input_ref",
     "get_output_ref",
     "current_span_id",
-    # v0.4 AML helpers
+    # v0.4 AML helpers — dual-channel toggle
     "raw_channel",
-    "guardrail",
+    # v0.4 AML helpers — safety / governance (A1-A8)
     "pii_filter",
+    "guardrail",
+    "prompt_render",
+    "auth_check",
+    "consent_check",
+    # v0.4 AML helpers — knowledge & memory (B1-B5)
+    "cache_lookup",
     "memory_read",
     "memory_write",
+    "retrieval_query",
+    # v0.4 AML helpers — reasoning (C2-C5)
+    "plan_generate",
+    "confidence_score",
+    "schema_validate",
+    "sentiment_classify",
+    # v0.4 AML helpers — orchestration & proactivity (E1-E6)
+    "event_trigger",
+    "reviewer_invoke",
     "record_retry_attempt",
     "record_circuit_breaker_state",
+    # v0.4 AML helpers — observability (F1)
+    "model_route",
 ]

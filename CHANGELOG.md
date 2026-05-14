@@ -7,6 +7,84 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-14
+
+### Added
+
+- **AML v0.4 instrumentation contract — full coverage (16 of 16 helpers
+  shipped).** The 12 helpers documented as "land in follow-up commits"
+  in 0.3.4 are now in. The complete contract maps every applicable
+  span primitive in
+  `resources/aml/phase-0/instrumentation-spec.yaml` to a Python helper.
+  - **`prometa.prompt_render(template_version=…, raw_rendered_prompt=…)`**
+    — emits a `prompt.render` span. Feeds AML A4 (prompt isolation), B7
+    (multilingual), C4 (explainability), C5 (sentiment), C6 (dynamic
+    context assembly). Handle: `.assembled(system_token_count=…,
+    user_token_count=…, tool_token_count=…, role_boundaries=…,
+    context_components=…)`. `raw_rendered_prompt` is gated by the
+    `raw_channel` toggle and carries the structured prompt JSON with
+    role boundaries preserved.
+  - **`prometa.auth_check(action, risk_class=…)`** — emits an
+    `auth.check` span. Feeds AML A5. Handle: `.decision(outcome,
+    method=…, principal_id=…)`. `risk_class` ∈ `low|medium|high`;
+    `outcome` ∈ `auto_approve|user_confirm|step_up_required|denied`;
+    `method` ∈ `policy|otp|mfa|biometric|hitl`.
+  - **`prometa.consent_check(record_id, scope=…, action=…)`** — emits
+    a `consent.check` span. Feeds AML A8, E2. Handle: `.result(valid=…,
+    expires_at=…, revocable=…)`.
+  - **`prometa.cache_lookup(kind, key=…)`** — emits a `cache.lookup`
+    span. Feeds AML B2. Handle: `.hit(ttl_remaining_seconds=…)` /
+    `.miss()` / `.write_action_blocked()`. The contract requires
+    `write_action_blocked` to be marked whenever a cache lookup hits a
+    write-API request (caches must never serve writes).
+  - **`prometa.retrieval_query(system, query_text=…, top_k=…,
+    raw_retrieved=…)`** — emits a `retrieval.query` span. Feeds AML B1
+    (RAG), B5 (graph reasoning). Handle: `.results(result_ids=…,
+    scores=…, permissions_enforced=…)`. `raw_retrieved` is
+    `raw_channel`-gated and carries the concatenated retrieved text —
+    what AML A3 indirect-injection scans against.
+  - **`prometa.plan_generate(plan_id)`** — emits a `plan.generate` span.
+    Feeds AML C2, C4, D3. Handle: `.emitted(steps=…, replanned_from=…,
+    complexity_estimate=…)`. Each step is `{order, action, tool,
+    depends_on, parallel_with}`.
+  - **`prometa.confidence_score(value, calibration_basis=…)`** — emits a
+    `confidence.score` span. Feeds AML C3. Handle: `.action(outcome,
+    threshold_used=…)` with `outcome` ∈ `respond|hedge|escalate|decline`.
+    Validates `value ∈ [0.0, 1.0]` and `calibration_basis` against
+    `retrieval_score|self_consistency|rule_check|ensemble|judge`.
+  - **`prometa.schema_validate(schema_id)`** — emits a `schema.validate`
+    span. Feeds AML D4 (output validation). Handle: `.result(passed=…,
+    errors=…, repair_attempt=…, downstream_blocked=…)`.
+  - **`prometa.reviewer_invoke(reviewer_id, target_span_id=…)`** —
+    emits a `reviewer.invoke` span. Feeds AML E5 (reviewer / critique
+    loop). Handle: `.verdict(outcome, rationale=…,
+    policy_violations=…)` with `outcome` ∈ `approve|request_fix|block`.
+  - **`prometa.event_trigger(source, consent_id=…)`** — emits an
+    `event.trigger` span. Feeds AML E1, E2, E4, F7. Handle:
+    `.fsm_transition(from_state=…, to_state=…)`. `source` ∈
+    `user_message|webhook|scheduler|market_trigger|iot_event|agent_initiated|channel_switch`.
+    `consent_id` is REQUIRED when `source == "agent_initiated"` per the
+    AML A8 proactive-action contract — the SDK raises if it's missing
+    rather than silently emitting a span the auditor would have to flag.
+  - **`prometa.model_route(chosen, candidates_considered=…,
+    routing_reason=…)`** — emits a `model.route` span. Feeds AML F1
+    (cost-aware routing). Handle: `.cost(cost_estimate_usd=…,
+    budget_cap_usd=…)`.
+  - **`prometa.sentiment_classify(label, confidence=…, raw_input=…)`**
+    — emits a `sentiment.classify` span. Feeds AML C5. Handle:
+    `.action_taken(outcome)` with `outcome` ∈
+    `none|tone_softened|escalated_human|crisis_resource_surfaced`.
+    `raw_input` is `raw_channel`-gated and preserves the pre-normalisation
+    caps / punctuation / profanity signals C5 reads.
+
+Full contract reference:
+<https://github.com/prometa-ai/agent-hook-v2/tree/main/resources/aml/phase-0>.
+
+Backwards compatible with 0.3.x — no existing decorator, integration,
+or attribute changes.
+
+## [0.4.0a1] — 2026-05-12
+
 ### Added
 
 - **AML v0.4 instrumentation contract — Phase 2 skeleton (4 of 18 helpers).**

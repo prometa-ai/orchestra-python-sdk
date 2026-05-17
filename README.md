@@ -1,10 +1,29 @@
 # prometa-sdk (Python)
 
+[![PyPI version](https://img.shields.io/pypi/v/prometa-sdk.svg)](https://pypi.org/project/prometa-sdk/)
+[![Python](https://img.shields.io/pypi/pyversions/prometa-sdk.svg)](https://pypi.org/project/prometa-sdk/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
-automatically emit lifecycle metadata (`solution_id`, `stage`, `agent`) to your
-Prometa instance via OTLP/JSON.
+automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
+Three families of helpers ship in the SDK today:
+
+- **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
+  wrap any sync/async function and emit a span carrying `solution_id`,
+  `stage`, `agent.name`, kind, and parent/child relationships.
+- **Correlation-chain setters** — `set_customer_id`, `set_user_id`,
+  `set_conversation_id`, `set_request_model`, `set_tool_name`. Light up
+  the platform's canonical correlation chain
+  (`org:sol:agent:tool:cus:user::session:trace:span`) so registry / AML
+  / lineage readers can join across the full identity prefix. Optional
+  but unlocks the richer end-to-end view.
+- **AML v0.4 instrumentation contract** — 16 helpers
+  (`pii_filter`, `guardrail`, `memory_read`, `record_retry_attempt`,
+  `confidence_score`, `schema_validate`, `model_route`,
+  `sentiment_classify`, …) that emit the spans the platform's AML
+  scoring engine consumes to score agents against the 41-feature catalog.
 
 ## Install
 
@@ -12,7 +31,12 @@ Prometa instance via OTLP/JSON.
 pip install prometa-sdk
 ```
 
-**Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source for this package (releases publish from GitHub Actions on tags `v*`, see `.github/workflows/publish.yml`). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
+Latest release: **0.5.0** (correlation-chain helpers + `customer_id`
+constructor kwarg, on top of the AML v0.4 contract that shipped in
+0.4.0). Release history is on
+[PyPI](https://pypi.org/project/prometa-sdk/#history).
+
+**Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 
 ## Quick start
 
@@ -98,6 +122,103 @@ stuff emails, names, or PII in there.
 Long-running sessions touching old + new traces will appear truncated
 once the oldest member trace ages out — acceptable for chat workloads,
 flag if you have multi-week audit needs.
+
+## Correlation-chain helpers (v0.5.0+)
+
+The platform's correlation-id resolver consumes five optional OTLP
+attributes to materialise its canonical chain end-to-end. Setting them
+is purely additive — without them, the unset chain segments stay
+empty but the platform still works; with them, every reader on the
+platform side (registry, AML scoring, incident lineage, annotation
+chain queries) joins by a single canonical address.
+
+```python
+from prometa import (
+    Prometa,
+    set_customer_id,    # → prometa.customer_id
+    set_user_id,        # → gen_ai.user.id (+ prometa.user.id fallback)
+    set_conversation_id,# → gen_ai.conversation.id (alias of set_session_id)
+    set_request_model,  # → gen_ai.request.model
+    set_tool_name,      # → prometa.tool_name (on tool-typed spans)
+)
+
+prometa = Prometa(
+    endpoint="https://prometa.example.com/api/v2/otlp/v1/traces",
+    api_key="prm_live_...",
+    solution_id="sol_billing",
+    agent_name="declarai-assistant",
+    customer_id="cus_org_wide_default",   # org-wide default; overridable per-span
+)
+
+@prometa.workflow(name="handle-ticket")
+def handle(ticket):
+    # Per-span override of customer_id wins over the constructor
+    # default for this span AND every nested span (parent-attribute
+    # inheritance in the span builder).
+    set_customer_id(ticket.customer_external_id)
+    set_user_id(ticket.agent_email)
+    set_conversation_id(ticket.thread_id)
+
+    @prometa.tool(name="search-kb")
+    def lookup():
+        set_tool_name("knowledge-base-search")   # auto-registers Tool entity in PG
+        ...
+```
+
+| Helper | OTLP key | Platform-side effect |
+|---|---|---|
+| `set_customer_id` | `prometa.customer_id` | Validated against `Organization.customerNamespace` regex at ingest; bridges Prometa telemetry to your CRM / data warehouse |
+| `set_user_id` | `gen_ai.user.id` + `prometa.user.id` | End-user attribution; lights up the user segment of the chain |
+| `set_conversation_id` | `gen_ai.conversation.id` | Auto-registers a Session row in Postgres; equivalent to `set_session_id` |
+| `set_request_model` | `gen_ai.request.model` | Cost rollup keys on this; LLM-instrumentation libs usually set it automatically |
+| `set_tool_name` | `prometa.tool_name` | Auto-registers a Tool row per `(orgId, solutionId, name)` triple on first sighting |
+
+All five helpers follow the same contract as `set_session_id`:
+synchronous, no-op outside an active span context (returns `False`),
+empty value pops the attribute. See the platform-side design at
+[`resources/correlation/correlation-id-design.md`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md)
+for the full canonical-chain grammar.
+
+## AML v0.4 instrumentation contract
+
+The SDK ships 16 helpers that emit the spans the platform's AML
+scoring engine consumes to score agents against its 41-feature
+catalog. The full catalog lives at
+[`resources/aml/phase-0/catalog.yaml`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/aml/phase-0/catalog.yaml)
+on the platform; the SDK-side primitives are:
+
+```python
+from prometa import (
+    # Safety / governance (A1-A8)
+    pii_filter, guardrail, prompt_render, auth_check, consent_check,
+    # Knowledge & memory (B1-B5)
+    cache_lookup, memory_read, memory_write, retrieval_query,
+    # Reasoning (C2-C5)
+    plan_generate, confidence_score, schema_validate, sentiment_classify,
+    # Orchestration & proactivity (E1-E6)
+    event_trigger, reviewer_invoke,
+    record_retry_attempt, record_circuit_breaker_state,
+    # Observability (F1)
+    model_route,
+)
+
+with guardrail("ethical", raw_input=user_query) as g:
+    v = my_classifier.check(user_query)
+    g.verdict("block" if v.harmful else "pass", confidence=v.score)
+
+with pii_filter("input", raw_input=text) as pii:
+    cleaned, matches = redactor.scrub(text)
+    pii.result(matches_found=len(matches),
+               match_categories=[m.kind for m in matches])
+
+prometa.raw_channel.enable()   # dual-channel raw capture (opt-in)
+```
+
+Each helper is a context manager (or a synchronous record call for
+fire-and-forget events) that emits a typed span with the attribute
+shape the AML detectors expect. Calling them from inside an active
+`@prometa.workflow / .agent / .tool` decorator nests the AML spans
+under the parent — no extra wiring needed.
 
 ## LLM client auto-instrumentation
 
@@ -199,8 +320,54 @@ release alongside this SDK version (see CHANGELOG.md).
 | `api_key` | `PROMETA_API_KEY` | none |
 | `solution_id` | — | none |
 | `agent_name` | — | `"prometa-agent"` |
+| `agent_id` | — | random uuid (discarded by platform resolver) |
 | `stage` | — | `"development"` |
+| `customer_id` | — | none — org-wide default for `prometa.customer_id` |
 | `flush_interval_seconds` | — | `2.0` |
+| `timeout_seconds` | — | `5.0` |
+
+## Architectural fit
+
+Prometa's stack is a multi-language SDK family plus a single platform.
+This SDK is the Python edge of that family; sister bindings ship for
+[Node.js](https://github.com/prometa-ai/orchestra-node-sdk) (`prometa-sdk`)
+and [Java](https://github.com/prometa-ai/orchestra-java-sdk) (`io.prometa:prometa-sdk`).
+All three emit the same OTLP attribute shape so the platform's
+correlation-id resolver materialises the same canonical chain
+regardless of which language the agent is written in.
+
+The architectural picture, end-to-end:
+
+```
+┌──────────────┐                           ┌──────────────────────────┐
+│  Your agent  │   OTLP/JSON (this SDK)    │  Prometa platform        │
+│  (Python)    │ ─────────────────────────►│  /api/v2/otlp/v1/traces  │
+└──────────────┘                           │  ┌──────────────────┐    │
+                                           │  │ correlation      │    │
+       ▼ Spans carry:                      │  │ resolver         │    │
+                                           │  │ (PG-side)        │    │
+   `prometa.solution_id`                   │  └────────┬─────────┘    │
+   `gen_ai.agent.name`                     │           │              │
+   `prometa.tool_name`        (optional)   │  canonical agent_id/etc  │
+   `prometa.customer_id`      (optional)   │           ▼              │
+   `gen_ai.conversation.id`   (optional)   │  ┌──────────────────┐    │
+   `gen_ai.user.id`           (optional)   │  │ ClickHouse       │    │
+   `gen_ai.request.model`     (optional)   │  │ (telemetry)      │    │
+   AML v0.4 helper spans      (optional)   │  └──────────────────┘    │
+                                           └──────────────────────────┘
+```
+
+Once the canonical ids land in ClickHouse, the platform's readers
+(registry, AML scoring engine, incidents, annotations, workflow runs)
+all join on the same chain. The end-to-end design lives in
+[`resources/correlation/correlation-id-design.md`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md).
+
+**Technology dependencies**
+
+- Python ≥ 3.9
+- `urllib` (standard library) for OTLP POST
+- No required third-party deps; LLM auto-instrumentation hooks are
+  opt-in and only run when the corresponding library is installed.
 
 ## Contributing
 

@@ -91,6 +91,15 @@ class Prometa:
         agent_name: str = "prometa-agent",
         agent_id: Optional[str] = None,
         stage: str = "development",
+        # Correlation-chain identity horizontal — the org's external
+        # customer key (their CRM / data-warehouse id for the
+        # end-customer this Prometa-instrumented app serves). Stamped
+        # on every span's resource attributes when set; the platform's
+        # correlation-id resolver validates against
+        # `Organization.customerNamespace` at ingest. Leave None for
+        # service-to-service or single-tenant deployments where every
+        # span trivially belongs to the same customer scope.
+        customer_id: Optional[str] = None,
         flush_interval_seconds: float = 2.0,
         timeout_seconds: float = 5.0,
     ) -> None:
@@ -100,6 +109,7 @@ class Prometa:
         self.agent_name = agent_name
         self.agent_id = agent_id or _new_id()
         self.stage = stage
+        self.customer_id = customer_id
         self._flush_interval = flush_interval_seconds
         self._timeout = timeout_seconds
 
@@ -204,6 +214,16 @@ class Prometa:
                 "gen_ai.conversation.id", ""
             )
         effective_session = session_id or inherited_session
+        # Inherit customer_id from the parent span so a per-span
+        # `set_customer_id` override on the workflow root flows into
+        # every nested span. The constructor-time `self.customer_id`
+        # is the org-wide default; per-span override wins.
+        inherited_customer = ""
+        if parent is not None:
+            inherited_customer = parent.attributes.get(
+                "prometa.customer_id", ""
+            )
+        effective_customer = inherited_customer or (self.customer_id or "")
         span = _Span(
             name=name,
             kind=kind,
@@ -220,6 +240,11 @@ class Prometa:
                 **(
                     {"gen_ai.conversation.id": effective_session}
                     if effective_session
+                    else {}
+                ),
+                **(
+                    {"prometa.customer_id": effective_customer}
+                    if effective_customer
                     else {}
                 ),
             },

@@ -67,6 +67,18 @@ from .refs import (
     get_output_ref,
     current_span_id,
 )
+# Correlation-chain identity-horizontal helpers — let the SDK emit the
+# new optional resource / span attributes the platform's correlation-id
+# resolver consumes (`prometa.customer_id`, `gen_ai.user.id`,
+# `gen_ai.request.model`, `prometa.tool_name`). See the design doc:
+# https://github.com/prometa-ai/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md
+from .chain import (
+    set_customer_id,
+    set_user_id,
+    set_conversation_id,
+    set_request_model,
+    set_tool_name,
+)
 
 # AML v0.4 instrumentation helpers — all 16 primitives from the contract
 # bundled at `resources/aml/phase-0/instrumentation-spec.yaml` in
@@ -100,6 +112,13 @@ __all__ = [
     "get_input_ref",
     "get_output_ref",
     "current_span_id",
+    # Correlation-chain identity-horizontal helpers (platform-side
+    # resolver consumes these to materialise the canonical chain).
+    "set_customer_id",
+    "set_user_id",
+    "set_conversation_id",
+    "set_request_model",
+    "set_tool_name",
     # v0.4 AML helpers — dual-channel toggle
     "raw_channel",
     # v0.4 AML helpers — safety / governance (A1-A8)

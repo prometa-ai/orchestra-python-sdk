@@ -7,6 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-18
+
+### Added
+
+- Optional OpenLLMetry bridge via `prometa.integrations.openllmetry`.
+  When installed with `prometa-sdk[openllmetry]`, the SDK can use
+  Traceloop/OpenLLMetry instrumentors for OpenAI, Anthropic, LangChain /
+  LangGraph, Chroma, and Pinecone while converting the resulting
+  OpenTelemetry spans into Prometa's existing OTLP/JSON shipper. Existing
+  Prometa-native wrappers remain available as fallbacks.
+
 ## [0.4.0] — 2026-05-14
 
 ### Added

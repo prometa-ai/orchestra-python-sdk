@@ -31,9 +31,9 @@ Three families of helpers ship in the SDK today:
 pip install prometa-sdk
 ```
 
-Latest release: **0.5.0** (correlation-chain helpers + `customer_id`
-constructor kwarg, on top of the AML v0.4 contract that shipped in
-0.4.0). Release history is on
+Latest release: **0.6.0** (optional OpenLLMetry bridge, on top of the
+correlation-chain helpers + `customer_id` constructor kwarg from 0.5.0
+and the AML v0.4 contract from 0.4.0). Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
@@ -285,6 +285,61 @@ table. When that lands, the panel will switch back to reading the
 processed-vs-raw pair from that table; the SDK contract does not
 change.
 
+## OpenLLMetry bridge (optional)
+
+Prometa can also use Traceloop's OpenLLMetry instrumentors as the
+first-choice auto-instrumentation layer. OpenLLMetry is Apache-2.0 and
+its instrumentors are standard OpenTelemetry instrumentations, so the
+SDK keeps them optional and bridges their finished OTel spans back into
+Prometa's existing OTLP/JSON shipper.
+
+```bash
+pip install "prometa-sdk[openllmetry]"
+```
+
+```python
+from prometa import Prometa
+from prometa.integrations import openllmetry
+
+Prometa(endpoint=..., api_key=..., solution_id=..., agent_name="my-agent")
+
+result = openllmetry.install()
+# {'openai': True, 'anthropic': True, 'langchain': True,
+#  'chromadb': True, 'pinecone': True}
+```
+
+By default this attempts OpenLLMetry for OpenAI, Anthropic, LangChain /
+LangGraph, Chroma, and Pinecone. If an OpenLLMetry package or target
+library is missing, `fallback=True` uses Prometa's native wrappers for
+the same target where one exists. The bridge also maps OpenLLMetry's
+newer `gen_ai.input.messages` / `gen_ai.output.messages` attributes
+onto Prometa's existing `gen_ai.prompt`, `gen_ai.prompt.user`, and
+`gen_ai.completion` fields so current trace UI behavior stays stable.
+
+For broader OpenLLMetry coverage, install:
+
+```bash
+pip install "prometa-sdk[openllmetry-all]"
+```
+
+Then pass the extra targets explicitly:
+
+```python
+openllmetry.install(
+    targets=[
+        "openai", "anthropic", "langchain", "chromadb", "pinecone",
+        "bedrock", "cohere", "haystack", "llamaindex",
+    ]
+)
+```
+
+**Migration note:** do not install both `openllmetry.install()` and the
+matching native `prometa.integrations.openai.install()` /
+`anthropic.install()` wrappers for the same process unless you are
+intentionally comparing span output; double-patching a client can emit
+duplicate spans. Existing customers can stay on the native wrappers and
+migrate target-by-target when ready.
+
 ## Reliability & retry semantics
 
 The SDK ships traces over OTLP/JSON with **at-least-once** delivery: a
@@ -368,6 +423,8 @@ all join on the same chain. The end-to-end design lives in
 - `urllib` (standard library) for OTLP POST
 - No required third-party deps; LLM auto-instrumentation hooks are
   opt-in and only run when the corresponding library is installed.
+- Optional OpenLLMetry bridge extras require Python ≥ 3.10 because the
+  current OpenLLMetry packages do.
 
 ## Contributing
 

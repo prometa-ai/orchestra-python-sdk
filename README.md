@@ -192,6 +192,39 @@ or setting `PROMETA_AGENT_ID`. When pinned, the SDK includes
 SDK deliberately omits `gen_ai.agent.id`; it does not generate a
 random per-process fallback.
 
+### Agent names — always set them
+
+`agent_name` is the customer-owned half of the
+`(orgId, solutionId, agent_name)` tuple the platform's Agent registry
+keys on. Two apps in the same solution that share the same
+`agent_name` collapse into a single Agent row — every downstream
+metric (latency, error rate, PAMI, cost) then fans across the wrong
+population.
+
+Resolution precedence:
+
+1. Explicit `agent_name="..."` kwarg to `Prometa(...)`.
+2. `PROMETA_AGENT_NAME` environment variable.
+3. Literal fallback `"prometa-agent"`, **emitted with a `UserWarning`**
+   at startup so the collision risk is visible in your logs the
+   moment you run an unconfigured app.
+
+```bash
+# Production
+export PROMETA_AGENT_NAME=declarai-assistant
+```
+
+```python
+# Or per-instance
+prometa = Prometa(endpoint=..., agent_name="declarai-assistant")
+```
+
+The fallback warning is intentional: silent registry collisions
+were the most-reported "AML score shows 0" symptom before this
+warning landed. If you genuinely want the literal name
+`"prometa-agent"`, pass it explicitly (`agent_name="prometa-agent"`)
+— the warning fires only on the unset path.
+
 ## AML v0.4 instrumentation contract
 
 The SDK ships 16 helpers that emit the spans the platform's AML

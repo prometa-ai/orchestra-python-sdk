@@ -36,6 +36,10 @@ class AgentIdResolutionTest(unittest.TestCase):
             os.environ.pop("PROMETA_AGENT_ID", None)
 
     def _make_client(self, **kwargs):
+        # Default agent_name so these tests stay focused on agent_id —
+        # without it the new agent_name fallback warning leaks into
+        # every test that doesn't override it.
+        kwargs.setdefault("agent_name", "test-agent")
         return Prometa(
             endpoint="http://localhost:0/never-flushed",
             flush_interval_seconds=3600,

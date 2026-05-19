@@ -238,7 +238,14 @@ def _ensure_bridge_provider(
 def _resource_attributes() -> dict[str, str]:
     client = Prometa._current
     if client is None:
-        return {"service.name": "prometa-agent", "telemetry.sdk.name": "prometa-sdk"}
+        # Pre-construction fallback — reached only if an OpenLLMetry
+        # instrumentor fires before any Prometa() was built (shouldn't
+        # happen in practice, since install_openllmetry_bridge requires
+        # a client to even reach this code). Uses the same default name
+        # the constructor would warn-and-use, so the registry shape is
+        # consistent across paths.
+        from prometa.client import DEFAULT_AGENT_NAME
+        return {"service.name": DEFAULT_AGENT_NAME, "telemetry.sdk.name": "prometa-sdk"}
     return {
         "service.name": client.agent_name,
         **_agent_identity_attrs(client.agent_name, client.agent_id),

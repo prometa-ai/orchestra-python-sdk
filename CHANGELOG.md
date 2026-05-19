@@ -7,6 +7,36 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-05-19
+
+### Added
+
+- **`PROMETA_AGENT_NAME` env var** as a fallback when no `agent_name`
+  kwarg is passed to `Prometa(...)`. Resolution precedence is:
+  explicit kwarg → `PROMETA_AGENT_NAME` env → literal
+  `"prometa-agent"` fallback **with a `UserWarning`** pointing at the
+  env var. Mirrors the v0.7.0 `PROMETA_AGENT_ID` shape.
+
+### Changed
+
+- When the SDK falls back to the default `agent_name="prometa-agent"`
+  (no kwarg, no env), it now emits a `UserWarning` at construction.
+  The platform's Agent registry is keyed on
+  `(orgId, solutionId, agent_name)`, so two apps in the same solution
+  that both fall through to the default collapse into a single Agent
+  row — every downstream metric then fans across the wrong
+  population. The warning makes this visible at startup instead of
+  surfacing later as "the AML score for this agent is 0." Callers
+  who deliberately want the literal name `"prometa-agent"` can pass
+  it explicitly to suppress the warning.
+
+### Fixed
+
+- `prometa.integrations.openllmetry._resource_attributes()`'s
+  pre-construction fallback now reuses `DEFAULT_AGENT_NAME` from the
+  client module instead of a hard-coded string literal, so future
+  default changes only need to flip one symbol.
+
 ## [0.7.1] — 2026-05-19
 
 ### Changed

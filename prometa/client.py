@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -70,6 +71,54 @@ def _resolve_agent_id(passed: Optional[str]) -> Optional[str]:
     return _clean_agent_id(passed) or _clean_agent_id(os.environ.get("PROMETA_AGENT_ID"))
 
 
+# Sentinel marking "caller did not pass agent_name". We can't just check
+# `agent_name == DEFAULT_AGENT_NAME` because a caller may deliberately
+# pass the literal "prometa-agent" — in which case we should not warn
+# (they made an explicit choice). The sentinel preserves call-site
+# intent without changing the public type signature.
+_AGENT_NAME_UNSET = object()
+DEFAULT_AGENT_NAME = "prometa-agent"
+
+
+def _resolve_agent_name(passed: Any) -> str:
+    """Resolve agent_name: explicit kwarg > PROMETA_AGENT_NAME env > default.
+
+    ``agent_name`` is the customer-owned identity of the instrumented
+    app. The platform keys the Agent registry on
+    ``(orgId, solutionId, agent_name)``, so two apps in the same solution
+    that both fall back to the default collapse into a single Agent row
+    in the registry — every read after that fans out across the wrong
+    population.
+
+    Resolution precedence:
+      1. Explicit kwarg passed to ``Prometa(agent_name=...)``.
+      2. ``PROMETA_AGENT_NAME`` environment variable.
+      3. The literal ``"prometa-agent"`` fallback, with a ``UserWarning``
+         pointing the operator at the env var. The fallback exists so
+         that a forgotten ``agent_name`` doesn't crash the process —
+         the warning makes the collision risk visible at startup
+         instead of surfacing later as "everyone shares one Agent row."
+    """
+    if passed is not _AGENT_NAME_UNSET:
+        cleaned = str(passed).strip()
+        if cleaned:
+            return cleaned
+
+    env_value = os.environ.get("PROMETA_AGENT_NAME", "").strip()
+    if env_value:
+        return env_value
+
+    warnings.warn(
+        "Prometa(): no agent_name supplied and PROMETA_AGENT_NAME is unset; "
+        "falling back to \"prometa-agent\". Apps in the same solution that "
+        "share this default collapse into one Agent row in the registry. "
+        "Set agent_name=... (or export PROMETA_AGENT_NAME) to disambiguate.",
+        UserWarning,
+        stacklevel=3,
+    )
+    return DEFAULT_AGENT_NAME
+
+
 def _agent_identity_attrs(agent_name: str, agent_id: Optional[str]) -> Dict[str, str]:
     attrs = {"gen_ai.agent.name": agent_name}
     if agent_id:
@@ -115,7 +164,10 @@ class Prometa:
         api_key: Optional[str] = None,
         *,
         solution_id: Optional[str] = None,
-        agent_name: str = "prometa-agent",
+        # Sentinel default so we can distinguish "caller omitted" (warn
+        # + fall back) from "caller explicitly passed 'prometa-agent'"
+        # (no warn). See _resolve_agent_name for the resolution rules.
+        agent_name: Any = _AGENT_NAME_UNSET,
         agent_id: Optional[str] = None,
         stage: str = "development",
         # Correlation-chain identity horizontal — the org's external
@@ -133,7 +185,7 @@ class Prometa:
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key or os.environ.get("PROMETA_API_KEY")
         self.solution_id = solution_id
-        self.agent_name = agent_name
+        self.agent_name = _resolve_agent_name(agent_name)
         self.agent_id: Optional[str] = _resolve_agent_id(agent_id)
         self.stage = stage
         self.customer_id = customer_id

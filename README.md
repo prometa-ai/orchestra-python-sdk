@@ -31,9 +31,7 @@ Three families of helpers ship in the SDK today:
 pip install prometa-sdk
 ```
 
-Latest release: **0.6.0** (optional OpenLLMetry bridge, on top of the
-correlation-chain helpers + `customer_id` constructor kwarg from 0.5.0
-and the AML v0.4 contract from 0.4.0). Release history is on
+Current source version: **0.7.1**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
@@ -76,7 +74,8 @@ Each decorated function emits a span with:
 
 - `prometa.kind` — `workflow | agent | tool | task`
 - `prometa.solution_id`, `prometa.stage`
-- `gen_ai.agent.name`, `gen_ai.agent.id`
+- `gen_ai.agent.name`
+- `gen_ai.agent.id` — only when you explicitly pin one; otherwise the platform auto-registers the Agent from `solution_id` + `agent_name`
 - `gen_ai.conversation.id` — when the producer opts into session grouping (see below)
 - Parent/child relationships across async/sync calls
 - Errors → span status `error` plus `error.message`
@@ -178,6 +177,20 @@ synchronous, no-op outside an active span context (returns `False`),
 empty value pops the attribute. See the platform-side design at
 [`resources/correlation/correlation-id-design.md`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md)
 for the full canonical-chain grammar.
+
+### Stable Agent IDs
+
+`agent_id` is optional. By default the SDK emits `solution_id` and
+`agent_name`, then the platform mirrors the Tool registration model:
+on first sighting it auto-registers the Agent row for the
+`(orgId, solutionId, agentName)` tuple and attaches the canonical
+Agent ID during ingest.
+
+You can still pin an ID by passing `agent_id="..."` to `Prometa(...)`
+or setting `PROMETA_AGENT_ID`. When pinned, the SDK includes
+`gen_ai.agent.id` on resource and span attributes. When absent, the
+SDK deliberately omits `gen_ai.agent.id`; it does not generate a
+random per-process fallback.
 
 ## AML v0.4 instrumentation contract
 
@@ -375,7 +388,7 @@ release alongside this SDK version (see CHANGELOG.md).
 | `api_key` | `PROMETA_API_KEY` | none |
 | `solution_id` | — | none |
 | `agent_name` | — | `"prometa-agent"` |
-| `agent_id` | `PROMETA_AGENT_ID` | random 16-char hex — **emits a startup warning** because random ids don't match the platform-side `Agent.id` (UUID), so every PG↔CH join for the agent silently returns empty. Set this to your registered Agent UUID. |
+| `agent_id` | `PROMETA_AGENT_ID` | none — when omitted, the SDK leaves `gen_ai.agent.id` absent and the platform auto-registers/attaches the canonical Agent ID from `(orgId, solutionId, agentName)` |
 | `stage` | — | `"development"` |
 | `customer_id` | — | none — org-wide default for `prometa.customer_id` |
 | `flush_interval_seconds` | — | `2.0` |

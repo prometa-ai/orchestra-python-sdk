@@ -7,6 +7,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`PROMETA_AGENT_ID` env var** as a fallback when no `agent_id` kwarg
+  is passed to `Prometa(...)`. Resolution precedence is: explicit
+  kwarg → `PROMETA_AGENT_ID` env → random 16-char hex fallback.
+
+### Changed
+
+- When the SDK falls back to a random per-process `agent_id` (no
+  kwarg, no env), it now emits a `UserWarning` pointing to
+  `PROMETA_AGENT_ID`. Random ids don't match the platform-side
+  registry `Agent.id` (a UUID), so every Postgres↔ClickHouse join for
+  the agent silently returns empty — the warning makes that visible at
+  SDK startup instead of surfacing later as "the AML page shows zero
+  traces."
+
 ## [0.6.0] — 2026-05-18
 
 ### Added

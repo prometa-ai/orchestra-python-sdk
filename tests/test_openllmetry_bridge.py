@@ -92,6 +92,7 @@ class OpenLLMetryBridgeTest(unittest.TestCase):
             api_key=None,
             solution_id="sol-test",
             agent_name="test-agent",
+            agent_id="test-agent-id",
             stage="test",
             customer_id="cus-default",
         )

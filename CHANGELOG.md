@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-19
+
 ### Added
 
 - **`PROMETA_AGENT_ID` env var** as a fallback when no `agent_id` kwarg

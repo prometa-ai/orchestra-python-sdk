@@ -7,6 +7,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-19
+
+### Changed
+
+- `agent_id` is now fully optional. Resolution is explicit kwarg →
+  `PROMETA_AGENT_ID` env → omitted. When omitted, the SDK no longer
+  emits a random per-process fallback or startup warning; it leaves
+  `gen_ai.agent.id` absent so platform-side Agent auto-registration can
+  attach the canonical Agent ID from `(orgId, solutionId, agentName)`.
+
 ## [0.7.0] — 2026-05-19
 
 ### Added

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from .. import _context
-from ..client import Prometa, _Span
+from ..client import Prometa, _Span, _agent_identity_attrs
 from . import _llm_common as _llm
 
 
@@ -241,8 +241,7 @@ def _resource_attributes() -> dict[str, str]:
         return {"service.name": "prometa-agent", "telemetry.sdk.name": "prometa-sdk"}
     return {
         "service.name": client.agent_name,
-        "gen_ai.agent.name": client.agent_name,
-        "gen_ai.agent.id": client.agent_id,
+        **_agent_identity_attrs(client.agent_name, client.agent_id),
         "prometa.solution.name": client.solution_id or "",
         "prometa.stage": client.stage,
         "telemetry.sdk.name": "prometa-sdk",
@@ -411,8 +410,7 @@ class _PrometaSpanProcessor:
             "prometa.kind": kind,
             "prometa.solution_id": client.solution_id or "",
             "prometa.stage": client.stage,
-            "gen_ai.agent.name": client.agent_name,
-            "gen_ai.agent.id": client.agent_id,
+            **_agent_identity_attrs(client.agent_name, client.agent_id),
             "prometa.instrumentation.provider": "openllmetry",
         }
         if client.customer_id:

@@ -1,10 +1,10 @@
-"""Tests for `Prometa.__init__`'s agent_id resolution precedence.
+"""Tests for `Prometa.__init__`'s optional agent_id resolution.
 
-The SDK's agent_id has to match the platform-side registry UUID for
-the agent so traces and spans correlate against `Agent.id` in
-Postgres. The resolution chain — explicit kwarg, then
-PROMETA_AGENT_ID env, then a warning-with-random-fallback — exists
-specifically to make that contract visible.
+Agents now mirror Tool registration semantics. The customer-facing
+identity is the `(solution_id, agent_name)` tuple; the platform can
+auto-register/attach the canonical Agent row on first sighting. The
+SDK still honors an explicit `agent_id` override, but it must not
+invent a random per-process fallback when none is configured.
 
 These tests don't run the flush thread to completion (no endpoint is
 reachable) but the client constructs cleanly because the buffer is
@@ -18,10 +18,11 @@ import unittest
 import warnings
 
 from prometa import Prometa
+from prometa.integrations import _llm_common, openllmetry
 
 
 class AgentIdResolutionTest(unittest.TestCase):
-    """Precedence: explicit kwarg > env > warn-and-random."""
+    """Precedence: explicit kwarg > env > omit."""
 
     def setUp(self) -> None:
         # Drop the env var so each test starts from a clean slate. The
@@ -35,7 +36,18 @@ class AgentIdResolutionTest(unittest.TestCase):
             os.environ.pop("PROMETA_AGENT_ID", None)
 
     def _make_client(self, **kwargs):
-        return Prometa(endpoint="http://localhost:0/never-flushed", **kwargs)
+        return Prometa(
+            endpoint="http://localhost:0/never-flushed",
+            flush_interval_seconds=3600,
+            **kwargs,
+        )
+
+    def _otlp_attrs(self, attrs):
+        decoded = {}
+        for attr in attrs:
+            value = attr["value"]
+            decoded[attr["key"]] = next(iter(value.values()))
+        return decoded
 
     def test_explicit_kwarg_wins_over_env(self) -> None:
         os.environ["PROMETA_AGENT_ID"] = "from-env"
@@ -43,21 +55,19 @@ class AgentIdResolutionTest(unittest.TestCase):
         self.assertEqual(client.agent_id, "from-kwarg")
 
     def test_env_used_when_no_kwarg(self) -> None:
-        os.environ["PROMETA_AGENT_ID"] = "6ca98816-3538-4da4-a2e2-1e3726ab887a"
+        os.environ["PROMETA_AGENT_ID"] = "declarai-assistant-production"
         client = self._make_client()
-        self.assertEqual(client.agent_id, "6ca98816-3538-4da4-a2e2-1e3726ab887a")
+        self.assertEqual(client.agent_id, "declarai-assistant-production")
 
-    def test_random_fallback_warns(self) -> None:
-        # No kwarg, no env — should still produce a usable id but warn.
+    def test_missing_agent_id_is_omitted_without_warning(self) -> None:
+        # No kwarg, no env: platform-side Agent auto-registration owns
+        # the canonical id, so the SDK leaves it absent.
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             client = self._make_client()
 
-        self.assertEqual(len(client.agent_id), 16)
-        self.assertTrue(all(c in "0123456789abcdef" for c in client.agent_id))
-        matching = [w for w in caught if "random per-process agent_id" in str(w.message)]
-        self.assertEqual(len(matching), 1, "Expected exactly one fallback warning")
-        self.assertEqual(matching[0].category, UserWarning)
+        self.assertIsNone(client.agent_id)
+        self.assertEqual(caught, [])
 
     def test_empty_string_kwarg_falls_through_to_env(self) -> None:
         # Defensive: an empty string from a missing config lookup
@@ -65,6 +75,84 @@ class AgentIdResolutionTest(unittest.TestCase):
         os.environ["PROMETA_AGENT_ID"] = "from-env"
         client = self._make_client(agent_id="")
         self.assertEqual(client.agent_id, "from-env")
+
+    def test_empty_string_env_is_treated_as_absent(self) -> None:
+        os.environ["PROMETA_AGENT_ID"] = ""
+        client = self._make_client()
+        self.assertIsNone(client.agent_id)
+
+    def test_missing_agent_id_is_not_emitted_on_spans_or_resource(self) -> None:
+        client = self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            stage="test",
+        )
+
+        @client.workflow(name="root")
+        def root():
+            return None
+
+        root()
+        span = client._buffer[-1]
+        self.assertNotIn("gen_ai.agent.id", span.attributes)
+
+        payload = client._build_otlp_payload([span])
+        resource_attrs = self._otlp_attrs(
+            payload["resourceSpans"][0]["resource"]["attributes"]
+        )
+        otlp_span_attrs = self._otlp_attrs(
+            payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        )
+        self.assertEqual(resource_attrs["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("gen_ai.agent.id", resource_attrs)
+        self.assertNotIn("gen_ai.agent.id", otlp_span_attrs)
+
+    def test_explicit_agent_id_is_emitted_on_spans_and_resource(self) -> None:
+        client = self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            agent_id="test-agent-id",
+            stage="test",
+        )
+
+        @client.workflow(name="root")
+        def root():
+            return None
+
+        root()
+        span = client._buffer[-1]
+        self.assertEqual(span.attributes["gen_ai.agent.id"], "test-agent-id")
+
+        payload = client._build_otlp_payload([span])
+        resource_attrs = self._otlp_attrs(
+            payload["resourceSpans"][0]["resource"]["attributes"]
+        )
+        self.assertEqual(resource_attrs["gen_ai.agent.id"], "test-agent-id")
+
+    def test_llm_manual_span_omits_missing_agent_id(self) -> None:
+        self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            stage="test",
+        )
+
+        span = _llm_common.open_manual_span("agent", "chat gpt-4o", {})
+
+        self.assertIsNotNone(span)
+        self.assertEqual(span.attributes["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("gen_ai.agent.id", span.attributes)
+
+    def test_openllmetry_resource_attrs_omit_missing_agent_id(self) -> None:
+        self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            stage="test",
+        )
+
+        attrs = openllmetry._resource_attributes()
+
+        self.assertEqual(attrs["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("gen_ai.agent.id", attrs)
 
 
 if __name__ == "__main__":

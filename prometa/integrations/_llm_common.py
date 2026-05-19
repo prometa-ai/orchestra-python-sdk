@@ -26,7 +26,7 @@ import time
 from typing import Any, AsyncIterator, Iterator, Optional
 
 from .. import _context
-from ..client import Prometa, _Span, _new_id, _now_unix_nano
+from ..client import Prometa, _Span, _agent_identity_attrs, _new_id, _now_unix_nano
 
 # Cap individual prompt/completion attribute payloads. Real chat histories
 # can be tens of KB; the OTLP envelope and ClickHouse string columns both
@@ -180,8 +180,7 @@ def open_manual_span(kind: str, name: str, base_attrs: dict) -> Optional[_Span]:
             "prometa.kind": kind,
             "prometa.solution_id": client.solution_id or "",
             "prometa.stage": client.stage,
-            "gen_ai.agent.name": client.agent_name,
-            "gen_ai.agent.id": client.agent_id,
+            **_agent_identity_attrs(client.agent_name, client.agent_id),
             **base_attrs,
         },
     )

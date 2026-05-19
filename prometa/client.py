@@ -13,7 +13,6 @@ import threading
 import time
 import urllib.request
 import uuid
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -51,30 +50,31 @@ def _new_id(length: int = 16) -> str:
     return uuid.uuid4().hex[:length]
 
 
-def _resolve_agent_id(passed: Optional[str]) -> str:
-    """Resolve agent_id with precedence: explicit kwarg > PROMETA_AGENT_ID env > random fallback.
+def _clean_agent_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
-    Random per-process ids don't match the platform-side registry
-    Agent.id (a UUID), which silently breaks every PG↔CH join across
-    the agent (lineage, AML scoring, incident-to-trace). The warning
-    on the fallback path makes that situation visible at SDK startup
-    instead of surfacing days later as "the dashboard shows zero
-    traces for this agent."
+
+def _resolve_agent_id(passed: Optional[str]) -> Optional[str]:
+    """Resolve optional agent_id: explicit kwarg > PROMETA_AGENT_ID env > None.
+
+    Agents now mirror Tool registration semantics: customers identify
+    an agent by the customer-owned ``(solution_id, agent_name)`` tuple,
+    and the platform can auto-register/attach the canonical Agent row
+    on first sighting. A supplied ``agent_id`` is still honored for
+    advanced users who need to pin an ID, but the SDK no longer invents
+    a random per-process fallback.
     """
-    if passed:
-        return passed
-    from_env = os.environ.get("PROMETA_AGENT_ID")
-    if from_env:
-        return from_env
-    warnings.warn(
-        "Prometa SDK is using a random per-process agent_id. "
-        "Set PROMETA_AGENT_ID to your registered Agent UUID (or pass "
-        "agent_id=... to Prometa(...)) so platform-side trace/span "
-        "joins line up with the agent registry.",
-        UserWarning,
-        stacklevel=3,
-    )
-    return _new_id()
+    return _clean_agent_id(passed) or _clean_agent_id(os.environ.get("PROMETA_AGENT_ID"))
+
+
+def _agent_identity_attrs(agent_name: str, agent_id: Optional[str]) -> Dict[str, str]:
+    attrs = {"gen_ai.agent.name": agent_name}
+    if agent_id:
+        attrs["gen_ai.agent.id"] = agent_id
+    return attrs
 
 
 @dataclass
@@ -134,7 +134,7 @@ class Prometa:
         self.api_key = api_key or os.environ.get("PROMETA_API_KEY")
         self.solution_id = solution_id
         self.agent_name = agent_name
-        self.agent_id = _resolve_agent_id(agent_id)
+        self.agent_id: Optional[str] = _resolve_agent_id(agent_id)
         self.stage = stage
         self.customer_id = customer_id
         self._flush_interval = flush_interval_seconds
@@ -262,8 +262,7 @@ class Prometa:
                 "prometa.kind": kind,
                 "prometa.solution_id": self.solution_id or "",
                 "prometa.stage": self.stage,
-                "gen_ai.agent.name": self.agent_name,
-                "gen_ai.agent.id": self.agent_id,
+                **_agent_identity_attrs(self.agent_name, self.agent_id),
                 **(
                     {"gen_ai.conversation.id": effective_session}
                     if effective_session
@@ -337,8 +336,13 @@ class Prometa:
                     "resource": {
                         "attributes": [
                             _attr_kv("service.name", self.agent_name),
-                            _attr_kv("gen_ai.agent.name", self.agent_name),
-                            _attr_kv("gen_ai.agent.id", self.agent_id),
+                            *[
+                                _attr_kv(k, v)
+                                for k, v in _agent_identity_attrs(
+                                    self.agent_name,
+                                    self.agent_id,
+                                ).items()
+                            ],
                             _attr_kv("prometa.solution.name", self.solution_id or ""),
                             _attr_kv("prometa.stage", self.stage),
                         ]

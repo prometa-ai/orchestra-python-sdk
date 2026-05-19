@@ -39,6 +39,7 @@ class ChainAttrsTest(unittest.TestCase):
             api_key=None,
             solution_id="sol-test",
             agent_name="test-agent",
+            agent_id="test-agent-id",
             stage="test",
         )
 
@@ -127,6 +128,7 @@ class ConstructorCustomerIdTest(unittest.TestCase):
             api_key=None,
             solution_id="sol-test",
             agent_name="test-agent",
+            agent_id="test-agent-id",
             stage="test",
             customer_id="cus_org_wide_default",
         )

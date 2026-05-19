@@ -375,7 +375,7 @@ release alongside this SDK version (see CHANGELOG.md).
 | `api_key` | `PROMETA_API_KEY` | none |
 | `solution_id` | — | none |
 | `agent_name` | — | `"prometa-agent"` |
-| `agent_id` | — | random uuid (discarded by platform resolver) |
+| `agent_id` | `PROMETA_AGENT_ID` | random 16-char hex — **emits a startup warning** because random ids don't match the platform-side `Agent.id` (UUID), so every PG↔CH join for the agent silently returns empty. Set this to your registered Agent UUID. |
 | `stage` | — | `"development"` |
 | `customer_id` | — | none — org-wide default for `prometa.customer_id` |
 | `flush_interval_seconds` | — | `2.0` |

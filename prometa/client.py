@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -48,6 +49,32 @@ def _now_unix_nano() -> int:
 
 def _new_id(length: int = 16) -> str:
     return uuid.uuid4().hex[:length]
+
+
+def _resolve_agent_id(passed: Optional[str]) -> str:
+    """Resolve agent_id with precedence: explicit kwarg > PROMETA_AGENT_ID env > random fallback.
+
+    Random per-process ids don't match the platform-side registry
+    Agent.id (a UUID), which silently breaks every PG↔CH join across
+    the agent (lineage, AML scoring, incident-to-trace). The warning
+    on the fallback path makes that situation visible at SDK startup
+    instead of surfacing days later as "the dashboard shows zero
+    traces for this agent."
+    """
+    if passed:
+        return passed
+    from_env = os.environ.get("PROMETA_AGENT_ID")
+    if from_env:
+        return from_env
+    warnings.warn(
+        "Prometa SDK is using a random per-process agent_id. "
+        "Set PROMETA_AGENT_ID to your registered Agent UUID (or pass "
+        "agent_id=... to Prometa(...)) so platform-side trace/span "
+        "joins line up with the agent registry.",
+        UserWarning,
+        stacklevel=3,
+    )
+    return _new_id()
 
 
 @dataclass
@@ -107,7 +134,7 @@ class Prometa:
         self.api_key = api_key or os.environ.get("PROMETA_API_KEY")
         self.solution_id = solution_id
         self.agent_name = agent_name
-        self.agent_id = agent_id or _new_id()
+        self.agent_id = _resolve_agent_id(agent_id)
         self.stage = stage
         self.customer_id = customer_id
         self._flush_interval = flush_interval_seconds

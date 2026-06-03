@@ -7,6 +7,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-06-03
+
+### Added
+
+- README coverage for **AQL / PrometaQL query readiness**, clarifying
+  that AQL is a platform-side query and evaluation layer over SDK
+  telemetry rather than a separate instrumentation-helper family.
+
+### Changed
+
+- README top-level framing now describes SDK telemetry surfaces instead
+  of an outdated helper-family count.
+
 ## [0.8.0] — 2026-06-03
 
 ### Added

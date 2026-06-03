@@ -1,8 +1,8 @@
 """Assistant intent labels for trace-level Prometa indexing.
 
-DeclarAI classifies each user turn before LLM/tool/action work and stamps
-the result onto the active trace. This module keeps that contract
-deterministic and token-free:
+Producer applications can classify each user turn before LLM/tool/action
+work and stamp the result onto the active trace. This module keeps that
+contract deterministic and token-free:
 
 ``A`` general_information_gathering
 ``B`` pipeline_flow_information_gathering
@@ -10,9 +10,8 @@ deterministic and token-free:
 ``D`` configuration_editing_execution
 ``E`` flow_process_execution
 
-Preclassified UI actions, such as the deterministic "Get AI Support"
-button, should call :func:`set_assistant_intent` directly with
-``preclassified=True``. Free-text turns can use
+Preclassified UI actions should call :func:`set_assistant_intent`
+directly with ``preclassified=True``. Free-text turns can use
 :func:`set_assistant_intent_from_text`, which performs deterministic
 clause decomposition and may emit multiple labels.
 """
@@ -35,29 +34,20 @@ LABEL_CODES: Tuple[str, ...] = ("A", "B", "C", "D", "E")
 CLASSIFIER_VERSION = "deterministic_clause_v1"
 PRECLASSIFIED_VERSION = "preclassified"
 
-DECLARAI_LABELS_ATTR = "declarai.intent.labels"
-DECLARAI_LABEL_NAMES_ATTR = "declarai.intent.label_names"
-DECLARAI_COUNT_ATTR = "declarai.intent.count"
-DECLARAI_SOURCE_ATTR = "declarai.intent.source"
-DECLARAI_PRECLASSIFIED_ATTR = "declarai.intent.preclassified"
-DECLARAI_CLASSIFIER_VERSION_ATTR = "declarai.intent.classifier_version"
-
 PROMETA_LABELS_ATTR = "prometa.intent.labels"
 PROMETA_LABEL_NAMES_ATTR = "prometa.intent.label_names"
+PROMETA_COUNT_ATTR = "prometa.intent.count"
 PROMETA_SOURCE_ATTR = "prometa.intent.source"
 PROMETA_PRECLASSIFIED_ATTR = "prometa.intent.preclassified"
+PROMETA_CLASSIFIER_VERSION_ATTR = "prometa.intent.classifier_version"
 
 INTENT_ATTRIBUTE_KEYS: Tuple[str, ...] = (
-    DECLARAI_LABELS_ATTR,
-    DECLARAI_LABEL_NAMES_ATTR,
-    DECLARAI_COUNT_ATTR,
-    DECLARAI_SOURCE_ATTR,
-    DECLARAI_PRECLASSIFIED_ATTR,
-    DECLARAI_CLASSIFIER_VERSION_ATTR,
     PROMETA_LABELS_ATTR,
     PROMETA_LABEL_NAMES_ATTR,
+    PROMETA_COUNT_ATTR,
     PROMETA_SOURCE_ATTR,
     PROMETA_PRECLASSIFIED_ATTR,
+    PROMETA_CLASSIFIER_VERSION_ATTR,
 )
 
 _NAME_TO_CODE = {name: code for code, name in LABEL_NAMES.items()}
@@ -250,7 +240,7 @@ def build_assistant_intent_attrs(
     preclassified: bool = True,
     classifier_version: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build DeclarAI and platform-indexable Prometa intent attributes."""
+    """Build platform-indexable Prometa intent attributes."""
     normalized = normalize_intent_labels(labels)
     if not normalized:
         return {}
@@ -260,16 +250,12 @@ def build_assistant_intent_attrs(
         PRECLASSIFIED_VERSION if preclassified else CLASSIFIER_VERSION
     )
     return {
-        DECLARAI_LABELS_ATTR: label_csv,
-        DECLARAI_LABEL_NAMES_ATTR: name_csv,
-        DECLARAI_COUNT_ATTR: len(normalized),
-        DECLARAI_SOURCE_ATTR: str(source or "manual"),
-        DECLARAI_PRECLASSIFIED_ATTR: bool(preclassified),
-        DECLARAI_CLASSIFIER_VERSION_ATTR: str(version),
         PROMETA_LABELS_ATTR: label_csv,
         PROMETA_LABEL_NAMES_ATTR: name_csv,
+        PROMETA_COUNT_ATTR: len(normalized),
         PROMETA_SOURCE_ATTR: str(source or "manual"),
         PROMETA_PRECLASSIFIED_ATTR: bool(preclassified),
+        PROMETA_CLASSIFIER_VERSION_ATTR: str(version),
     }
 
 
@@ -345,10 +331,7 @@ def set_assistant_intent_from_text(
 
 
 def has_assistant_intent_attrs(attrs: Dict[str, Any]) -> bool:
-    return bool(
-        attrs.get(DECLARAI_LABELS_ATTR)
-        or attrs.get(PROMETA_LABELS_ATTR)
-    )
+    return bool(attrs.get(PROMETA_LABELS_ATTR))
 
 
 def inherited_assistant_intent_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:

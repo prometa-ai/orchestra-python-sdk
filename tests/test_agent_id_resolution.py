@@ -59,9 +59,9 @@ class AgentIdResolutionTest(unittest.TestCase):
         self.assertEqual(client.agent_id, "from-kwarg")
 
     def test_env_used_when_no_kwarg(self) -> None:
-        os.environ["PROMETA_AGENT_ID"] = "declarai-assistant-production"
+        os.environ["PROMETA_AGENT_ID"] = "support-assistant-production"
         client = self._make_client()
-        self.assertEqual(client.agent_id, "declarai-assistant-production")
+        self.assertEqual(client.agent_id, "support-assistant-production")
 
     def test_missing_agent_id_is_omitted_without_warning(self) -> None:
         # No kwarg, no env: platform-side Agent auto-registration owns

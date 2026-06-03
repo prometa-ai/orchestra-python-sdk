@@ -124,7 +124,7 @@ __all__ = [
     "set_conversation_id",
     "set_request_model",
     "set_tool_name",
-    # Assistant intent labels (DeclarAI / platform trace indexing).
+    # Assistant intent labels (platform trace indexing).
     "classify_assistant_intent",
     "set_assistant_intent",
     "set_assistant_intent_from_text",

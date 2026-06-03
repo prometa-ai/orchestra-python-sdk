@@ -20,8 +20,8 @@ Three families of helpers ship in the SDK today:
   / lineage readers can join across the full identity prefix. Optional
   but unlocks the richer end-to-end view.
 - **Assistant intent labels** — `set_assistant_intent` /
-  `set_assistant_intent_from_text` stamp deterministic DeclarAI intent
-  labels plus `prometa.intent.*` aliases before LLM, tool, or action work.
+  `set_assistant_intent_from_text` stamp deterministic Prometa intent
+  labels before LLM, tool, or action work.
 - **AML v0.4 instrumentation contract** — 16 helpers
   (`pii_filter`, `guardrail`, `memory_read`, `record_retry_attempt`,
   `confidence_score`, `schema_validate`, `model_route`,
@@ -148,7 +148,7 @@ prometa = Prometa(
     endpoint="https://prometa.example.com/api/v2/otlp/v1/traces",
     api_key="prm_live_...",
     solution_id="sol_billing",
-    agent_name="declarai-assistant",
+    agent_name="support-assistant",
     customer_id="cus_org_wide_default",   # org-wide default; overridable per-span
 )
 
@@ -183,18 +183,18 @@ for the full canonical-chain grammar.
 
 ## Assistant intent labels
 
-DeclarAI can stamp assistant intent before any LLM/tool/action work so
-Prometa can index and filter traces by the user's intended operation.
+Applications can stamp assistant intent before any LLM/tool/action work
+so Prometa can index and filter traces by the user's intended operation.
 
 ```python
 from prometa import set_assistant_intent, set_assistant_intent_from_text
 
 @prometa.workflow(name="assistant-turn")
-def handle_turn(user_text: str, from_support_button: bool = False):
-    if from_support_button:
+def handle_turn(user_text: str, from_quick_action: bool = False):
+    if from_quick_action:
         set_assistant_intent(
             "D,E",
-            source="get_ai_support_button",
+            source="quick_action",
             preclassified=True,
         )
     else:
@@ -215,14 +215,11 @@ Labels are stable single-letter codes:
 | `D` | `configuration_editing_execution` |
 | `E` | `flow_process_execution` |
 
-The SDK stamps both DeclarAI trace attributes and Prometa aliases:
+The SDK stamps platform-indexable Prometa trace attributes:
 
-- `declarai.intent.labels`, `declarai.intent.label_names`,
-  `declarai.intent.count`, `declarai.intent.source`,
-  `declarai.intent.preclassified`,
-  `declarai.intent.classifier_version`
 - `prometa.intent.labels`, `prometa.intent.label_names`,
-  `prometa.intent.source`, `prometa.intent.preclassified`
+  `prometa.intent.count`, `prometa.intent.source`,
+  `prometa.intent.preclassified`, `prometa.intent.classifier_version`
 
 Free-text turns use deterministic clause decomposition, so a request
 such as "change the settings, then run the flow" emits `D,E` without
@@ -238,7 +235,7 @@ client.responses.create(
     model="gpt-4o-mini",
     input=[{"role": "user", "content": prompt}],
     prometa_intent_labels="D,E",
-    prometa_intent_source="get_ai_support_button",
+    prometa_intent_source="quick_action",
     prometa_intent_preclassified=True,
 )
 ```
@@ -276,12 +273,12 @@ Resolution precedence:
 
 ```bash
 # Production
-export PROMETA_AGENT_NAME=declarai-assistant
+export PROMETA_AGENT_NAME=support-assistant
 ```
 
 ```python
 # Or per-instance
-prometa = Prometa(endpoint=..., agent_name="declarai-assistant")
+prometa = Prometa(endpoint=..., agent_name="support-assistant")
 ```
 
 The fallback warning is intentional: silent registry collisions

@@ -126,49 +126,42 @@ def pop_assistant_intent_attrs(kwargs: dict) -> dict:
     Provider SDKs would reject unknown Prometa kwargs, so integrations
     strip these before calling the real client method:
 
-    - ``prometa_intent_labels`` / ``declarai_intent_labels``
-    - ``prometa_intent_source`` / ``declarai_intent_source``
-    - ``prometa_intent_preclassified`` / ``declarai_intent_preclassified``
+    - ``prometa_intent_labels`` / ``intent_labels``
+    - ``prometa_intent_source`` / ``intent_source``
+    - ``prometa_intent_preclassified`` / ``intent_preclassified``
     - ``prometa_intent_classifier_version`` /
-      ``declarai_intent_classifier_version``
+      ``intent_classifier_version``
     """
     labels = _pop_first(
         kwargs,
         (
             "prometa_intent_labels",
-            "declarai_intent_labels",
             "intent_labels",
             "prometa.intent.labels",
-            "declarai.intent.labels",
         ),
     )
     source = _pop_first(
         kwargs,
         (
             "prometa_intent_source",
-            "declarai_intent_source",
             "intent_source",
             "prometa.intent.source",
-            "declarai.intent.source",
         ),
     )
     preclassified = _pop_first(
         kwargs,
         (
             "prometa_intent_preclassified",
-            "declarai_intent_preclassified",
             "intent_preclassified",
             "prometa.intent.preclassified",
-            "declarai.intent.preclassified",
         ),
     )
     classifier_version = _pop_first(
         kwargs,
         (
             "prometa_intent_classifier_version",
-            "declarai_intent_classifier_version",
             "intent_classifier_version",
-            "declarai.intent.classifier_version",
+            "prometa.intent.classifier_version",
         ),
     )
     if labels is None:

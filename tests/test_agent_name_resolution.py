@@ -50,11 +50,11 @@ class AgentNameResolutionTest(unittest.TestCase):
         self.assertEqual([w for w in caught if issubclass(w.category, UserWarning)], [])
 
     def test_env_used_when_no_kwarg(self) -> None:
-        os.environ["PROMETA_AGENT_NAME"] = "declarai-assistant"
+        os.environ["PROMETA_AGENT_NAME"] = "support-assistant"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             client = self._make_client()
-        self.assertEqual(client.agent_name, "declarai-assistant")
+        self.assertEqual(client.agent_name, "support-assistant")
         self.assertEqual([w for w in caught if issubclass(w.category, UserWarning)], [])
 
     def test_missing_name_falls_back_and_warns(self) -> None:

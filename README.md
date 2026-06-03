@@ -8,7 +8,8 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
-Three families of helpers ship in the SDK today:
+The SDK ships several telemetry surfaces that make agent behavior queryable,
+evaluable, and joinable on the platform:
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -22,6 +23,10 @@ Three families of helpers ship in the SDK today:
 - **Assistant intent labels** — `set_assistant_intent` /
   `set_assistant_intent_from_text` stamp deterministic Prometa intent
   labels before LLM, tool, or action work.
+- **AQL-ready trace metadata** — lifecycle, correlation, refs, intent,
+  prompt, completion, usage, and model attributes give Prometa's AQL /
+  PrometaQL query and evaluation layer stable fields to filter, aggregate,
+  replay, and judge traces.
 - **AML v0.4 instrumentation contract** — 16 helpers
   (`pii_filter`, `guardrail`, `memory_read`, `record_retry_attempt`,
   `confidence_score`, `schema_validate`, `model_route`,
@@ -34,7 +39,7 @@ Three families of helpers ship in the SDK today:
 pip install prometa-sdk
 ```
 
-Current source version: **0.8.0**. Release history is on
+Current source version: **0.8.1**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
@@ -327,6 +332,30 @@ fire-and-forget events) that emits a typed span with the attribute
 shape the AML detectors expect. Calling them from inside an active
 `@prometa.workflow / .agent / .tool` decorator nests the AML spans
 under the parent — no extra wiring needed.
+
+## AQL / PrometaQL query readiness
+
+AQL is the platform-side query and evaluation layer over the telemetry
+this SDK emits. That is why it does not have a separate family of
+`aql_*` instrumentation helpers: AML helpers create additional detector
+evidence spans, while AQL reads the normalized trace/span attributes
+already emitted by decorators, setters, refs, and LLM integrations.
+
+To make traces useful for AQL queries and judge/replay workflows, stamp
+the stable fields AQL filters and aggregates on:
+
+| SDK surface | AQL-readable signal |
+|---|---|
+| `@prometa.workflow / .agent / .tool / .task` | `trace_id`, `span_id`, parent/child edges, `prometa.kind`, `prometa.solution_id`, `gen_ai.agent.name` |
+| `set_customer_id`, `set_user_id`, `set_conversation_id`, `set_request_model`, `set_tool_name` | canonical customer, user, session, model, and tool dimensions |
+| `set_assistant_intent` / `set_assistant_intent_from_text` | `prometa.intent.*` filters for user-turn intent and preclassified UI actions |
+| `set_input_ref`, `set_output_ref`, `current_span_id` | lineage edges for replay, judge, and flow-level queries |
+| LLM integrations | `gen_ai.prompt`, `gen_ai.prompt.user`, `gen_ai.completion`, token usage, response model, finish reasons |
+| AML helpers | typed evidence spans that AQL can join with ordinary lifecycle and LLM spans |
+
+In short: instrument once with the SDK, then run AQL / PrometaQL on the
+Prometa platform to query traces, compare sessions, inspect failure
+patterns, build eval cohorts, and feed LLM-as-judge or replay tooling.
 
 ## LLM client auto-instrumentation
 

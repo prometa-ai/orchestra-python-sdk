@@ -7,10 +7,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.7.2] — 2026-05-19
+## [0.8.0] — 2026-06-03
 
 ### Added
 
+- **Assistant intent labels** via `set_assistant_intent`,
+  `set_assistant_intent_from_text`, and `classify_assistant_intent`.
+  The SDK now stamps generic, platform-indexable
+  `prometa.intent.*` attributes before LLM/tool/action work, including
+  labels, label names, count, source, preclassification state, and
+  classifier version.
+- Native OpenAI, Anthropic, Google/Gemini, and OpenLLMetry integration
+  paths now classify the latest user turn deterministically when no
+  parent span already carries intent labels.
+- LLM integrations now accept local-only `prometa_intent_*` /
+  `intent_*` kwargs so callers can pass preclassified labels from any
+  UI/action producer without leaking those kwargs to provider SDKs.
 - **`PROMETA_AGENT_NAME` env var** as a fallback when no `agent_name`
   kwarg is passed to `Prometa(...)`. Resolution precedence is:
   explicit kwarg → `PROMETA_AGENT_NAME` env → literal
@@ -19,6 +31,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Nested spans inherit parent `prometa.intent.*` attributes unless a
+  child span explicitly overrides them.
 - When the SDK falls back to the default `agent_name="prometa-agent"`
   (no kwarg, no env), it now emits a `UserWarning` at construction.
   The platform's Agent registry is keyed on

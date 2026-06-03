@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+from .intent import inherited_assistant_intent_attrs
+
 
 # OTLP instrumentation-scope version, surfaced so the platform can group
 # spans by SDK release for compatibility tracking. Derived at import
@@ -303,6 +305,9 @@ class Prometa:
                 "prometa.customer_id", ""
             )
         effective_customer = inherited_customer or (self.customer_id or "")
+        inherited_intent: Dict[str, Any] = {}
+        if parent is not None:
+            inherited_intent = inherited_assistant_intent_attrs(parent.attributes)
         span = _Span(
             name=name,
             kind=kind,
@@ -325,6 +330,7 @@ class Prometa:
                     if effective_customer
                     else {}
                 ),
+                **inherited_intent,
             },
         )
         token = _context.push(span)

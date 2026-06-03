@@ -558,6 +558,11 @@ def _normalize_attributes(attrs: dict[str, Any]) -> dict[str, Any]:
         user_text = _llm.extract_last_user_text(_maybe_json(input_messages))
         if user_text:
             out.setdefault("gen_ai.prompt.user", _llm.truncate(user_text))
+            if not _llm.has_assistant_intent_attrs(out):
+                for key, value in _llm.assistant_intent_attrs_for_user_text(
+                    user_text
+                ).items():
+                    out.setdefault(key, value)
 
     output_messages = _first_present(
         out,

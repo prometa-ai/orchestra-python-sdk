@@ -49,6 +49,7 @@ SYSTEM = "google"
 
 
 def _request_attrs(args: tuple, kwargs: dict) -> dict:
+    intent_attrs = _c.pop_assistant_intent_attrs(kwargs)
     out: dict = {
         "gen_ai.system": SYSTEM,
         "gen_ai.framework": SYSTEM,
@@ -68,6 +69,8 @@ def _request_attrs(args: tuple, kwargs: dict) -> dict:
         user_text = _c.extract_last_user_text(contents)
         if user_text:
             out["gen_ai.prompt.user"] = _c.truncate(user_text)
+            if not intent_attrs:
+                out.update(_c.assistant_intent_attrs_for_user_text(user_text))
     config = kwargs.get("config") or kwargs.get("generation_config")
     if config is not None:
         # config can be a dict or a pydantic model — extract a few common
@@ -84,6 +87,8 @@ def _request_attrs(args: tuple, kwargs: dict) -> dict:
             )
             if val is not None:
                 out[dst] = val
+    if intent_attrs:
+        out.update(intent_attrs)
     return out
 
 
@@ -236,6 +241,7 @@ def _wrap_generate_content(cls: type, *, is_async: bool) -> None:
         async def wrapper(self, *args, **kwargs):
             client = _c._client()
             if client is None:
+                _c.pop_assistant_intent_attrs(kwargs)
                 return await original(self, *args, **kwargs)
             attrs = _request_attrs(args, kwargs)
             span_name = _make_span_name("generate_content", kwargs)
@@ -259,6 +265,7 @@ def _wrap_generate_content(cls: type, *, is_async: bool) -> None:
         def wrapper(self, *args, **kwargs):
             client = _c._client()
             if client is None:
+                _c.pop_assistant_intent_attrs(kwargs)
                 return original(self, *args, **kwargs)
             attrs = _request_attrs(args, kwargs)
             span_name = _make_span_name("generate_content", kwargs)
@@ -296,6 +303,7 @@ def _wrap_generate_content_stream(cls: type, *, is_async: bool) -> None:
             # function returning the iterator directly. Handle both.
             client = _c._client()
             if client is None:
+                _c.pop_assistant_intent_attrs(kwargs)
                 result = original(self, *args, **kwargs)
                 return await result if inspect.iscoroutine(result) else result
             attrs = _request_attrs(args, kwargs)
@@ -325,6 +333,7 @@ def _wrap_generate_content_stream(cls: type, *, is_async: bool) -> None:
         def wrapper(self, *args, **kwargs):
             client = _c._client()
             if client is None:
+                _c.pop_assistant_intent_attrs(kwargs)
                 return original(self, *args, **kwargs)
             attrs = _request_attrs(args, kwargs)
             attrs["gen_ai.request.stream"] = True
@@ -402,6 +411,7 @@ def install() -> bool:
                 async def wrapper(self, *args, **kwargs):
                     client = _c._client()
                     if client is None:
+                        _c.pop_assistant_intent_attrs(kwargs)
                         return await original(self, *args, **kwargs)
                     attrs = _request_attrs(args, kwargs)
                     span_name = _make_span_name("generate_content_async", kwargs)

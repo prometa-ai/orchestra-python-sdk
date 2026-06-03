@@ -19,6 +19,9 @@ Three families of helpers ship in the SDK today:
   (`org:sol:agent:tool:cus:user::session:trace:span`) so registry / AML
   / lineage readers can join across the full identity prefix. Optional
   but unlocks the richer end-to-end view.
+- **Assistant intent labels** — `set_assistant_intent` /
+  `set_assistant_intent_from_text` stamp deterministic DeclarAI intent
+  labels plus `prometa.intent.*` aliases before LLM, tool, or action work.
 - **AML v0.4 instrumentation contract** — 16 helpers
   (`pii_filter`, `guardrail`, `memory_read`, `record_retry_attempt`,
   `confidence_score`, `schema_validate`, `model_route`,
@@ -177,6 +180,68 @@ synchronous, no-op outside an active span context (returns `False`),
 empty value pops the attribute. See the platform-side design at
 [`resources/correlation/correlation-id-design.md`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md)
 for the full canonical-chain grammar.
+
+## Assistant intent labels
+
+DeclarAI can stamp assistant intent before any LLM/tool/action work so
+Prometa can index and filter traces by the user's intended operation.
+
+```python
+from prometa import set_assistant_intent, set_assistant_intent_from_text
+
+@prometa.workflow(name="assistant-turn")
+def handle_turn(user_text: str, from_support_button: bool = False):
+    if from_support_button:
+        set_assistant_intent(
+            "D,E",
+            source="get_ai_support_button",
+            preclassified=True,
+        )
+    else:
+        set_assistant_intent_from_text(user_text)
+
+    # Nested LLM/tool/action spans inherit the labels unless they
+    # explicitly override them.
+    ...
+```
+
+Labels are stable single-letter codes:
+
+| Code | Label name |
+|---|---|
+| `A` | `general_information_gathering` |
+| `B` | `pipeline_flow_information_gathering` |
+| `C` | `current_status_information_gathering` |
+| `D` | `configuration_editing_execution` |
+| `E` | `flow_process_execution` |
+
+The SDK stamps both DeclarAI trace attributes and Prometa aliases:
+
+- `declarai.intent.labels`, `declarai.intent.label_names`,
+  `declarai.intent.count`, `declarai.intent.source`,
+  `declarai.intent.preclassified`,
+  `declarai.intent.classifier_version`
+- `prometa.intent.labels`, `prometa.intent.label_names`,
+  `prometa.intent.source`, `prometa.intent.preclassified`
+
+Free-text turns use deterministic clause decomposition, so a request
+such as "change the settings, then run the flow" emits `D,E` without
+LLM token usage. Provider integrations also classify the latest
+`role: "user"` text automatically when no active parent span already
+has intent labels.
+
+For deterministic UI actions, pass local-only kwargs through supported
+LLM integrations; the SDK strips them before calling the provider:
+
+```python
+client.responses.create(
+    model="gpt-4o-mini",
+    input=[{"role": "user", "content": prompt}],
+    prometa_intent_labels="D,E",
+    prometa_intent_source="get_ai_support_button",
+    prometa_intent_preclassified=True,
+)
+```
 
 ### Stable Agent IDs
 

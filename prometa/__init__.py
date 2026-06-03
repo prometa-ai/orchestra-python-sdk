@@ -79,6 +79,11 @@ from .chain import (
     set_request_model,
     set_tool_name,
 )
+from .intent import (
+    classify_assistant_intent,
+    set_assistant_intent,
+    set_assistant_intent_from_text,
+)
 
 # AML v0.4 instrumentation helpers — all 16 primitives from the contract
 # bundled at `resources/aml/phase-0/instrumentation-spec.yaml` in
@@ -119,6 +124,10 @@ __all__ = [
     "set_conversation_id",
     "set_request_model",
     "set_tool_name",
+    # Assistant intent labels (DeclarAI / platform trace indexing).
+    "classify_assistant_intent",
+    "set_assistant_intent",
+    "set_assistant_intent_from_text",
     # v0.4 AML helpers — dual-channel toggle
     "raw_channel",
     # v0.4 AML helpers — safety / governance (A1-A8)

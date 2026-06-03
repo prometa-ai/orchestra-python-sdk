@@ -49,6 +49,7 @@ SYSTEM = "anthropic"
 
 
 def _request_attrs(kwargs: dict) -> dict:
+    intent_attrs = _c.pop_assistant_intent_attrs(kwargs)
     out: dict = {
         "gen_ai.system": SYSTEM,
         "gen_ai.framework": SYSTEM,
@@ -85,6 +86,10 @@ def _request_attrs(kwargs: dict) -> dict:
         user_text = _c.extract_last_user_text(messages)
         if user_text:
             out["gen_ai.prompt.user"] = _c.truncate(user_text)
+            if not intent_attrs:
+                out.update(_c.assistant_intent_attrs_for_user_text(user_text))
+    if intent_attrs:
+        out.update(intent_attrs)
     return out
 
 
@@ -253,6 +258,7 @@ def _wrap_sync_create(cls: type) -> None:
     def wrapper(self, *args, **kwargs):
         client = _c._client()
         if client is None:
+            _c.pop_assistant_intent_attrs(kwargs)
             return original(self, *args, **kwargs)
         attrs = _request_attrs(kwargs)
         span_name = _make_span_name("messages", kwargs)
@@ -302,6 +308,7 @@ def _wrap_async_create(cls: type) -> None:
     async def wrapper(self, *args, **kwargs):
         client = _c._client()
         if client is None:
+            _c.pop_assistant_intent_attrs(kwargs)
             return await original(self, *args, **kwargs)
         attrs = _request_attrs(kwargs)
         span_name = _make_span_name("messages", kwargs)
@@ -358,6 +365,7 @@ def _wrap_sync_stream(cls: type) -> None:
     def wrapper(self, *args, **kwargs):
         client = _c._client()
         if client is None:
+            _c.pop_assistant_intent_attrs(kwargs)
             return original(self, *args, **kwargs)
         attrs = _request_attrs(kwargs)
         attrs["gen_ai.request.stream"] = True
@@ -395,6 +403,7 @@ def _wrap_async_stream(cls: type) -> None:
         # synchronously returns an async context manager. Mirror that.
         client = _c._client()
         if client is None:
+            _c.pop_assistant_intent_attrs(kwargs)
             return original(self, *args, **kwargs)
         attrs = _request_attrs(kwargs)
         attrs["gen_ai.request.stream"] = True

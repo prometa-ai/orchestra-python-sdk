@@ -27,6 +27,12 @@ from typing import Any, AsyncIterator, Iterator, Optional
 
 from .. import _context
 from ..client import Prometa, _Span, _agent_identity_attrs, _new_id, _now_unix_nano
+from ..intent import (
+    build_assistant_intent_attrs,
+    assistant_intent_attrs_from_text,
+    has_assistant_intent_attrs,
+    inherited_assistant_intent_attrs,
+)
 
 # Cap individual prompt/completion attribute payloads. Real chat histories
 # can be tens of KB; the OTLP envelope and ClickHouse string columns both
@@ -114,6 +120,104 @@ def extract_last_user_text(prompt: Any) -> Optional[str]:
     return None
 
 
+def pop_assistant_intent_attrs(kwargs: dict) -> dict:
+    """Pop local-only intent kwargs and return span attributes.
+
+    Provider SDKs would reject unknown Prometa kwargs, so integrations
+    strip these before calling the real client method:
+
+    - ``prometa_intent_labels`` / ``declarai_intent_labels``
+    - ``prometa_intent_source`` / ``declarai_intent_source``
+    - ``prometa_intent_preclassified`` / ``declarai_intent_preclassified``
+    - ``prometa_intent_classifier_version`` /
+      ``declarai_intent_classifier_version``
+    """
+    labels = _pop_first(
+        kwargs,
+        (
+            "prometa_intent_labels",
+            "declarai_intent_labels",
+            "intent_labels",
+            "prometa.intent.labels",
+            "declarai.intent.labels",
+        ),
+    )
+    source = _pop_first(
+        kwargs,
+        (
+            "prometa_intent_source",
+            "declarai_intent_source",
+            "intent_source",
+            "prometa.intent.source",
+            "declarai.intent.source",
+        ),
+    )
+    preclassified = _pop_first(
+        kwargs,
+        (
+            "prometa_intent_preclassified",
+            "declarai_intent_preclassified",
+            "intent_preclassified",
+            "prometa.intent.preclassified",
+            "declarai.intent.preclassified",
+        ),
+    )
+    classifier_version = _pop_first(
+        kwargs,
+        (
+            "prometa_intent_classifier_version",
+            "declarai_intent_classifier_version",
+            "intent_classifier_version",
+            "declarai.intent.classifier_version",
+        ),
+    )
+    if labels is None:
+        return {}
+    try:
+        return build_assistant_intent_attrs(
+            labels,
+            source=str(source or "manual"),
+            preclassified=True if preclassified is None else _as_bool(preclassified),
+            classifier_version=(
+                str(classifier_version) if classifier_version is not None else None
+            ),
+        )
+    except Exception:
+        return {}
+
+
+def assistant_intent_attrs_for_user_text(
+    text: Optional[str],
+    *,
+    source: str = "user_turn",
+) -> dict:
+    """Classify user text unless the active parent already carries intent."""
+    if not text:
+        return {}
+    current = _context.current_span()
+    if current is not None and has_assistant_intent_attrs(current.attributes):
+        return {}
+    try:
+        return assistant_intent_attrs_from_text(text, source=source)
+    except Exception:
+        return {}
+
+
+def _pop_first(kwargs: dict, keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in kwargs:
+            return kwargs.pop(key)
+    return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
 def _attr_or_key(obj: Any, name: str) -> Any:
     """Read ``name`` from a dict or an object — SDK message types are
     sometimes pydantic models, sometimes plain dicts, depending on which
@@ -169,6 +273,11 @@ def open_manual_span(kind: str, name: str, base_attrs: dict) -> Optional[_Span]:
         return None
     parent = _context.current_span()
     trace_id = parent.trace_id if parent else _new_id(32)
+    inherited_intent = (
+        inherited_assistant_intent_attrs(parent.attributes)
+        if parent is not None
+        else {}
+    )
     span = _Span(
         name=name,
         kind=kind,
@@ -181,6 +290,7 @@ def open_manual_span(kind: str, name: str, base_attrs: dict) -> Optional[_Span]:
             "prometa.solution_id": client.solution_id or "",
             "prometa.stage": client.stage,
             **_agent_identity_attrs(client.agent_name, client.agent_id),
+            **inherited_intent,
             **base_attrs,
         },
     )

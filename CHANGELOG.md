@@ -7,6 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-06-03
+
+### Changed
+
+- Expanded the first README occurrences of **AML (Agentic Maturity Leveling)**
+  and **AQL (Agentic Quality Leveling)** so SDK users do not need prior
+  Prometa terminology context.
+
 ## [0.8.1] — 2026-06-03
 
 ### Added

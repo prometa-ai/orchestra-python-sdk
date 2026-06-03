@@ -17,21 +17,23 @@ evaluable, and joinable on the platform:
 - **Correlation-chain setters** — `set_customer_id`, `set_user_id`,
   `set_conversation_id`, `set_request_model`, `set_tool_name`. Light up
   the platform's canonical correlation chain
-  (`org:sol:agent:tool:cus:user::session:trace:span`) so registry / AML
-  / lineage readers can join across the full identity prefix. Optional
+  (`org:sol:agent:tool:cus:user::session:trace:span`) so registry /
+  AML (Agentic Maturity Leveling) / lineage readers can join across the
+  full identity prefix. Optional
   but unlocks the richer end-to-end view.
 - **Assistant intent labels** — `set_assistant_intent` /
   `set_assistant_intent_from_text` stamp deterministic Prometa intent
   labels before LLM, tool, or action work.
-- **AQL-ready trace metadata** — lifecycle, correlation, refs, intent,
-  prompt, completion, usage, and model attributes give Prometa's AQL /
-  PrometaQL query and evaluation layer stable fields to filter, aggregate,
-  replay, and judge traces.
-- **AML v0.4 instrumentation contract** — 16 helpers
-  (`pii_filter`, `guardrail`, `memory_read`, `record_retry_attempt`,
-  `confidence_score`, `schema_validate`, `model_route`,
-  `sentiment_classify`, …) that emit the spans the platform's AML
-  scoring engine consumes to score agents against the 41-feature catalog.
+- **AQL (Agentic Quality Leveling) trace metadata** — lifecycle,
+  correlation, refs, intent, prompt, completion, usage, and model
+  attributes give Prometa's AQL / PrometaQL query and evaluation layer
+  stable fields to filter, aggregate, replay, and judge traces.
+- **AML (Agentic Maturity Leveling) v0.4 instrumentation contract** —
+  16 helpers (`pii_filter`, `guardrail`, `memory_read`,
+  `record_retry_attempt`, `confidence_score`, `schema_validate`,
+  `model_route`, `sentiment_classify`, …) that emit the spans the
+  platform's AML scoring engine consumes to score agents against the
+  41-feature catalog.
 
 ## Install
 
@@ -39,7 +41,7 @@ evaluable, and joinable on the platform:
 pip install prometa-sdk
 ```
 
-Current source version: **0.8.1**. Release history is on
+Current source version: **0.8.2**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.

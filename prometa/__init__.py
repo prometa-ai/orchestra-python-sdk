@@ -84,6 +84,11 @@ from .intent import (
     set_assistant_intent,
     set_assistant_intent_from_text,
 )
+from .feedback import (
+    build_user_feedback_attrs,
+    set_user_feedback,
+    record_user_feedback,
+)
 
 # AML v0.4 instrumentation helpers — all 16 primitives from the contract
 # bundled at `resources/aml/phase-0/instrumentation-spec.yaml` in
@@ -101,7 +106,7 @@ from .events import event_trigger
 from .routing import model_route
 from .sentiment import sentiment_classify
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 __all__ = [
     "Prometa",
     "workflow",
@@ -128,6 +133,10 @@ __all__ = [
     "classify_assistant_intent",
     "set_assistant_intent",
     "set_assistant_intent_from_text",
+    # User feedback signals (platform trace indexing).
+    "build_user_feedback_attrs",
+    "set_user_feedback",
+    "record_user_feedback",
     # v0.4 AML helpers — dual-channel toggle
     "raw_channel",
     # v0.4 AML helpers — safety / governance (A1-A8)

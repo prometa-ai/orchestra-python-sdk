@@ -7,6 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-05
+
+### Added
+
+- **User feedback feeding** via `set_user_feedback`,
+  `record_user_feedback`, and `build_user_feedback_attrs`. The SDK now
+  emits generic `prometa.feedback.*` attributes for thumbs-up /
+  thumbs-down, 1-5 star ratings, open-text comments, normalized
+  sentiment, and optional trace/span/session targets for delayed UI
+  feedback ingestion.
+
 ## [0.8.2] — 2026-06-03
 
 ### Changed

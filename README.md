@@ -24,10 +24,14 @@ evaluable, and joinable on the platform:
 - **Assistant intent labels** — `set_assistant_intent` /
   `set_assistant_intent_from_text` stamp deterministic Prometa intent
   labels before LLM, tool, or action work.
+- **User feedback feeding** — `set_user_feedback` /
+  `record_user_feedback` collect thumbs-up / thumbs-down, 1-5 star
+  ratings, and open-text comments as generic `prometa.feedback.*`
+  telemetry for platform ingestion.
 - **AQL (Agentic Quality Leveling) trace metadata** — lifecycle,
-  correlation, refs, intent, prompt, completion, usage, and model
-  attributes give Prometa's AQL / PrometaQL query and evaluation layer
-  stable fields to filter, aggregate, replay, and judge traces.
+  correlation, refs, intent, feedback, prompt, completion, usage, and
+  model attributes give Prometa's AQL / PrometaQL query and evaluation
+  layer stable fields to filter, aggregate, replay, and judge traces.
 - **AML (Agentic Maturity Leveling) v0.4 instrumentation contract** —
   16 helpers (`pii_filter`, `guardrail`, `memory_read`,
   `record_retry_attempt`, `confidence_score`, `schema_validate`,
@@ -41,7 +45,7 @@ evaluable, and joinable on the platform:
 pip install prometa-sdk
 ```
 
-Current source version: **0.8.2**. Release history is on
+Current source version: **0.9.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
@@ -246,6 +250,72 @@ client.responses.create(
     prometa_intent_preclassified=True,
 )
 ```
+
+## User feedback feeding
+
+Applications can feed user feedback into Prometa as generic
+`prometa.feedback.*` telemetry. The SDK supports thumbs-up /
+thumbs-down, 1-5 star ratings, open-text comments, and optional target
+ids so the platform can attach delayed feedback to the original trace,
+span, or session.
+
+If feedback is collected before the traced workflow exits, stamp it on
+the active span:
+
+```python
+from prometa import set_user_feedback
+
+@prometa.workflow(name="assistant-turn")
+def handle_turn(user_text: str):
+    answer = run_assistant(user_text)
+
+    if user_clicked_dislike:
+        set_user_feedback(
+            liked=False,
+            comment="Missed the billing policy exception.",
+            source="thumbs_down",
+            feedback_id="fb_123",
+            user_id="user_456",
+        )
+
+    return answer
+```
+
+If feedback arrives later from a UI callback or API endpoint, emit a
+dedicated `feedback.record` span:
+
+```python
+from prometa import record_user_feedback
+
+record_user_feedback(
+    rating=5,
+    comment="Exactly what I needed.",
+    source="stars",
+    target_trace_id=trace_id,
+    target_span_id=span_id,
+    target_session_id=session_id,
+    submitted_at="2026-06-05T09:30:00Z",
+)
+```
+
+The SDK emits these platform-facing attributes:
+
+- `prometa.feedback.signal` — `like`, `dislike`, `rating`, `comment`,
+  or a comma-separated combination.
+- `prometa.feedback.liked` — boolean thumbs signal when supplied.
+- `prometa.feedback.rating` — integer 1-5 star score when supplied.
+- `prometa.feedback.score` — normalized score in `[-1.0, 1.0]`.
+- `prometa.feedback.sentiment` — `positive`, `neutral`, or `negative`.
+- `prometa.feedback.comment` — open-text comment, truncated to 4096
+  characters.
+- `prometa.feedback.source`, `prometa.feedback.id`,
+  `prometa.feedback.user_id`, `prometa.feedback.submitted_at`.
+- `prometa.feedback.target.trace_id`,
+  `prometa.feedback.target.span_id`,
+  `prometa.feedback.target.session_id`.
+
+Avoid putting PII in comments or user ids unless your Prometa
+deployment is configured for that data class.
 
 ### Stable Agent IDs
 

@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-06-15
+
+### Changed
+
+- Updated public README and changelog wording to keep custom attribute
+  examples tenant-neutral for multi-tenant Prometa deployments.
+
 ## [0.10.0] — 2026-06-15
 
 ### Added
@@ -15,7 +22,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   when `agent_id` / `PROMETA_AGENT_ID` is configured, while preserving
   `gen_ai.agent.name` / `service.name` as the name fallback.
 - Public `set_attribute` and `set_attributes` helpers for stamping
-  scalar custom metadata such as `declarai.mcp.*` onto the active span.
+  scalar custom metadata such as `your.integration.*` onto the active span.
 
 ### Changed
 

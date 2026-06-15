@@ -91,17 +91,19 @@ class ChainAttrsTest(unittest.TestCase):
     def test_set_attribute_stamps_custom_scalar_attrs(self) -> None:
         @self.prometa.workflow(name="root")
         def handle():
-            self.assertTrue(set_attribute("declarai.mcp.server.name", "declarai"))
-            self.assertTrue(set_attribute("declarai.mcp.tool.args_count", 0))
-            self.assertTrue(set_attribute("declarai.mcp.direct_action", False))
-            self.assertTrue(set_attribute("declarai.mcp.latency_ms", 12.5))
+            self.assertTrue(
+                set_attribute("custom.mcp.server.name", "example-server")
+            )
+            self.assertTrue(set_attribute("custom.mcp.tool.args_count", 0))
+            self.assertTrue(set_attribute("custom.mcp.direct_action", False))
+            self.assertTrue(set_attribute("custom.mcp.latency_ms", 12.5))
 
         handle()
         attrs = self._latest_span().attributes
-        self.assertEqual(attrs.get("declarai.mcp.server.name"), "declarai")
-        self.assertEqual(attrs.get("declarai.mcp.tool.args_count"), 0)
-        self.assertIs(attrs.get("declarai.mcp.direct_action"), False)
-        self.assertEqual(attrs.get("declarai.mcp.latency_ms"), 12.5)
+        self.assertEqual(attrs.get("custom.mcp.server.name"), "example-server")
+        self.assertEqual(attrs.get("custom.mcp.tool.args_count"), 0)
+        self.assertIs(attrs.get("custom.mcp.direct_action"), False)
+        self.assertEqual(attrs.get("custom.mcp.latency_ms"), 12.5)
 
     def test_set_attributes_stamps_custom_mapping_atomically(self) -> None:
         @self.prometa.workflow(name="root")
@@ -109,22 +111,22 @@ class ChainAttrsTest(unittest.TestCase):
             self.assertTrue(
                 set_attributes(
                     {
-                        "declarai.mcp.tool.name": "prepare_action",
-                        "declarai.mcp.catalog.cached": True,
+                        "custom.mcp.tool.name": "prepare_action",
+                        "custom.mcp.catalog.cached": True,
                     }
                 )
             )
 
         handle()
         attrs = self._latest_span().attributes
-        self.assertEqual(attrs.get("declarai.mcp.tool.name"), "prepare_action")
-        self.assertIs(attrs.get("declarai.mcp.catalog.cached"), True)
+        self.assertEqual(attrs.get("custom.mcp.tool.name"), "prepare_action")
+        self.assertIs(attrs.get("custom.mcp.catalog.cached"), True)
 
     def test_set_attribute_rejects_non_scalar_values_inside_span(self) -> None:
         @self.prometa.workflow(name="root")
         def handle():
             with self.assertRaises(TypeError):
-                set_attribute("declarai.mcp.payload", {"nested": "value"})
+                set_attribute("custom.mcp.payload", {"nested": "value"})
 
         handle()
 
@@ -147,9 +149,9 @@ class ChainAttrsTest(unittest.TestCase):
         self.assertFalse(set_conversation_id("c"))
         self.assertFalse(set_request_model("m"))
         self.assertFalse(set_tool_name("t"))
-        self.assertFalse(set_attribute("declarai.mcp.server.name", "declarai"))
+        self.assertFalse(set_attribute("custom.mcp.server.name", "example-server"))
         self.assertFalse(
-            set_attributes({"declarai.mcp.tool.name": "prepare_action"})
+            set_attributes({"custom.mcp.tool.name": "prepare_action"})
         )
         self.assertEqual(len(self.prometa._buffer), 0)
 

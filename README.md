@@ -11,7 +11,7 @@ automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships several telemetry surfaces that make agent behavior queryable,
 evaluable, and joinable on the platform. The current release adds canonical
 `prometa.agent_id` correlation for pinned agents, public custom span
-attributes for integration metadata such as `declarai.mcp.*`, and richer MCP
+attributes for tenant-owned integration metadata, and richer MCP
 tool-call spans with Prometa/GenAI tool-name aliases plus raw-channel-gated
 argument and result capture.
 
@@ -26,7 +26,7 @@ argument and result capture.
   full identity prefix. Optional
   but unlocks the richer end-to-end view.
 - **Custom span attributes** — `set_attribute` / `set_attributes` stamp
-  scalar attributes such as `declarai.mcp.*` on the active span. Prometa
+  scalar attributes such as `your.integration.*` on the active span. Prometa
   preserves non-promoted attributes in span metadata for governance and
   evaluation workflows.
 - **Assistant intent labels** — `set_assistant_intent` /
@@ -53,7 +53,7 @@ argument and result capture.
 pip install prometa-sdk
 ```
 
-Current source version: **0.10.0**. Release history is on
+Current source version: **0.10.1**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
@@ -212,12 +212,12 @@ from prometa import set_attribute, set_attributes
 
 @prometa.tool(name="prepare-action")
 def prepare_action():
-    set_attribute("declarai.mcp.server.name", "declarai")
+    set_attribute("your.integration.mcp.server.name", "example-server")
     set_attributes(
         {
-            "declarai.mcp.tool.name": "prepare_action",
-            "declarai.mcp.direct_action": False,
-            "declarai.mcp.args_count": 3,
+            "your.integration.mcp.tool.name": "prepare_action",
+            "your.integration.mcp.direct_action": False,
+            "your.integration.mcp.args_count": 3,
         }
     )
 ```

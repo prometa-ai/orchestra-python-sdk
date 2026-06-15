@@ -181,8 +181,8 @@ class Prometa:
         # on every span's resource attributes when set; the platform's
         # correlation-id resolver validates against
         # `Organization.customerNamespace` at ingest. Leave None for
-        # service-to-service or single-tenant deployments where every
-        # span trivially belongs to the same customer scope.
+        # service-to-service deployments where every span trivially
+        # belongs to the same customer scope.
         customer_id: Optional[str] = None,
         flush_interval_seconds: float = 2.0,
         timeout_seconds: float = 5.0,

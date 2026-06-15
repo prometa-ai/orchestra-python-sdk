@@ -32,7 +32,7 @@ class MCPIntegrationTest(unittest.TestCase):
         client = self._make_client()
 
         class FakeSession:
-            server_name = "declarai"
+            server_name = "example-server"
 
             def call_tool(self, name, arguments=None):
                 return {"ok": True, "arguments": arguments}
@@ -47,7 +47,7 @@ class MCPIntegrationTest(unittest.TestCase):
         self.assertEqual(attrs["mcp.tool.name"], "prepare_action")
         self.assertEqual(attrs["gen_ai.tool.name"], "prepare_action")
         self.assertEqual(attrs["prometa.tool_name"], "prepare_action")
-        self.assertEqual(attrs["mcp.server.name"], "declarai")
+        self.assertEqual(attrs["mcp.server.name"], "example-server")
         self.assertEqual(attrs["mcp.tool.args_count"], 1)
         self.assertNotIn("prometa.raw.input", attrs)
         self.assertNotIn("prometa.raw.output", attrs)
@@ -62,7 +62,7 @@ class MCPIntegrationTest(unittest.TestCase):
                 return {"content": [{"type": "text", "text": "prepared"}]}
 
         class FakeSession:
-            server_name = "declarai"
+            server_name = "example-server"
 
             async def call_tool(self, name, arguments=None):
                 return FakeResult()

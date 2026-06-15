@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-15
+
 ### Added
 
 - Canonical `prometa.agent_id` emission on span and resource attributes

@@ -9,7 +9,11 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships several telemetry surfaces that make agent behavior queryable,
-evaluable, and joinable on the platform:
+evaluable, and joinable on the platform. The current release adds canonical
+`prometa.agent_id` correlation for pinned agents, public custom span
+attributes for integration metadata such as `declarai.mcp.*`, and richer MCP
+tool-call spans with Prometa/GenAI tool-name aliases plus raw-channel-gated
+argument and result capture.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -49,7 +53,7 @@ evaluable, and joinable on the platform:
 pip install prometa-sdk
 ```
 
-Current source version: **0.9.0**. Release history is on
+Current source version: **0.10.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.

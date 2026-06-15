@@ -98,6 +98,7 @@ class AgentIdResolutionTest(unittest.TestCase):
 
         root()
         span = client._buffer[-1]
+        self.assertNotIn("prometa.agent_id", span.attributes)
         self.assertNotIn("gen_ai.agent.id", span.attributes)
 
         payload = client._build_otlp_payload([span])
@@ -108,14 +109,16 @@ class AgentIdResolutionTest(unittest.TestCase):
             payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
         )
         self.assertEqual(resource_attrs["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("prometa.agent_id", resource_attrs)
         self.assertNotIn("gen_ai.agent.id", resource_attrs)
+        self.assertNotIn("prometa.agent_id", otlp_span_attrs)
         self.assertNotIn("gen_ai.agent.id", otlp_span_attrs)
 
     def test_explicit_agent_id_is_emitted_on_spans_and_resource(self) -> None:
         client = self._make_client(
             solution_id="sol-test",
             agent_name="test-agent",
-            agent_id="test-agent-id",
+            agent_id="agt-test-agent-id",
             stage="test",
         )
 
@@ -125,13 +128,19 @@ class AgentIdResolutionTest(unittest.TestCase):
 
         root()
         span = client._buffer[-1]
-        self.assertEqual(span.attributes["gen_ai.agent.id"], "test-agent-id")
+        self.assertEqual(span.attributes["prometa.agent_id"], "agt-test-agent-id")
+        self.assertEqual(span.attributes["gen_ai.agent.id"], "agt-test-agent-id")
 
         payload = client._build_otlp_payload([span])
         resource_attrs = self._otlp_attrs(
             payload["resourceSpans"][0]["resource"]["attributes"]
         )
-        self.assertEqual(resource_attrs["gen_ai.agent.id"], "test-agent-id")
+        otlp_span_attrs = self._otlp_attrs(
+            payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        )
+        self.assertEqual(resource_attrs["prometa.agent_id"], "agt-test-agent-id")
+        self.assertEqual(resource_attrs["gen_ai.agent.id"], "agt-test-agent-id")
+        self.assertEqual(otlp_span_attrs["prometa.agent_id"], "agt-test-agent-id")
 
     def test_llm_manual_span_omits_missing_agent_id(self) -> None:
         self._make_client(
@@ -144,7 +153,22 @@ class AgentIdResolutionTest(unittest.TestCase):
 
         self.assertIsNotNone(span)
         self.assertEqual(span.attributes["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("prometa.agent_id", span.attributes)
         self.assertNotIn("gen_ai.agent.id", span.attributes)
+
+    def test_llm_manual_span_emits_prometa_agent_id(self) -> None:
+        self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            agent_id="agt-test-agent-id",
+            stage="test",
+        )
+
+        span = _llm_common.open_manual_span("agent", "chat gpt-4o", {})
+
+        self.assertIsNotNone(span)
+        self.assertEqual(span.attributes["prometa.agent_id"], "agt-test-agent-id")
+        self.assertEqual(span.attributes["gen_ai.agent.id"], "agt-test-agent-id")
 
     def test_openllmetry_resource_attrs_omit_missing_agent_id(self) -> None:
         self._make_client(
@@ -156,7 +180,21 @@ class AgentIdResolutionTest(unittest.TestCase):
         attrs = openllmetry._resource_attributes()
 
         self.assertEqual(attrs["gen_ai.agent.name"], "test-agent")
+        self.assertNotIn("prometa.agent_id", attrs)
         self.assertNotIn("gen_ai.agent.id", attrs)
+
+    def test_openllmetry_resource_attrs_emit_prometa_agent_id(self) -> None:
+        self._make_client(
+            solution_id="sol-test",
+            agent_name="test-agent",
+            agent_id="agt-test-agent-id",
+            stage="test",
+        )
+
+        attrs = openllmetry._resource_attributes()
+
+        self.assertEqual(attrs["prometa.agent_id"], "agt-test-agent-id")
+        self.assertEqual(attrs["gen_ai.agent.id"], "agt-test-agent-id")
 
 
 if __name__ == "__main__":

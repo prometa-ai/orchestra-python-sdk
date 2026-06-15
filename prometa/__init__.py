@@ -79,6 +79,7 @@ from .chain import (
     set_request_model,
     set_tool_name,
 )
+from .attributes import set_attribute, set_attributes
 from .intent import (
     classify_assistant_intent,
     set_assistant_intent,
@@ -129,6 +130,8 @@ __all__ = [
     "set_conversation_id",
     "set_request_model",
     "set_tool_name",
+    "set_attribute",
+    "set_attributes",
     # Assistant intent labels (platform trace indexing).
     "classify_assistant_intent",
     "set_assistant_intent",

@@ -2,7 +2,9 @@
 
 Patches ``mcp.ClientSession.call_tool`` so every MCP tool invocation
 becomes a Prometa ``tool`` span tagged with ``mcp.server.name`` and
-``mcp.tool.name``.
+``mcp.tool.name`` plus Prometa/GenAI tool-name aliases. When the
+process-wide raw channel is enabled, the wrapper also captures
+truncated tool arguments/results as ``prometa.raw.*`` attributes.
 
 Usage::
 
@@ -19,7 +21,9 @@ import asyncio
 import functools
 from typing import Any, Callable, Optional
 
+from .. import _raw_channel
 from ..client import Prometa
+from . import _llm_common as _llm
 
 
 _INSTALLED = False
@@ -27,6 +31,62 @@ _INSTALLED = False
 
 def _client() -> Optional[Prometa]:
     return Prometa._current
+
+
+def _server_name(session: Any) -> str:
+    return str(
+        getattr(session, "server_name", None)
+        or getattr(getattr(session, "server", None), "name", "")
+        or ""
+    )
+
+
+def _initialize_tool_span(span: Any, name: Any, server_name: str, arguments: Any) -> None:
+    tool_name = str(name)
+    span.attributes.update(
+        {
+            "gen_ai.framework": "mcp",
+            "mcp.tool.name": tool_name,
+            "gen_ai.tool.name": tool_name,
+            "prometa.tool_name": tool_name,
+            "mcp.server.name": server_name,
+        }
+    )
+    if isinstance(arguments, dict):
+        span.attributes["mcp.tool.args_count"] = len(arguments)
+    if _raw_channel.is_enabled() and arguments is not None:
+        span.attributes["prometa.raw.input"] = _serialize_payload(arguments)
+
+
+def _record_tool_result(span: Any, result: Any) -> None:
+    if _raw_channel.is_enabled():
+        span.attributes["prometa.raw.output"] = _serialize_payload(result)
+
+
+def _serialize_payload(value: Any) -> str:
+    value = _jsonable(value)
+    return _llm.truncate(_llm.safe_json(value))
+
+
+def _jsonable(value: Any) -> Any:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            try:
+                return model_dump()
+            except Exception:
+                return value
+        except Exception:
+            return value
+    as_dict = getattr(value, "dict", None)
+    if callable(as_dict):
+        try:
+            return as_dict()
+        except Exception:
+            return value
+    return value
 
 
 def _wrap_call_tool(cls: type) -> None:
@@ -43,21 +103,13 @@ def _wrap_call_tool(cls: type) -> None:
             client = _client()
             if client is None:
                 return await original(self, name, arguments, *args, **kwargs)
-            server_name = getattr(self, "server_name", None) or getattr(
-                getattr(self, "server", None), "name", ""
-            )
+            server_name = _server_name(self)
             with client._span("tool", f"mcp.call_tool:{name}") as span:
-                span.attributes.update(
-                    {
-                        "gen_ai.framework": "mcp",
-                        "mcp.tool.name": str(name),
-                        "mcp.server.name": str(server_name or ""),
-                    }
-                )
-                if isinstance(arguments, dict):
-                    span.attributes["mcp.tool.args_count"] = len(arguments)
+                _initialize_tool_span(span, name, server_name, arguments)
                 try:
-                    return await original(self, name, arguments, *args, **kwargs)
+                    result = await original(self, name, arguments, *args, **kwargs)
+                    _record_tool_result(span, result)
+                    return result
                 except Exception as e:
                     span.status = "error"
                     span.attributes["error.message"] = str(e)
@@ -71,21 +123,13 @@ def _wrap_call_tool(cls: type) -> None:
             client = _client()
             if client is None:
                 return original(self, name, arguments, *args, **kwargs)
-            server_name = getattr(self, "server_name", None) or getattr(
-                getattr(self, "server", None), "name", ""
-            )
+            server_name = _server_name(self)
             with client._span("tool", f"mcp.call_tool:{name}") as span:
-                span.attributes.update(
-                    {
-                        "gen_ai.framework": "mcp",
-                        "mcp.tool.name": str(name),
-                        "mcp.server.name": str(server_name or ""),
-                    }
-                )
-                if isinstance(arguments, dict):
-                    span.attributes["mcp.tool.args_count"] = len(arguments)
+                _initialize_tool_span(span, name, server_name, arguments)
                 try:
-                    return original(self, name, arguments, *args, **kwargs)
+                    result = original(self, name, arguments, *args, **kwargs)
+                    _record_tool_result(span, result)
+                    return result
                 except Exception as e:
                     span.status = "error"
                     span.attributes["error.message"] = str(e)

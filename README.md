@@ -21,6 +21,10 @@ evaluable, and joinable on the platform:
   AML (Agentic Maturity Leveling) / lineage readers can join across the
   full identity prefix. Optional
   but unlocks the richer end-to-end view.
+- **Custom span attributes** — `set_attribute` / `set_attributes` stamp
+  scalar attributes such as `declarai.mcp.*` on the active span. Prometa
+  preserves non-promoted attributes in span metadata for governance and
+  evaluation workflows.
 - **Assistant intent labels** — `set_assistant_intent` /
   `set_assistant_intent_from_text` stamp deterministic Prometa intent
   labels before LLM, tool, or action work.
@@ -89,7 +93,8 @@ Each decorated function emits a span with:
 - `prometa.kind` — `workflow | agent | tool | task`
 - `prometa.solution_id`, `prometa.stage`
 - `gen_ai.agent.name`
-- `gen_ai.agent.id` — only when you explicitly pin one; otherwise the platform auto-registers the Agent from `solution_id` + `agent_name`
+- `prometa.agent_id` — only when you explicitly pin one; otherwise the platform auto-registers the Agent from `solution_id` + `agent_name`
+- `gen_ai.agent.id` — legacy compatibility only; Prometa correlation keys on `prometa.agent_id` or the name fallback
 - `gen_ai.conversation.id` — when the producer opts into session grouping (see below)
 - Parent/child relationships across async/sync calls
 - Errors → span status `error` plus `error.message`
@@ -191,6 +196,30 @@ synchronous, no-op outside an active span context (returns `False`),
 empty value pops the attribute. See the platform-side design at
 [`resources/correlation/correlation-id-design.md`](https://github.com/caglarsubas/agent-hook-v2/blob/main/resources/correlation/correlation-id-design.md)
 for the full canonical-chain grammar.
+
+## Custom span attributes
+
+Use `set_attribute` and `set_attributes` when an integration needs to
+stamp scalar metadata that Prometa should preserve, but that is not part
+of the core correlation chain.
+
+```python
+from prometa import set_attribute, set_attributes
+
+@prometa.tool(name="prepare-action")
+def prepare_action():
+    set_attribute("declarai.mcp.server.name", "declarai")
+    set_attributes(
+        {
+            "declarai.mcp.tool.name": "prepare_action",
+            "declarai.mcp.direct_action": False,
+            "declarai.mcp.args_count": 3,
+        }
+    )
+```
+
+Values must be `str`, `int`, `float`, or `bool`. Both helpers return
+`False` when called outside an active span.
 
 ## Assistant intent labels
 
@@ -327,9 +356,12 @@ Agent ID during ingest.
 
 You can still pin an ID by passing `agent_id="..."` to `Prometa(...)`
 or setting `PROMETA_AGENT_ID`. When pinned, the SDK includes
-`gen_ai.agent.id` on resource and span attributes. When absent, the
-SDK deliberately omits `gen_ai.agent.id`; it does not generate a
-random per-process fallback.
+`prometa.agent_id` on resource and span attributes, alongside
+`gen_ai.agent.name` and `service.name`. The SDK also emits
+`gen_ai.agent.id` for legacy readers, but Prometa correlation should key
+on `prometa.agent_id` and fall back to the name tuple when absent. When
+absent, the SDK deliberately omits both ID attributes; it does not
+generate a random per-process fallback.
 
 ### Agent names — always set them
 
@@ -584,7 +616,7 @@ release alongside this SDK version (see CHANGELOG.md).
 | `api_key` | `PROMETA_API_KEY` | none |
 | `solution_id` | — | none |
 | `agent_name` | — | `"prometa-agent"` |
-| `agent_id` | `PROMETA_AGENT_ID` | none — when omitted, the SDK leaves `gen_ai.agent.id` absent and the platform auto-registers/attaches the canonical Agent ID from `(orgId, solutionId, agentName)` |
+| `agent_id` | `PROMETA_AGENT_ID` | none — when set, the SDK emits canonical `prometa.agent_id`; when omitted, the platform auto-registers/attaches the canonical Agent ID from `(orgId, solutionId, agentName)` |
 | `stage` | — | `"development"` |
 | `customer_id` | — | none — org-wide default for `prometa.customer_id` |
 | `flush_interval_seconds` | — | `2.0` |
@@ -612,6 +644,7 @@ The architectural picture, end-to-end:
                                            │  │ (PG-side)        │    │
    `prometa.solution_id`                   │  └────────┬─────────┘    │
    `gen_ai.agent.name`                     │           │              │
+   `prometa.agent_id`        (optional)    │           │              │
    `prometa.tool_name`        (optional)   │  canonical agent_id/etc  │
    `prometa.customer_id`      (optional)   │           ▼              │
    `gen_ai.conversation.id`   (optional)   │  ┌──────────────────┐    │

@@ -124,6 +124,9 @@ def _resolve_agent_name(passed: Any) -> str:
 def _agent_identity_attrs(agent_name: str, agent_id: Optional[str]) -> Dict[str, str]:
     attrs = {"gen_ai.agent.name": agent_name}
     if agent_id:
+        attrs["prometa.agent_id"] = agent_id
+        # Legacy compatibility: the platform's canonical correlation key is
+        # prometa.agent_id, but older consumers may still inspect this OTel key.
         attrs["gen_ai.agent.id"] = agent_id
     return attrs
 

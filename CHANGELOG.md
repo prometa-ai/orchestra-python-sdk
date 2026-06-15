@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Canonical `prometa.agent_id` emission on span and resource attributes
+  when `agent_id` / `PROMETA_AGENT_ID` is configured, while preserving
+  `gen_ai.agent.name` / `service.name` as the name fallback.
+- Public `set_attribute` and `set_attributes` helpers for stamping
+  scalar custom metadata such as `declarai.mcp.*` onto the active span.
+
+### Changed
+
+- MCP tool-call spans now emit `gen_ai.tool.name` and
+  `prometa.tool_name` aliases alongside `mcp.tool.name`, and capture
+  truncated tool arguments/results as `prometa.raw.*` only when the
+  raw channel is explicitly enabled.
+
 ## [0.9.0] — 2026-06-05
 
 ### Added

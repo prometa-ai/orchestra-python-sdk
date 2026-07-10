@@ -1,0 +1,94 @@
+{
+  "fixtureVersion": 1,
+  "description": "Orchestra bundle envelope v1 cross-language conformance vector",
+  "trust": {
+    "issuer": "https://orchestra.example.test",
+    "keyId": "orchestra-test-key-v1",
+    "publicKeySpkiDerBase64": "MCowBQYDK2VwAyEACUfBblVMQKBW1gYtp6M3KMViOtROfD3/UShH08pL/g8="
+  },
+  "verification": {
+    "now": "2026-07-10T12:05:00.000Z",
+    "expectedOrgId": "org-golden",
+    "expectedAudience": "prometa-runtime",
+    "expectedEnvironment": "prod"
+  },
+  "bundle": {
+    "content": {
+      "schemaVersion": 1,
+      "manifest": {
+        "id": "manifest-golden-1",
+        "name": "Cafe Support",
+        "description": "Cafe order support",
+        "version": 7,
+        "status": "published",
+        "agentId": "agent-golden-1",
+        "solutionId": "solution-golden-1",
+        "solutionName": "Retail Support",
+        "deployable": true
+      },
+      "systemPrompt": "Respond safely for cafe orders.",
+      "models": [
+        {
+          "name": "Primary",
+          "provider": "inference-engine",
+          "modelName": "golden-model",
+          "role": "primary",
+          "temperature": 0.2,
+          "maxOutputTokens": 512,
+          "structuredOutput": true
+        }
+      ],
+      "primaryModel": {
+        "name": "Primary",
+        "provider": "inference-engine",
+        "modelName": "golden-model",
+        "role": "primary",
+        "temperature": 0.2,
+        "maxOutputTokens": 512,
+        "structuredOutput": true
+      },
+      "topology": {
+        "pattern": "single-react",
+        "maxIterations": 4
+      },
+      "tools": [],
+      "skills": [],
+      "knowledge": [],
+      "memory": [],
+      "subAgents": [],
+      "workflows": [],
+      "guardrails": [
+        {
+          "name": "PII",
+          "guardrailType": "pii-dlp",
+          "onViolation": "block",
+          "appliesTo": "all"
+        }
+      ],
+      "identity": null,
+      "triggers": [],
+      "evaluation": [],
+      "mcpServers": [],
+      "requiredScopes": [],
+      "grantedScopes": [],
+      "readiness": {
+        "quality": 100,
+        "security": 100,
+        "maturity": 80,
+        "productivity": 60
+      }
+    },
+    "algorithm": "ed25519",
+    "canonicalization": "json-sorted-keys-utf8",
+    "publicKey": "MCowBQYDK2VwAyEACUfBblVMQKBW1gYtp6M3KMViOtROfD3/UShH08pL/g8=",
+    "signature": "yV9j3BImp4R2ZQ1d/PHFB52cqXRkry4HUPiojI2T/fRpJxqLOe7sxgjwXRfC4t1RYY69kopCA8RNQcDUK4pIBg==",
+    "envelopeVersion": 1,
+    "envelopeCanonicalization": "signed-payload-json-v1",
+    "signedPayload": "{\"artifactDigest\":\"sha256:35888c18225e3b5d33ceceb8ed4c1b3165a93a25d0fc9259fd9891500c5b6eb8\",\"audience\":\"prometa-runtime\",\"contentCanonical\":\"{\\\"evaluation\\\":[],\\\"grantedScopes\\\":[],\\\"guardrails\\\":[{\\\"appliesTo\\\":\\\"all\\\",\\\"guardrailType\\\":\\\"pii-dlp\\\",\\\"name\\\":\\\"PII\\\",\\\"onViolation\\\":\\\"block\\\"}],\\\"identity\\\":null,\\\"knowledge\\\":[],\\\"manifest\\\":{\\\"agentId\\\":\\\"agent-golden-1\\\",\\\"deployable\\\":true,\\\"description\\\":\\\"Cafe order support\\\",\\\"id\\\":\\\"manifest-golden-1\\\",\\\"name\\\":\\\"Cafe Support\\\",\\\"solutionId\\\":\\\"solution-golden-1\\\",\\\"solutionName\\\":\\\"Retail Support\\\",\\\"status\\\":\\\"published\\\",\\\"version\\\":7},\\\"mcpServers\\\":[],\\\"memory\\\":[],\\\"models\\\":[{\\\"maxOutputTokens\\\":512,\\\"modelName\\\":\\\"golden-model\\\",\\\"name\\\":\\\"Primary\\\",\\\"provider\\\":\\\"inference-engine\\\",\\\"role\\\":\\\"primary\\\",\\\"structuredOutput\\\":true,\\\"temperature\\\":0.2}],\\\"primaryModel\\\":{\\\"maxOutputTokens\\\":512,\\\"modelName\\\":\\\"golden-model\\\",\\\"name\\\":\\\"Primary\\\",\\\"provider\\\":\\\"inference-engine\\\",\\\"role\\\":\\\"primary\\\",\\\"structuredOutput\\\":true,\\\"temperature\\\":0.2},\\\"readiness\\\":{\\\"maturity\\\":80,\\\"productivity\\\":60,\\\"quality\\\":100,\\\"security\\\":100},\\\"requiredScopes\\\":[],\\\"schemaVersion\\\":1,\\\"skills\\\":[],\\\"subAgents\\\":[],\\\"systemPrompt\\\":\\\"Respond safely for cafe orders.\\\",\\\"tools\\\":[],\\\"topology\\\":{\\\"maxIterations\\\":4,\\\"pattern\\\":\\\"single-react\\\"},\\\"triggers\\\":[],\\\"workflows\\\":[]}\",\"envelopeVersion\":1,\"expiresAt\":\"2026-07-10T13:00:00.000Z\",\"issuedAt\":\"2026-07-10T12:00:00.000Z\",\"issuer\":\"https://orchestra.example.test\",\"jti\":\"bundle-golden-v1\",\"keyId\":\"orchestra-test-key-v1\",\"notBefore\":\"2026-07-10T12:00:00.000Z\",\"offlineLeaseExpiresAt\":\"2026-07-10T12:15:00.000Z\",\"orgId\":\"org-golden\",\"subject\":\"agent-manifest:manifest-golden-1:v7\",\"targetEnvironment\":\"prod\"}",
+    "envelopeSignature": "EmFgRKmZssLq3GuX45LqmFESbSDtMELkTv4bxi7iRn44eCvrFeBaXgwaMFyFT1DJXtkLoD6Q5Fe5RHiD3nGoDg==",
+    "artifactDigest": "sha256:35888c18225e3b5d33ceceb8ed4c1b3165a93a25d0fc9259fd9891500c5b6eb8",
+    "issuer": "https://orchestra.example.test",
+    "keyId": "orchestra-test-key-v1",
+    "signed": true
+  }
+}

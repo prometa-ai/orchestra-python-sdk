@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-smoke:
+  lint-and-test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,7 +27,28 @@ jobs:
         run: pip install ".[dev]"
 
       - name: Ruff
-        run: ruff check prometa
+        run: ruff check prometa tests
 
-      - name: Import smoke test
-        run: python -c "from prometa import Prometa; assert Prometa.__name__ == 'Prometa'"
+      - name: Pytest
+        run: pytest -q
+
+      - name: Dependency-free import smoke test
+        run: python -c "from prometa import Prometa; import prometa.runtime; assert Prometa.__name__ == 'Prometa'"
+
+  runtime-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime extra + dev tools
+        run: pip install ".[dev,runtime]"
+
+      - name: Ruff
+        run: ruff check prometa/runtime tests/test_runtime_trust.py
+
+      - name: Runtime trust conformance
+        run: pytest -q tests/test_runtime_trust.py

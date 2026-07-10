@@ -53,8 +53,68 @@ argument and result capture.
 pip install prometa-sdk
 ```
 
-Current source version: **0.10.1**. Release history is on
+Current source version: **0.11.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
+
+### Optional tenant-runtime trust verifier
+
+The default install remains dependency-free and telemetry-first. Install the
+runtime extra only in a tenant component that admits signed Agent Builder
+artifacts:
+
+```bash
+pip install "prometa-sdk[runtime]"
+```
+
+```python
+import json
+import os
+from datetime import datetime, timezone
+
+from prometa.runtime import (
+    BundleTrustEntry,
+    BundleTrustStore,
+    verify_bundle_envelope,
+)
+
+with open("agent-bundle.json", encoding="utf-8") as bundle_file:
+    bundle = json.load(bundle_file)
+trusted_public_key = os.environ["ORCHESTRA_BUNDLE_PUBLIC_KEY"]
+trust_store = BundleTrustStore(
+    [
+        BundleTrustEntry(
+            issuer="https://orchestra.example.com",
+            key_id="orchestra-bundle-2026-07",
+            public_key_spki_der_base64=trusted_public_key,
+            allowed_org_ids=frozenset({"org_acme"}),
+            allowed_audiences=frozenset({"prometa-runtime"}),
+            allowed_environments=frozenset({"prod"}),
+        )
+    ]
+)
+admitted_jtis = set()  # Use an atomic durable store in a multi-process runtime.
+
+verified = verify_bundle_envelope(
+    bundle,
+    trust_store,
+    expected_org_id="org_acme",
+    expected_audience="prometa-runtime",
+    expected_environment="prod",
+    now=datetime.now(timezone.utc),
+    seen_jtis=admitted_jtis,
+)
+run_config = verified.content
+```
+
+The verifier ignores the public key embedded in the transport bundle and
+resolves `(issuer, keyId)` from the tenant-controlled trust store. It rejects
+unsigned, tampered, expired, revoked, replayed, wrong-org, wrong-audience,
+wrong-environment, offline-lease-expired, and non-deployable artifacts.
+
+This is an admission primitive, not an agent executor. Production admission
+will also require the separate promotion-attestation contract; a valid bundle
+signature alone is not release authorization. Importing `prometa.runtime` does
+not add runtime dependencies to `import prometa` or change telemetry behavior.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

@@ -7,6 +7,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-10
+
+### Added
+
+- Optional `prometa-sdk[runtime]` trust dependency and
+  `prometa.runtime.verify_bundle_envelope` admission primitive for Orchestra
+  bundle-envelope v1 artifacts.
+- Tenant trust-store key selection, org/audience/environment binding, validity
+  and offline-lease checks, revocation, replay protection hooks, and verified
+  canonical-content parsing.
+- A checked-in TypeScript/Python Ed25519 conformance vector plus rotation,
+  tamper, expiry, revocation, replay, and trust-scope tests.
+
+### Changed
+
+- CI now runs the existing pytest suite on every supported Python matrix entry
+  and has a separate runtime-extra conformance job. The core install remains
+  dependency-free and imports `prometa.runtime` without loading cryptography.
+
 ## [0.10.1] — 2026-06-15
 
 ### Changed

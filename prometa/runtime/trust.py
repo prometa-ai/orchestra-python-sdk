@@ -1,0 +1,391 @@
+"""Fail-closed verification for Orchestra bundle-envelope v1 artifacts.
+
+This module is the first, deliberately narrow runtime capability in the SDK.
+It verifies an artifact at a tenant admission boundary; it does not execute an
+agent and it does not call the Orchestra control plane.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, MutableSet, Optional, Tuple
+
+
+ENVELOPE_VERSION = 1
+ENVELOPE_CANONICALIZATION = "signed-payload-json-v1"
+SUPPORTED_TARGET_ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
+
+
+class BundleVerificationError(ValueError):
+    """A fail-closed artifact rejection with a stable machine-readable code."""
+
+    def __init__(self, code: str, message: Optional[str] = None) -> None:
+        self.code = code
+        super().__init__(message or code.replace("_", " "))
+
+
+@dataclass(frozen=True)
+class BundleTrustEntry:
+    """One tenant-controlled Ed25519 trust-store entry.
+
+    The transport bundle's embedded public key is intentionally absent from
+    this type. Trust is provisioned out of band and selected by issuer/key ID.
+    """
+
+    issuer: str
+    key_id: str
+    public_key_spki_der_base64: str
+    allowed_org_ids: Optional[FrozenSet[str]] = None
+    allowed_audiences: Optional[FrozenSet[str]] = None
+    allowed_environments: Optional[FrozenSet[str]] = None
+    active_from: Optional[datetime] = None
+    retired_at: Optional[datetime] = None
+
+
+class BundleTrustStore:
+    """In-memory trust-store snapshot suitable for offline verification."""
+
+    def __init__(self, entries: Iterable[BundleTrustEntry]) -> None:
+        indexed: Dict[Tuple[str, str], BundleTrustEntry] = {}
+        for entry in entries:
+            if not entry.issuer or not entry.key_id:
+                raise ValueError("trust entries require issuer and key_id")
+            key = (entry.issuer, entry.key_id)
+            if key in indexed:
+                raise ValueError("duplicate trust entry: %s/%s" % key)
+            indexed[key] = entry
+        self._entries = indexed
+
+    def resolve(self, issuer: str, key_id: str) -> BundleTrustEntry:
+        try:
+            return self._entries[(issuer, key_id)]
+        except KeyError as exc:
+            raise BundleVerificationError(
+                "unknown_signing_key",
+                "No trusted bundle key for issuer=%r key_id=%r" % (issuer, key_id),
+            ) from exc
+
+
+@dataclass(frozen=True)
+class VerifiedBundle:
+    """Content and claims parsed only from successfully verified bytes."""
+
+    claims: Mapping[str, Any]
+    content: Mapping[str, Any]
+    signed_payload: str
+    trust_entry: BundleTrustEntry
+
+    @property
+    def artifact_digest(self) -> str:
+        return str(self.claims["artifactDigest"])
+
+    @property
+    def jti(self) -> str:
+        return str(self.claims["jti"])
+
+
+def _reject_duplicate_keys(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key: %s" % key)
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-finite JSON number: %s" % value)
+
+
+def _parse_json_object(value: str, code: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BundleVerificationError(code, "Invalid JSON artifact bytes") from exc
+    if not isinstance(parsed, dict):
+        raise BundleVerificationError(code, "Artifact JSON must be an object")
+    return parsed
+
+
+def _required_string(value: Mapping[str, Any], key: str, code: str) -> str:
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or not candidate:
+        raise BundleVerificationError(code, "Missing or invalid %s" % key)
+    return candidate
+
+
+def _parse_instant(value: Mapping[str, Any], key: str) -> datetime:
+    raw = _required_string(value, key, "invalid_time_claim")
+    normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise BundleVerificationError(
+            "invalid_time_claim", "Invalid ISO-8601 %s" % key
+        ) from exc
+    if parsed.tzinfo is None:
+        raise BundleVerificationError(
+            "invalid_time_claim", "%s must include a timezone" % key
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _as_utc(value: Optional[datetime]) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise BundleVerificationError("invalid_now", "now must be timezone-aware")
+    return current.astimezone(timezone.utc)
+
+
+def _entry_time(value: Optional[datetime], field: str) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        raise BundleVerificationError(
+            "invalid_trust_entry", "%s must be timezone-aware" % field
+        )
+    return value.astimezone(timezone.utc)
+
+
+def _decode_base64(value: str, code: str) -> bytes:
+    try:
+        return base64.b64decode("".join(value.split()), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise BundleVerificationError(code, "Invalid base64 data") from exc
+
+
+def _verify_ed25519(
+    entry: BundleTrustEntry,
+    signed_payload: str,
+    signature_base64: str,
+) -> None:
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+        from cryptography.hazmat.primitives.serialization import load_der_public_key
+    except ImportError as exc:  # pragma: no cover - exercised by core-only CI smoke
+        raise BundleVerificationError(
+            "runtime_dependency_missing",
+            "Install prometa-sdk[runtime] to verify runtime artifacts",
+        ) from exc
+
+    key_der = _decode_base64(
+        entry.public_key_spki_der_base64, "invalid_trust_key"
+    )
+    signature = _decode_base64(signature_base64, "malformed_signature")
+    try:
+        public_key = load_der_public_key(key_der)
+    except (TypeError, ValueError) as exc:
+        raise BundleVerificationError("invalid_trust_key") from exc
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise BundleVerificationError("invalid_trust_key", "Trusted key is not Ed25519")
+    try:
+        public_key.verify(signature, signed_payload.encode("utf-8"))
+    except InvalidSignature as exc:
+        raise BundleVerificationError("invalid_signature") from exc
+
+
+def _validate_trust_constraints(
+    entry: BundleTrustEntry,
+    claims: Mapping[str, Any],
+    current: datetime,
+    skew: timedelta,
+) -> None:
+    active_from = _entry_time(entry.active_from, "active_from")
+    retired_at = _entry_time(entry.retired_at, "retired_at")
+    if active_from is not None and current + skew < active_from:
+        raise BundleVerificationError("signing_key_not_active")
+    if retired_at is not None and current >= retired_at:
+        raise BundleVerificationError("signing_key_retired")
+
+    constrained = (
+        (entry.allowed_org_ids, "orgId", "signing_key_org_denied"),
+        (entry.allowed_audiences, "audience", "signing_key_audience_denied"),
+        (
+            entry.allowed_environments,
+            "targetEnvironment",
+            "signing_key_environment_denied",
+        ),
+    )
+    for allowed, claim_name, error_code in constrained:
+        if allowed is not None and claims.get(claim_name) not in allowed:
+            raise BundleVerificationError(error_code)
+
+
+def verify_bundle_envelope(
+    bundle: Mapping[str, Any],
+    trust_store: BundleTrustStore,
+    *,
+    expected_org_id: str,
+    expected_audience: str,
+    expected_environment: str,
+    now: Optional[datetime] = None,
+    revoked_key_ids: Iterable[str] = (),
+    revoked_jtis: Iterable[str] = (),
+    seen_jtis: Optional[MutableSet[str]] = None,
+    max_clock_skew_seconds: int = 60,
+    max_signed_payload_bytes: int = 8 * 1024 * 1024,
+    enforce_offline_lease: bool = True,
+    require_deployable: bool = True,
+) -> VerifiedBundle:
+    """Verify and admit one bundle envelope.
+
+    ``seen_jtis`` is an optional caller-owned replay store. It is updated only
+    after every verification step succeeds; callers that need cross-process
+    atomic replay protection should wrap this verifier with a durable store.
+    """
+
+    if not expected_org_id or not expected_audience or not expected_environment:
+        raise BundleVerificationError("missing_expected_binding")
+    if expected_environment not in SUPPORTED_TARGET_ENVIRONMENTS:
+        raise BundleVerificationError("unsupported_expected_environment")
+    if type(max_clock_skew_seconds) is not int or max_clock_skew_seconds < 0:
+        raise BundleVerificationError("invalid_clock_skew")
+    if type(max_signed_payload_bytes) is not int or max_signed_payload_bytes < 1:
+        raise BundleVerificationError("invalid_payload_limit")
+
+    if bundle.get("signed") is not True:
+        raise BundleVerificationError("unsigned_bundle")
+    if bundle.get("algorithm") != "ed25519":
+        raise BundleVerificationError("unsupported_algorithm")
+    if (
+        type(bundle.get("envelopeVersion")) is not int
+        or bundle.get("envelopeVersion") != ENVELOPE_VERSION
+    ):
+        raise BundleVerificationError("unsupported_envelope_version")
+    if bundle.get("envelopeCanonicalization") != ENVELOPE_CANONICALIZATION:
+        raise BundleVerificationError("unsupported_envelope_canonicalization")
+
+    signed_payload = _required_string(
+        bundle, "signedPayload", "missing_signed_payload"
+    )
+    envelope_signature = _required_string(
+        bundle, "envelopeSignature", "missing_signature"
+    )
+    if len(signed_payload.encode("utf-8")) > max_signed_payload_bytes:
+        raise BundleVerificationError("signed_payload_too_large")
+
+    # These transport fields are untrusted selectors only. The resolved key
+    # verifies the payload before any signed JSON is parsed, and the signed
+    # issuer/key claims must match the selectors afterward.
+    transport_issuer = _required_string(bundle, "issuer", "missing_issuer")
+    transport_key_id = _required_string(bundle, "keyId", "missing_key_id")
+    if transport_key_id in frozenset(revoked_key_ids):
+        raise BundleVerificationError("revoked_signing_key")
+
+    trust_entry = trust_store.resolve(transport_issuer, transport_key_id)
+    _verify_ed25519(trust_entry, signed_payload, envelope_signature)
+    claims = _parse_json_object(signed_payload, "malformed_signed_payload")
+
+    if (
+        type(claims.get("envelopeVersion")) is not int
+        or claims.get("envelopeVersion") != ENVELOPE_VERSION
+    ):
+        raise BundleVerificationError("unsupported_envelope_version")
+    issuer = _required_string(claims, "issuer", "invalid_claims")
+    key_id = _required_string(claims, "keyId", "invalid_claims")
+    org_id = _required_string(claims, "orgId", "invalid_claims")
+    audience = _required_string(claims, "audience", "invalid_claims")
+    environment = _required_string(
+        claims, "targetEnvironment", "invalid_claims"
+    )
+    subject = _required_string(claims, "subject", "invalid_claims")
+    jti = _required_string(claims, "jti", "invalid_claims")
+    artifact_digest = _required_string(
+        claims, "artifactDigest", "invalid_claims"
+    )
+    content_canonical = _required_string(
+        claims, "contentCanonical", "invalid_claims"
+    )
+
+    if issuer != transport_issuer or key_id != transport_key_id:
+        raise BundleVerificationError("trust_selector_mismatch")
+    if bundle.get("artifactDigest") != artifact_digest:
+        raise BundleVerificationError("transport_digest_mismatch")
+    if org_id != expected_org_id:
+        raise BundleVerificationError("wrong_org")
+    if audience != expected_audience:
+        raise BundleVerificationError("wrong_audience")
+    if environment != expected_environment:
+        raise BundleVerificationError("wrong_environment")
+    if environment not in SUPPORTED_TARGET_ENVIRONMENTS:
+        raise BundleVerificationError("unsupported_target_environment")
+
+    current = _as_utc(now)
+    skew = timedelta(seconds=max_clock_skew_seconds)
+    _validate_trust_constraints(trust_entry, claims, current, skew)
+
+    issued_at = _parse_instant(claims, "issuedAt")
+    not_before = _parse_instant(claims, "notBefore")
+    expires_at = _parse_instant(claims, "expiresAt")
+    offline_lease_expires_at = _parse_instant(claims, "offlineLeaseExpiresAt")
+    if not (issued_at <= not_before < expires_at):
+        raise BundleVerificationError("invalid_validity_window")
+    if offline_lease_expires_at < not_before or offline_lease_expires_at > expires_at:
+        raise BundleVerificationError("invalid_offline_lease")
+    if current + skew < not_before:
+        raise BundleVerificationError("not_yet_valid")
+    if current >= expires_at:
+        raise BundleVerificationError("expired_bundle")
+    if enforce_offline_lease and current >= offline_lease_expires_at:
+        raise BundleVerificationError("offline_lease_expired")
+
+    revoked_jti_set = frozenset(revoked_jtis)
+    if jti in revoked_jti_set:
+        raise BundleVerificationError("revoked_bundle")
+    if seen_jtis is not None and jti in seen_jtis:
+        raise BundleVerificationError("replayed_bundle")
+
+    expected_digest = "sha256:" + hashlib.sha256(
+        content_canonical.encode("utf-8")
+    ).hexdigest()
+    if not hmac.compare_digest(expected_digest, artifact_digest):
+        raise BundleVerificationError("artifact_digest_mismatch")
+
+    content = _parse_json_object(content_canonical, "malformed_bundle_content")
+    if content.get("schemaVersion") != 1:
+        raise BundleVerificationError("unsupported_bundle_schema")
+    manifest = content.get("manifest")
+    if not isinstance(manifest, dict):
+        raise BundleVerificationError("invalid_manifest")
+    manifest_id = _required_string(manifest, "id", "invalid_manifest")
+    manifest_version = manifest.get("version")
+    if type(manifest_version) is not int or manifest_version < 1:
+        raise BundleVerificationError("invalid_manifest")
+    expected_subject = "agent-manifest:%s:v%s" % (manifest_id, manifest_version)
+    if subject != expected_subject:
+        raise BundleVerificationError("subject_mismatch")
+    if require_deployable and manifest.get("deployable") is not True:
+        raise BundleVerificationError("bundle_not_deployable")
+    if "content" in bundle and bundle.get("content") != content:
+        raise BundleVerificationError("transport_content_mismatch")
+
+    if seen_jtis is not None:
+        seen_jtis.add(jti)
+    return VerifiedBundle(
+        claims=claims,
+        content=content,
+        signed_payload=signed_payload,
+        trust_entry=trust_entry,
+    )
+
+
+__all__ = [
+    "BundleTrustEntry",
+    "BundleTrustStore",
+    "BundleVerificationError",
+    "VerifiedBundle",
+    "verify_bundle_envelope",
+]

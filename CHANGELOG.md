@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-10
+
+### Added
+
+- Purpose-separated `verify_promotion_attestation` admission checks for
+  Orchestra promotion-attestation v1, including exact release, deployment,
+  artifact, runtime, environment, gate, validity, revocation, and replay
+  bindings.
+- `build_runtime_receipt` and the dependency-free `RuntimeReceiptClient` for
+  idempotent authenticated admission/lifecycle evidence submission.
+- A TypeScript-generated promotion-attestation conformance vector shared
+  byte-for-byte with the platform.
+
+### Changed
+
+- The optional runtime kit now models the complete Phase 0 handoff sequence:
+  verify bundle integrity, verify independent promotion authorization, then
+  emit lifecycle evidence. It remains an admission/telemetry kit rather than
+  an agent executor.
+
 ## [0.11.0] - 2026-07-10
 
 ### Added

@@ -1,8 +1,9 @@
-"""Fail-closed verification for Orchestra bundle-envelope v1 artifacts.
+"""Fail-closed verification for Orchestra runtime-admission artifacts.
 
 This module is the first, deliberately narrow runtime capability in the SDK.
-It verifies an artifact at a tenant admission boundary; it does not execute an
-agent and it does not call the Orchestra control plane.
+It verifies bundle integrity and independent promotion authorization at a
+tenant admission boundary; it does not execute an agent or put the Orchestra
+control plane in the tenant's synchronous request path.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ ENVELOPE_CANONICALIZATION = "signed-payload-json-v1"
 PROMOTION_ATTESTATION_VERSION = 1
 PROMOTION_ATTESTATION_TYPE = "orchestra.promotion-attestation"
 PROMOTION_ATTESTATION_CANONICALIZATION = "signed-payload-json-v1"
+MAX_PROMOTION_APPROVALS = 10
 SUPPORTED_TARGET_ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
 
 
@@ -139,6 +141,17 @@ def _parse_json_object(value: str, code: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise BundleVerificationError(code, "Artifact JSON must be an object")
     return parsed
+
+
+def _digest_json(value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _required_string(value: Mapping[str, Any], key: str, code: str) -> str:
@@ -438,6 +451,7 @@ def verify_promotion_attestation(
     expected_release_id: str,
     expected_deployment_id: str,
     expected_runtime: str,
+    minimum_approvals: int = 0,
     now: Optional[datetime] = None,
     revoked_key_ids: Iterable[str] = (),
     revoked_jtis: Iterable[str] = (),
@@ -467,6 +481,12 @@ def verify_promotion_attestation(
         raise BundleVerificationError("missing_expected_binding")
     if expected_environment not in SUPPORTED_TARGET_ENVIRONMENTS:
         raise BundleVerificationError("unsupported_expected_environment")
+    if (
+        type(minimum_approvals) is not int
+        or minimum_approvals < 0
+        or minimum_approvals > MAX_PROMOTION_APPROVALS
+    ):
+        raise BundleVerificationError("invalid_minimum_approvals")
     if type(max_clock_skew_seconds) is not int or max_clock_skew_seconds < 0:
         raise BundleVerificationError("invalid_clock_skew")
     if type(max_signed_payload_bytes) is not int or max_signed_payload_bytes < 1:
@@ -597,17 +617,69 @@ def verify_promotion_attestation(
     if enforce_offline_lease and current >= offline_lease_expires_at:
         raise BundleVerificationError("offline_lease_expired")
 
+    approval_requirement = claims.get("approvalRequirement")
+    if approval_requirement is None:
+        signed_minimum_approvals = 0
+    else:
+        if not isinstance(approval_requirement, dict):
+            raise BundleVerificationError("invalid_approvals")
+        signed_minimum_approvals = approval_requirement.get("minimum")
+        if (
+            type(signed_minimum_approvals) is not int
+            or signed_minimum_approvals < 0
+            or signed_minimum_approvals > MAX_PROMOTION_APPROVALS
+        ):
+            raise BundleVerificationError("invalid_approvals")
+        _required_string(approval_requirement, "policy", "invalid_approvals")
+
     approvals = claims.get("approvals")
-    if not isinstance(approvals, list):
+    if not isinstance(approvals, list) or len(approvals) > MAX_PROMOTION_APPROVALS:
         raise BundleVerificationError("invalid_approvals")
+    approval_scope = {
+        "artifactId": artifact_id,
+        "artifactDigest": artifact_digest,
+        "decisionId": decision_id,
+        "targetEnvironment": environment,
+        "agentId": agent_id,
+        "requestedRuntime": requested_runtime,
+        "releaseId": release_id,
+        "deploymentId": deployment_id,
+    }
+    expected_scope_digest = _digest_json(approval_scope)
+    approval_ids = set()
+    approval_identities = set()
     for approval in approvals:
         if not isinstance(approval, dict):
             raise BundleVerificationError("invalid_approvals")
-        _required_string(approval, "identity", "invalid_approvals")
-        _required_string(approval, "method", "invalid_approvals")
+        approval_id = _required_string(approval, "approvalId", "invalid_approvals")
+        identity = _required_string(approval, "identity", "invalid_approvals")
+        method = _required_string(approval, "method", "invalid_approvals")
+        _required_string(approval, "role", "invalid_approvals")
+        scope_digest = _require_sha256_digest(approval, "scopeDigest")
         approved_at = _parse_instant(approval, "approvedAt")
-        if approved_at < decision_evaluated_at or approved_at > issued_at:
+        approval_expires_at = _parse_instant(approval, "expiresAt")
+        if (
+            approved_at < decision_evaluated_at
+            or approved_at > issued_at
+            or approval_expires_at <= approved_at
+            or approval_expires_at < expires_at
+            or approval_expires_at > decision_valid_until
+        ):
             raise BundleVerificationError("invalid_approvals")
+        if not identity.startswith("user:") or identity == "user:":
+            raise BundleVerificationError("invalid_approvals")
+        if method != "prometa-session":
+            raise BundleVerificationError("invalid_approvals")
+        if scope_digest != expected_scope_digest:
+            raise BundleVerificationError("approval_scope_mismatch")
+        if approval_id in approval_ids or identity in approval_identities:
+            raise BundleVerificationError("duplicate_approval_identity")
+        approval_ids.add(approval_id)
+        approval_identities.add(identity)
+
+    required_approvals = max(signed_minimum_approvals, minimum_approvals)
+    if len(approval_identities) < required_approvals:
+        raise BundleVerificationError("insufficient_approvals")
 
     if transport_id in frozenset(revoked_attestation_ids):
         raise BundleVerificationError("revoked_attestation")

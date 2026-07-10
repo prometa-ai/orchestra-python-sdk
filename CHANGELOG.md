@@ -7,6 +7,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-11
+
+### Added
+
+- Fail-closed verification of signed human promotion approvals, including the
+  canonical release-scope digest, identity uniqueness, decision/attestation
+  validity nesting, and signed approval-policy minimum.
+- Optional tenant-local `minimum_approvals` admission policy. The runtime
+  enforces the greater of this value and the platform-signed minimum.
+
+### Changed
+
+- Promotion-attestation v1 remains backward compatible for previously issued
+  attestations without `approvalRequirement`, while new platform attestations
+  can carry immutable approval evidence.
+- Runtime-extra CI now exercises bundle trust, promotion-attestation, and
+  runtime-receipt contracts together with cryptographic dependencies installed.
+
 ## [0.12.0] - 2026-07-10
 
 ### Added

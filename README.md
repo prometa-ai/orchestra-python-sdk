@@ -9,7 +9,7 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.12.0 also introduces an optional,
+and joinable on the platform. Version 0.13.0 includes an optional,
 purposefully narrow tenant-runtime admission kit: trust-store verification for
 signed builder bundles and promotion attestations, plus authenticated lifecycle
 receipt submission. It does not execute agents or add dependencies to the
@@ -53,7 +53,7 @@ default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.12.0**. Release history is on
+Current source version: **0.13.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime admission kit
@@ -140,6 +140,7 @@ verified_promotion = verify_promotion_attestation(
     expected_release_id="release-2026-07-10.1",
     expected_deployment_id="deployment-42",
     expected_runtime="tenant-runtime",
+    minimum_approvals=1,
     now=datetime.now(timezone.utc),
     seen_jtis=set(admitted_promotion_jtis),
 )
@@ -176,9 +177,16 @@ wrong-environment, offline-lease-expired, and non-deployable artifacts.
 Bundle integrity, promotion authorization, and runtime evidence are separate.
 The promotion verifier requires a purpose-specific signed payload and exact
 artifact/release/deployment/runtime bindings; a bundle signature alone is not
-release authorization. Receipt submission requires an API key carrying the
-platform's explicit `runtime:write` scope and is safe to retry with the same
-`receiptId` and semantic payload.
+release authorization. New attestations can include identity-distinct human
+approvals whose canonical scope binds the gate decision, artifact, environment,
+agent, runtime, release, and deployment. The verifier recomputes that scope,
+checks approval validity, and enforces the greater of the signed platform
+minimum and the tenant-local `minimum_approvals`. Attestations issued before
+this extension remain compatible and have a signed minimum of zero.
+
+Receipt submission requires an API key carrying the platform's explicit
+`runtime:write` scope and is safe to retry with the same `receiptId` and
+semantic payload.
 
 A receipt is an API-key-authenticated assertion from the tenant runtime, not an
 independent workload signature or proof of cluster state. Provision a narrow,

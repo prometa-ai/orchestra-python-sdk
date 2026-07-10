@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,9 @@ from prometa.runtime import (
 
 NOW = datetime(2026, 7, 10, 12, 5, tzinfo=timezone.utc)
 DIGEST = "sha256:" + "a" * 64
+APPROVAL_SCOPE_DIGEST = (
+    "sha256:0ed1f9a9663483de64301e1124424a21354e62a91dc5aa2a0536eb3214a34c03"
+)
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "promotion-attestation-v1.json"
 
 
@@ -34,6 +38,37 @@ def _public_key(private_key) -> str:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     return base64.b64encode(der).decode("ascii")
+
+
+def _approval_scope_digest(claims) -> str:
+    scope = {
+        "artifactId": claims["artifactId"],
+        "artifactDigest": claims["artifactDigest"],
+        "decisionId": claims["decisionId"],
+        "targetEnvironment": claims["targetEnvironment"],
+        "agentId": claims["agentId"],
+        "requestedRuntime": claims["requestedRuntime"],
+        "releaseId": claims["releaseId"],
+        "deploymentId": claims["deploymentId"],
+    }
+    canonical = json.dumps(
+        scope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _approval(claims, **overrides):
+    evidence = {
+        "approvalId": "approval-1",
+        "identity": "user:approver-1",
+        "approvedAt": "2026-07-10T12:00:30.000Z",
+        "expiresAt": "2026-07-10T12:12:00.000Z",
+        "method": "prometa-session",
+        "role": "Compliance Officer",
+        "scopeDigest": _approval_scope_digest(claims),
+    }
+    evidence.update(overrides)
+    return evidence
 
 
 def _signed(private_key, mutate=None):
@@ -61,6 +96,7 @@ def _signed(private_key, mutate=None):
         "requestedRuntime": "tenant-runtime",
         "releaseId": "release-1",
         "deploymentId": "deployment-1",
+        "approvalRequirement": {"minimum": 0, "policy": "platform-default-v1"},
         "approvals": [],
         "issuedAt": "2026-07-10T12:01:00.000Z",
         "notBefore": "2026-07-10T12:01:00.000Z",
@@ -247,6 +283,102 @@ def test_approval_timestamps_must_follow_the_bound_decision(
         ),
     )
     _assert_code("invalid_approvals", lambda: _verify(stale_approval, store))
+
+
+def test_scoped_human_approvals_and_minimums_are_enforced(signed_attestation) -> None:
+    private_key, _, store = signed_attestation
+    baseline_claims = json.loads(_signed(private_key)["signedPayload"])
+    assert _approval_scope_digest(baseline_claims) == APPROVAL_SCOPE_DIGEST
+
+    def with_approval(claims) -> None:
+        claims["approvalRequirement"] = {
+            "minimum": 1,
+            "policy": "env:PROMETA_PROMOTION_REQUIRED_APPROVALS_PROD",
+        }
+        claims["approvals"] = [_approval(claims)]
+
+    envelope = _signed(private_key, with_approval)
+    verified = _verify(envelope, store, minimum_approvals=1)
+    assert verified.claims["approvals"][0]["approvalId"] == "approval-1"
+    _assert_code(
+        "insufficient_approvals",
+        lambda: _verify(envelope, store, minimum_approvals=2),
+    )
+
+    wrong_scope = _signed(
+        private_key,
+        lambda claims: (
+            with_approval(claims),
+            claims["approvals"][0].update({"scopeDigest": "sha256:" + "f" * 64}),
+        ),
+    )
+    _assert_code("approval_scope_mismatch", lambda: _verify(wrong_scope, store))
+
+    duplicate = _signed(
+        private_key,
+        lambda claims: (
+            with_approval(claims),
+            claims["approvals"].append(
+                {**claims["approvals"][0], "approvalId": "approval-2"}
+            ),
+        ),
+    )
+    _assert_code("duplicate_approval_identity", lambda: _verify(duplicate, store))
+
+
+def test_approval_policy_and_expiry_evidence_fail_closed(signed_attestation) -> None:
+    private_key, _, store = signed_attestation
+
+    invalid_requirement = _signed(
+        private_key,
+        lambda claims: claims.update(
+            {"approvalRequirement": {"minimum": True, "policy": "test"}}
+        ),
+    )
+    _assert_code("invalid_approvals", lambda: _verify(invalid_requirement, store))
+
+    for field, value in (
+        ("method", "api-key"),
+        ("identity", "service:ci"),
+        ("identity", "user:"),
+    ):
+        malformed_human = _signed(
+            private_key,
+            lambda claims, field=field, value=value: claims.update(
+                {"approvals": [_approval(claims, **{field: value})]}
+            ),
+        )
+        _assert_code(
+            "invalid_approvals", lambda value=malformed_human: _verify(value, store)
+        )
+
+    def expired_approval(claims) -> None:
+        claims["approvals"] = [
+            _approval(claims, expiresAt="2026-07-10T12:10:00.000Z")
+        ]
+
+    invalid_expiry = _signed(private_key, expired_approval)
+    _assert_code("invalid_approvals", lambda: _verify(invalid_expiry, store))
+
+    beyond_decision = _signed(
+        private_key,
+        lambda claims: claims.update(
+            {
+                "approvals": [
+                    _approval(claims, expiresAt="2026-07-10T12:16:00.000Z")
+                ]
+            }
+        ),
+    )
+    _assert_code("invalid_approvals", lambda: _verify(beyond_decision, store))
+
+    for invalid_minimum in (-1, True, 11):
+        _assert_code(
+            "invalid_minimum_approvals",
+            lambda value=invalid_minimum: _verify(
+                _signed(private_key), store, minimum_approvals=value
+            ),
+        )
 
 
 def test_revocation_replay_expiry_and_offline_lease(signed_attestation) -> None:

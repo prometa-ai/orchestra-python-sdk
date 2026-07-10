@@ -8,12 +8,12 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
-The SDK ships several telemetry surfaces that make agent behavior queryable,
-evaluable, and joinable on the platform. The current release adds canonical
-`prometa.agent_id` correlation for pinned agents, public custom span
-attributes for tenant-owned integration metadata, and richer MCP
-tool-call spans with Prometa/GenAI tool-name aliases plus raw-channel-gated
-argument and result capture.
+The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
+and joinable on the platform. Version 0.12.0 also introduces an optional,
+purposefully narrow tenant-runtime admission kit: trust-store verification for
+signed builder bundles and promotion attestations, plus authenticated lifecycle
+receipt submission. It does not execute agents or add dependencies to the
+default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -53,14 +53,14 @@ argument and result capture.
 pip install prometa-sdk
 ```
 
-Current source version: **0.11.0**. Release history is on
+Current source version: **0.12.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
-### Optional tenant-runtime trust verifier
+### Optional tenant-runtime admission kit
 
 The default install remains dependency-free and telemetry-first. Install the
 runtime extra only in a tenant component that admits signed Agent Builder
-artifacts:
+artifacts and reports release lifecycle evidence:
 
 ```bash
 pip install "prometa-sdk[runtime]"
@@ -74,7 +74,10 @@ from datetime import datetime, timezone
 from prometa.runtime import (
     BundleTrustEntry,
     BundleTrustStore,
+    RuntimeReceiptClient,
+    build_runtime_receipt,
     verify_bundle_envelope,
+    verify_promotion_attestation,
 )
 
 with open("agent-bundle.json", encoding="utf-8") as bundle_file:
@@ -92,7 +95,11 @@ trust_store = BundleTrustStore(
         )
     ]
 )
-admitted_jtis = set()  # Use an atomic durable store in a multi-process runtime.
+admitted_bundle_jtis = set()
+admitted_promotion_jtis = set()
+# Stage replay checks in copies. Commit both real replay records only after the
+# bundle and promotion pass; use one durable transaction in a real runtime.
+staged_bundle_jtis = set(admitted_bundle_jtis)
 
 verified = verify_bundle_envelope(
     bundle,
@@ -101,9 +108,64 @@ verified = verify_bundle_envelope(
     expected_audience="prometa-runtime",
     expected_environment="prod",
     now=datetime.now(timezone.utc),
-    seen_jtis=admitted_jtis,
+    seen_jtis=staged_bundle_jtis,
 )
+
+with open("promotion-attestation.json", encoding="utf-8") as attestation_file:
+    attestation = json.load(attestation_file)
+
+# Provision this purpose-specific key as a second trust entry. It may use a
+# different issuer/key lifecycle from bundle signing.
+promotion_trust_store = BundleTrustStore(
+    [
+        BundleTrustEntry(
+            issuer="https://orchestra.example.com/promotion",
+            key_id="orchestra-promotion-2026-07",
+            public_key_spki_der_base64=os.environ[
+                "ORCHESTRA_PROMOTION_PUBLIC_KEY"
+            ],
+            allowed_org_ids=frozenset({"org_acme"}),
+            allowed_audiences=frozenset({"prometa-runtime-admission"}),
+            allowed_environments=frozenset({"prod"}),
+        )
+    ]
+)
+verified_promotion = verify_promotion_attestation(
+    attestation,
+    promotion_trust_store,
+    expected_org_id="org_acme",
+    expected_audience="prometa-runtime-admission",
+    expected_environment="prod",
+    expected_artifact_digest=verified.artifact_digest,
+    expected_release_id="release-2026-07-10.1",
+    expected_deployment_id="deployment-42",
+    expected_runtime="tenant-runtime",
+    now=datetime.now(timezone.utc),
+    seen_jtis=set(admitted_promotion_jtis),
+)
+
+# This in-memory example is single-process. A production host atomically checks
+# and reserves both JTIs in its durable admission transaction.
+admitted_bundle_jtis.add(verified.jti)
+admitted_promotion_jtis.add(verified_promotion.jti)
 run_config = verified.content
+
+receipt = build_runtime_receipt(
+    attestation_id=verified_promotion.attestation_id,
+    artifact_digest=verified.artifact_digest,
+    release_id="release-2026-07-10.1",
+    deployment_id="deployment-42",
+    target_environment="prod",
+    runtime_target="tenant-runtime",
+    runtime_id="tenant-runtime-01",
+    runtime_version="1.0.0",
+    transition="admitted",
+    outcome="accepted",
+)
+RuntimeReceiptClient(
+    "https://orchestra.example.com",
+    os.environ["ORCHESTRA_RUNTIME_RECEIPT_API_KEY"],
+).submit(receipt)
 ```
 
 The verifier ignores the public key embedded in the transport bundle and
@@ -111,10 +173,20 @@ resolves `(issuer, keyId)` from the tenant-controlled trust store. It rejects
 unsigned, tampered, expired, revoked, replayed, wrong-org, wrong-audience,
 wrong-environment, offline-lease-expired, and non-deployable artifacts.
 
-This is an admission primitive, not an agent executor. Production admission
-will also require the separate promotion-attestation contract; a valid bundle
-signature alone is not release authorization. Importing `prometa.runtime` does
-not add runtime dependencies to `import prometa` or change telemetry behavior.
+Bundle integrity, promotion authorization, and runtime evidence are separate.
+The promotion verifier requires a purpose-specific signed payload and exact
+artifact/release/deployment/runtime bindings; a bundle signature alone is not
+release authorization. Receipt submission requires an API key carrying the
+platform's explicit `runtime:write` scope and is safe to retry with the same
+`receiptId` and semantic payload.
+
+A receipt is an API-key-authenticated assertion from the tenant runtime, not an
+independent workload signature or proof of cluster state. Provision a narrow,
+expiring key per runtime trust boundary.
+
+This remains an admission and evidence kit, not an agent executor. Importing
+`prometa.runtime` does not add dependencies to `import prometa` or change
+telemetry behavior; only cryptographic verification needs the `runtime` extra.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

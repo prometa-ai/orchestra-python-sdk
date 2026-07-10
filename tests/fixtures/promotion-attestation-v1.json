@@ -1,0 +1,41 @@
+{
+  "fixtureVersion": 1,
+  "description": "Orchestra promotion attestation v1 cross-language conformance vector",
+  "trust": {
+    "issuer": "https://orchestra.example.test/promotion",
+    "keyId": "promotion-test-key-v1",
+    "publicKeySpkiDerBase64": "MCowBQYDK2VwAyEA7OTroVz/H7f1ZA9Mz2VkLJZh54EZeifDJ0vanrgIZhs="
+  },
+  "verification": {
+    "now": "2026-07-10T12:05:00.000Z",
+    "expectedOrgId": "org-golden",
+    "expectedAudience": "prometa-runtime-admission",
+    "expectedEnvironment": "prod",
+    "expectedArtifactDigest": "sha256:35888c18225e3b5d33ceceb8ed4c1b3165a93a25d0fc9259fd9891500c5b6eb8",
+    "expectedReleaseId": "release-golden-v1",
+    "expectedDeploymentId": "deployment-golden-v1",
+    "expectedRuntime": "tenant-runtime"
+  },
+  "attestation": {
+    "attestationId": "attestation-golden-v1",
+    "attestationVersion": 1,
+    "algorithm": "ed25519",
+    "canonicalization": "signed-payload-json-v1",
+    "issuer": "https://orchestra.example.test/promotion",
+    "keyId": "promotion-test-key-v1",
+    "signedPayload": "{\"agentId\":\"agent-golden-1\",\"approvals\":[],\"artifactDigest\":\"sha256:35888c18225e3b5d33ceceb8ed4c1b3165a93a25d0fc9259fd9891500c5b6eb8\",\"artifactId\":\"artifact-golden-v1\",\"artifactType\":\"orchestra.promotion-attestation\",\"attestationVersion\":1,\"audience\":\"prometa-runtime-admission\",\"decisionAllow\":true,\"decisionEvaluatedAt\":\"2026-07-10T12:00:00.000Z\",\"decisionId\":\"decision-golden-v1\",\"decisionValidUntil\":\"2026-07-10T12:20:00.000Z\",\"deploymentId\":\"deployment-golden-v1\",\"evidenceDigest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"expiresAt\":\"2026-07-10T12:12:00.000Z\",\"gateStage\":\"prod\",\"issuedAt\":\"2026-07-10T12:02:00.000Z\",\"issuer\":\"https://orchestra.example.test/promotion\",\"jti\":\"promotion-golden-v1\",\"keyId\":\"promotion-test-key-v1\",\"manifestId\":\"manifest-golden-1\",\"manifestVersion\":7,\"notBefore\":\"2026-07-10T12:02:00.000Z\",\"offlineLeaseExpiresAt\":\"2026-07-10T12:08:00.000Z\",\"orgId\":\"org-golden\",\"policySetDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"releaseId\":\"release-golden-v1\",\"requestedRuntime\":\"tenant-runtime\",\"revocationRef\":\"urn:prometa:promotion-attestation:attestation-golden-v1\",\"subject\":\"promotion-attestation:attestation-golden-v1\",\"targetEnvironment\":\"prod\"}",
+    "signature": "AHeRplSMq06zYYuYJOb/LYVuq19DM7EeUaKy6Journ+sGKiqpdpj02ursaeaYOxzrVr283TOd4A+9fdA5M94Bw==",
+    "signed": true,
+    "authorization": {
+      "artifactId": "artifact-golden-v1",
+      "artifactDigest": "sha256:35888c18225e3b5d33ceceb8ed4c1b3165a93a25d0fc9259fd9891500c5b6eb8",
+      "decisionId": "decision-golden-v1",
+      "releaseId": "release-golden-v1",
+      "deploymentId": "deployment-golden-v1",
+      "targetEnvironment": "prod",
+      "requestedRuntime": "tenant-runtime",
+      "expiresAt": "2026-07-10T12:12:00.000Z",
+      "offlineLeaseExpiresAt": "2026-07-10T12:08:00.000Z"
+    }
+  }
+}

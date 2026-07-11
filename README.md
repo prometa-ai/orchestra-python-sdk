@@ -9,10 +9,10 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.16.0 advances the optional Phase 2A
-tenant-runtime kernel with a reusable conformance runner and explicitly opted-in
-PostgreSQL replay/state adapters for multi-replica hosts. It adds no dependency
-or runtime behavior to the default observability install.
+and joinable on the platform. Version 0.17.0 adds deployment-oriented
+conformance profiles and a bounded subprocess-driver protocol on top of the
+optional Phase 2A tenant-runtime kernel and PostgreSQL durability adapters. It
+adds no dependency or runtime behavior to the default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -52,7 +52,7 @@ or runtime behavior to the default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.16.0**. Release history is on
+Current source version: **0.17.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit
@@ -293,12 +293,77 @@ evidence behavior:
 prometa-runtime-conformance --output runtime-conformance-report.json
 ```
 
+Profiles are explicit:
+
+- `core` retains the existing six-case library contract;
+- `resilience` tests local admission during control-plane outage, offline-lease
+  expiry, replay/state-store outages, and bounded model-plane failure;
+- `deployment` runs both profiles and is the expected pre-hosting gate.
+
+To exercise another process, container wrapper, or adapter to a deployed tenant
+runtime, provide a command. The runner parses it to argv and executes it directly
+without a shell. Each case gets a fresh process, bounded stdin/stdout/stderr,
+and a hard timeout:
+
+```bash
+prometa-runtime-conformance \
+  --profile deployment \
+  --driver-name tenant-runtime-staging \
+  --command "python examples/runtime_conformance_command_driver.py" \
+  --output runtime-deployment-conformance.json
+```
+
+The child receives protocol v1 JSON on stdin and writes one observation to
+stdout. `runtime_conformance_command_main()` provides the child-side framing;
+replace its `SdkRuntimeConformanceDriver` with an adapter that calls the runtime
+under test. The protocol requires an explicit synchronous control-plane call
+count, and every shipped case expects zero.
+
+The language-neutral wire shape is:
+
+```json
+{
+  "protocolVersion": 1,
+  "case": {
+    "caseId": "execution.valid",
+    "description": "...",
+    "vector": {}
+  }
+}
+```
+
+```json
+{
+  "protocolVersion": 1,
+  "observation": {
+    "accepted": true,
+    "errorCode": null,
+    "output": {},
+    "modelInvocations": 1,
+    "controlPlaneInvocations": 0,
+    "evidenceEvents": [
+      {
+        "name": "runtime.request",
+        "outcome": "completed",
+        "occurredAt": "2026-07-12T00:00:00Z",
+        "attributes": {}
+      }
+    ]
+  }
+}
+```
+
+The runner uses `output` and evidence attributes only to evaluate expectations;
+neither is copied into the final report.
+
 The command exits nonzero when a check fails. Reports contain fixture identity,
 check outcomes, error codes, model-call counts, and evidence event names; they
 exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
 runtime can implement `RuntimeConformanceDriver` and select a factory with
 `--driver package.module:create_driver`. This is an adapter-level test contract,
-not a hosted runtime API or certification by the Prometa control plane.
+not a hosted runtime API or certification by the Prometa control plane. A green
+deployment profile is retained evidence; production certification still
+requires the future reference host's topology, isolation, and outage proof.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

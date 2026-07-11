@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-12
+
+### Added
+
+- Conformance report v2 profiles: the existing six-case `core`, a five-case
+  `resilience` profile, and a combined `deployment` profile.
+- Offline-control-plane, offline-lease-expiry, replay-store outage, state-store
+  outage, and bounded model-plane outage conformance cases with evidence checks.
+- A shell-free, bounded, timed subprocess driver protocol plus a reusable
+  child-side entry point and example adapter for external runtime processes.
+- Explicit reporting and zero-call enforcement for synchronous Prometa control
+  plane dependencies.
+
+### Security
+
+- Subprocess failures expose stable codes without child stderr, command output,
+  fixture payloads, model output, keys, or credentials in conformance reports.
+- Protocol parsing rejects duplicate keys, non-finite JSON, unknown fields,
+  oversized streams, malformed evidence, nonzero exits, and hung child drivers.
+
 ## [0.16.0] - 2026-07-11
 
 ### Added

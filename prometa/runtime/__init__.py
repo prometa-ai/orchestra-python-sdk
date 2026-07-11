@@ -84,14 +84,19 @@ from .postgres import (
 )
 from .conformance import (
     CONFORMANCE_REPORT_VERSION,
+    CONFORMANCE_COMMAND_PROTOCOL_VERSION,
+    CONFORMANCE_PROFILES,
     RuntimeConformanceCase,
     RuntimeConformanceObservation,
     RuntimeConformanceDriver,
+    RuntimeConformanceProtocolError,
     RuntimeConformanceCheck,
     RuntimeConformanceReport,
     SdkRuntimeConformanceDriver,
+    SubprocessRuntimeConformanceDriver,
     load_runtime_conformance_fixture,
     run_runtime_conformance,
+    runtime_conformance_command_main,
 )
 
 __all__ = [
@@ -160,12 +165,17 @@ __all__ = [
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
+    "CONFORMANCE_COMMAND_PROTOCOL_VERSION",
+    "CONFORMANCE_PROFILES",
     "RuntimeConformanceCase",
     "RuntimeConformanceObservation",
     "RuntimeConformanceDriver",
+    "RuntimeConformanceProtocolError",
     "RuntimeConformanceCheck",
     "RuntimeConformanceReport",
     "SdkRuntimeConformanceDriver",
+    "SubprocessRuntimeConformanceDriver",
     "load_runtime_conformance_fixture",
     "run_runtime_conformance",
+    "runtime_conformance_command_main",
 ]

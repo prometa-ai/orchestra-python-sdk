@@ -174,7 +174,7 @@ def _kernel(admitted, adapter, emitter=None, **overrides):
         "model_adapter": adapter,
         "evidence_emitter": emitter or InMemoryEvidenceEmitter(),
         "runtime_id": "tenant-runtime-01",
-        "runtime_version": "0.16.0",
+        "runtime_version": "0.17.0",
     }
     values.update(overrides)
     return RuntimeKernel(admitted, **values), values["evidence_emitter"]

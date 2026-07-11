@@ -11,6 +11,7 @@ import pytest
 
 from prometa.runtime import (
     PostgresAdmissionReplayStore,
+    PostgresRuntimeActivationStore,
     PostgresRuntimeStateStore,
     RuntimePersistenceError,
     install_postgres_runtime_schema,
@@ -79,6 +80,28 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
         asyncio.run(state.save("request-1", {"status": "running"}))
     assert caught.value.code == "state_store_unavailable"
     assert "password" not in str(caught.value)
+
+    activation = PostgresRuntimeActivationStore(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        connect=_unavailable,
+    )
+    activation_values = {
+        "runtime_id": "runtime-1",
+        "deployment_id": "deployment-1",
+        "release_id": "release-1",
+        "artifact_digest": "sha256:" + "a" * 64,
+        "bundle_jti": "bundle-1",
+        "promotion_jti": "promotion-1",
+    }
+    with pytest.raises(RuntimePersistenceError) as caught:
+        activation.activate_or_join(**activation_values)
+    assert caught.value.code == "activation_store_unavailable"
+    assert "password" not in str(caught.value)
+    with pytest.raises(ValueError, match="artifact_digest"):
+        activation.activate_or_join(
+            **{**activation_values, "artifact_digest": "not-a-digest"}
+        )
 
 
 def test_state_validation_is_finite_and_bounded() -> None:
@@ -158,6 +181,62 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
         tenant_id=tenant_id + "-other",
     )
     assert isolated.reserve_pair("bundle-shared", "promotion-shared") is True
+
+    activations = PostgresRuntimeActivationStore(dsn, tenant_id=tenant_id)
+    activation_values = {
+        "runtime_id": runtime_id,
+        "deployment_id": "deployment-shared",
+        "release_id": "release-shared",
+        "artifact_digest": "sha256:" + "a" * 64,
+        "bundle_jti": "bundle-activation",
+        "promotion_jti": "promotion-activation",
+    }
+
+    def activate(_):
+        store = PostgresRuntimeActivationStore(dsn, tenant_id=tenant_id)
+        return store.activate_or_join(**activation_values).created
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        activation_outcomes = list(executor.map(activate, range(24)))
+    assert activation_outcomes.count(True) == 1
+    assert activation_outcomes.count(False) == 23
+    assert activations.activate_or_join(**activation_values).created is False
+
+    redeployed = activations.activate_or_join(
+        **{
+            **activation_values,
+            "runtime_id": "runtime-redeploy",
+            "deployment_id": "deployment-redeploy",
+            "promotion_jti": "promotion-redeploy",
+        }
+    )
+    assert redeployed.created is True
+
+    with pytest.raises(RuntimePersistenceError) as caught:
+        activations.activate_or_join(
+            **{**activation_values, "release_id": "release-conflict"}
+        )
+    assert caught.value.code == "runtime_activation_conflict"
+    with pytest.raises(RuntimePersistenceError) as caught:
+        activations.activate_or_join(
+            **{
+                **activation_values,
+                "runtime_id": "runtime-other",
+                "deployment_id": "deployment-other",
+                "promotion_jti": "promotion-digest-conflict",
+                "artifact_digest": "sha256:" + "b" * 64,
+            }
+        )
+    assert caught.value.code == "runtime_activation_conflict"
+    with pytest.raises(RuntimePersistenceError) as caught:
+        activations.activate_or_join(
+            **{
+                **activation_values,
+                "runtime_id": "runtime-promotion-replay",
+                "deployment_id": "deployment-promotion-replay",
+            }
+        )
+    assert caught.value.code == "runtime_activation_conflict"
 
     first = PostgresRuntimeStateStore(
         dsn,

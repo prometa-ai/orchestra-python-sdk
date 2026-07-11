@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: runtime
+      POSTGRES_PASSWORD: ${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: runtime
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runtime -d runtime"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - runtime-postgres:/var/lib/postgresql/data
+
+  migrate:
+    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.0}
+    entrypoint: ["prometa-runtime-postgres-init"]
+    environment:
+      PROMETA_RUNTIME_DATABASE_URL: postgresql://runtime:${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}@postgres:5432/runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  runtime:
+    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.0}
+    restart: unless-stopped
+    environment:
+      PROMETA_RUNTIME_DATABASE_URL: postgresql://runtime:${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}@postgres:5432/runtime
+      PROMETA_RUNTIME_API_TOKEN: ${PROMETA_RUNTIME_API_TOKEN:?required}
+      MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_API_KEY:-}
+    volumes:
+      - ./config.json:/etc/prometa-runtime/config.json:ro
+    ports:
+      - "127.0.0.1:${PROMETA_RUNTIME_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+
+volumes:
+  runtime-postgres:

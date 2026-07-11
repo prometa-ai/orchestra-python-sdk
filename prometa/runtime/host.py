@@ -1,0 +1,836 @@
+"""Tenant-deployed reference HTTP host for the optional runtime kernel.
+
+The host activates one signed release against a tenant PostgreSQL database,
+serves a bounded authenticated request API, and calls only tenant-owned model
+and persistence planes. The Orchestra control plane is never in the request
+path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import concurrent.futures
+import hashlib
+import hmac
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence, TextIO, Tuple
+
+from .admission import (
+    RuntimeAdmissionPolicy,
+    activate_runtime_release,
+)
+from .kernel import (
+    EvidenceEmitter,
+    RuntimeEvidenceEvent,
+    RuntimeExecutionError,
+    RuntimeExecutionPolicy,
+    RuntimeExecutionResult,
+    RuntimeKernel,
+    available_runtime_capabilities,
+)
+from .model_gateway import OpenAICompatibleModelAdapter
+from .postgres import (
+    PostgresRuntimeActivationStore,
+    PostgresRuntimeStateStore,
+    RuntimePersistenceError,
+)
+from .trust import BundleTrustEntry, BundleTrustStore, BundleVerificationError
+
+
+HOST_CONFIG_VERSION = 1
+DEFAULT_MAX_REQUEST_BYTES = 1_048_576
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60.0
+_MAX_CONFIG_BYTES = 4_194_304
+_MAX_EVIDENCE_BYTES = 65_536
+_IDENTIFIER_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/@+-"
+)
+_ENVIRONMENT_NAME_FIRST = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+)
+_ENVIRONMENT_NAME_CHARACTERS = _ENVIRONMENT_NAME_FIRST.union("0123456789")
+
+
+class RuntimeHostError(RuntimeError):
+    """Stable host bootstrap or request-boundary failure."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code.replace("_", " "))
+
+
+@dataclass(frozen=True)
+class RuntimeHostConfig:
+    tenant_id: str
+    runtime_id: str
+    runtime_version: str
+    org_id: str
+    environment: str
+    release_id: str
+    deployment_id: str
+    runtime_target: str
+    bundle: Mapping[str, Any]
+    promotion_attestation: Mapping[str, Any]
+    bundle_trust_store: BundleTrustStore
+    promotion_trust_store: BundleTrustStore
+    model_gateway_base_url: str
+    model_gateway_api_key_env: Optional[str]
+    model_gateway_endpoint_path: str
+    model_gateway_timeout_seconds: float
+    model_gateway_max_response_bytes: int
+    database_dsn_env: str
+    api_token_env: str
+    request_timeout_seconds: float
+    max_request_bytes: int
+
+
+@dataclass(frozen=True)
+class RuntimeHostResponse:
+    status: int
+    body: Mapping[str, Any]
+
+
+def _strict_json_loads(data: bytes, code: str) -> Any:
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError("non-finite number")
+
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise RuntimeHostError(code) from None
+
+
+def _mapping(value: Any, code: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeHostError(code)
+    return value
+
+
+def _exact_keys(
+    value: Mapping[str, Any],
+    *,
+    required: Sequence[str],
+    optional: Sequence[str] = (),
+    code: str,
+) -> None:
+    keys = set(value)
+    if not set(required).issubset(keys) or not keys.issubset(
+        set(required).union(optional)
+    ):
+        raise RuntimeHostError(code)
+
+
+def _identifier(name: str, value: Any, maximum: int = 128) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(character not in _IDENTIFIER_CHARACTERS for character in value)
+    ):
+        raise RuntimeHostError("invalid_%s" % name)
+    return value
+
+
+def _bounded_string(name: str, value: Any, maximum: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+    ):
+        raise RuntimeHostError("invalid_%s" % name)
+    return value
+
+
+def _environment_name(name: str, value: Any) -> str:
+    candidate = _bounded_string(name, value, 128)
+    if candidate[0] not in _ENVIRONMENT_NAME_FIRST or any(
+        character not in _ENVIRONMENT_NAME_CHARACTERS for character in candidate[1:]
+    ):
+        raise RuntimeHostError("invalid_%s" % name)
+    return candidate
+
+
+def _positive_number(name: str, value: Any, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeHostError("invalid_%s" % name)
+    result = float(value)
+    if result <= 0 or result > maximum:
+        raise RuntimeHostError("invalid_%s" % name)
+    return result
+
+
+def _positive_integer(name: str, value: Any, maximum: int) -> int:
+    if type(value) is not int or value <= 0 or value > maximum:
+        raise RuntimeHostError("invalid_%s" % name)
+    return value
+
+
+def _string_set(name: str, value: Any) -> Optional[frozenset]:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value or len(value) > 128:
+        raise RuntimeHostError("invalid_%s" % name)
+    return frozenset(_identifier(name, child, 512) for child in value)
+
+
+def _parse_trust_store(value: Any, code: str) -> BundleTrustStore:
+    if not isinstance(value, list) or not value or len(value) > 32:
+        raise RuntimeHostError(code)
+    entries = []
+    for raw in value:
+        item = _mapping(raw, code)
+        _exact_keys(
+            item,
+            required=("issuer", "keyId", "publicKeySpkiDerBase64"),
+            optional=("allowedOrgIds", "allowedAudiences", "allowedEnvironments"),
+            code=code,
+        )
+        entries.append(
+            BundleTrustEntry(
+                issuer=_bounded_string("trust_issuer", item["issuer"], 512),
+                key_id=_identifier("trust_key_id", item["keyId"], 256),
+                public_key_spki_der_base64=_bounded_string(
+                    "trust_public_key", item["publicKeySpkiDerBase64"], 4096
+                ),
+                allowed_org_ids=_string_set("trust_org_id", item.get("allowedOrgIds")),
+                allowed_audiences=_string_set(
+                    "trust_audience", item.get("allowedAudiences")
+                ),
+                allowed_environments=_string_set(
+                    "trust_environment", item.get("allowedEnvironments")
+                ),
+            )
+        )
+    try:
+        return BundleTrustStore(entries)
+    except ValueError:
+        raise RuntimeHostError(code) from None
+
+
+def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
+    """Load strict non-secret host configuration from a mounted JSON file."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise RuntimeHostError("host_config_unavailable") from None
+    if len(raw) > _MAX_CONFIG_BYTES:
+        raise RuntimeHostError("host_config_too_large")
+    document = _mapping(
+        _strict_json_loads(raw, "host_config_invalid_json"), "host_config_invalid"
+    )
+    _exact_keys(
+        document,
+        required=(
+            "configVersion",
+            "tenantId",
+            "runtimeId",
+            "runtimeVersion",
+            "orgId",
+            "environment",
+            "releaseId",
+            "deploymentId",
+            "runtimeTarget",
+            "bundle",
+            "promotionAttestation",
+            "bundleTrust",
+            "promotionTrust",
+            "modelGateway",
+        ),
+        optional=(
+            "databaseDsnEnv",
+            "apiTokenEnv",
+            "requestTimeoutSeconds",
+            "maxRequestBytes",
+        ),
+        code="host_config_invalid",
+    )
+    if document["configVersion"] != HOST_CONFIG_VERSION:
+        raise RuntimeHostError("host_config_version_unsupported")
+    model = _mapping(document["modelGateway"], "model_gateway_config_invalid")
+    _exact_keys(
+        model,
+        required=("baseUrl",),
+        optional=("apiKeyEnv", "endpointPath", "timeoutSeconds", "maxResponseBytes"),
+        code="model_gateway_config_invalid",
+    )
+    api_key_env = model.get("apiKeyEnv")
+    if api_key_env is not None:
+        api_key_env = _environment_name("model_api_key_env", api_key_env)
+    return RuntimeHostConfig(
+        tenant_id=_identifier("tenant_id", document["tenantId"]),
+        runtime_id=_identifier("runtime_id", document["runtimeId"]),
+        runtime_version=_identifier("runtime_version", document["runtimeVersion"]),
+        org_id=_identifier("org_id", document["orgId"]),
+        environment=_identifier("environment", document["environment"]),
+        release_id=_identifier("release_id", document["releaseId"]),
+        deployment_id=_identifier("deployment_id", document["deploymentId"]),
+        runtime_target=_identifier("runtime_target", document["runtimeTarget"]),
+        bundle=_mapping(document["bundle"], "bundle_config_invalid"),
+        promotion_attestation=_mapping(
+            document["promotionAttestation"], "promotion_config_invalid"
+        ),
+        bundle_trust_store=_parse_trust_store(
+            document["bundleTrust"], "bundle_trust_invalid"
+        ),
+        promotion_trust_store=_parse_trust_store(
+            document["promotionTrust"], "promotion_trust_invalid"
+        ),
+        model_gateway_base_url=_bounded_string(
+            "model_gateway_base_url", model["baseUrl"], 2048
+        ),
+        model_gateway_api_key_env=api_key_env,
+        model_gateway_endpoint_path=_bounded_string(
+            "model_gateway_endpoint_path",
+            model.get("endpointPath", "/v1/chat/completions"),
+            512,
+        ),
+        model_gateway_timeout_seconds=_positive_number(
+            "model_gateway_timeout_seconds",
+            model.get("timeoutSeconds", 30),
+            300,
+        ),
+        model_gateway_max_response_bytes=_positive_integer(
+            "model_gateway_max_response_bytes",
+            model.get("maxResponseBytes", 4 * 1024 * 1024),
+            16 * 1024 * 1024,
+        ),
+        database_dsn_env=_environment_name(
+            "database_dsn_env",
+            document.get("databaseDsnEnv", "PROMETA_RUNTIME_DATABASE_URL"),
+        ),
+        api_token_env=_environment_name(
+            "api_token_env",
+            document.get("apiTokenEnv", "PROMETA_RUNTIME_API_TOKEN"),
+        ),
+        request_timeout_seconds=_positive_number(
+            "request_timeout_seconds",
+            document.get("requestTimeoutSeconds", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            600,
+        ),
+        max_request_bytes=_positive_integer(
+            "max_request_bytes",
+            document.get("maxRequestBytes", DEFAULT_MAX_REQUEST_BYTES),
+            16 * 1024 * 1024,
+        ),
+    )
+
+
+class JsonLineEvidenceEmitter:
+    """Write payload-free kernel evidence as bounded JSON lines."""
+
+    def __init__(self, stream: Optional[TextIO] = None) -> None:
+        self._stream = stream or sys.stdout
+        self._lock = threading.Lock()
+
+    def emit(self, event: RuntimeEvidenceEvent) -> None:
+        body = json.dumps(
+            {
+                "type": "prometa.runtime.evidence",
+                "name": event.name,
+                "outcome": event.outcome,
+                "occurredAt": event.occurred_at,
+                "attributes": dict(event.attributes),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if len(body.encode("utf-8")) > _MAX_EVIDENCE_BYTES:
+            raise RuntimeHostError("evidence_event_too_large")
+        with self._lock:
+            self._stream.write(body + "\n")
+            self._stream.flush()
+
+
+class _KernelLoop:
+    def __init__(self, kernel: RuntimeKernel) -> None:
+        self._kernel = kernel
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="prometa-runtime-kernel",
+            daemon=True,
+        )
+        self._closed = False
+        self._thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        self._loop.close()
+
+    def execute(
+        self, payload: Any, request_id: str, timeout_seconds: float
+    ) -> RuntimeExecutionResult:
+        if self._closed:
+            raise RuntimeHostError("runtime_host_stopped")
+        future = asyncio.run_coroutine_threadsafe(
+            self._kernel.execute(payload, request_id=request_id),
+            self._loop,
+        )
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise RuntimeHostError("runtime_request_timeout") from None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            raise RuntimeHostError("runtime_shutdown_timeout")
+
+
+class ReferenceRuntimeHost:
+    """Authenticated HTTP application around one activated runtime kernel."""
+
+    def __init__(
+        self,
+        kernel: RuntimeKernel,
+        *,
+        api_token: str,
+        request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+    ) -> None:
+        if not isinstance(api_token, str) or len(api_token.encode("utf-8")) < 32:
+            raise RuntimeHostError("api_token_too_short")
+        self.kernel = kernel
+        self._token_digest = hashlib.sha256(api_token.encode("utf-8")).digest()
+        self.request_timeout_seconds = _positive_number(
+            "request_timeout_seconds", request_timeout_seconds, 600
+        )
+        self.max_request_bytes = _positive_integer(
+            "max_request_bytes", max_request_bytes, 16 * 1024 * 1024
+        )
+        self._runner = _KernelLoop(kernel)
+        self._inflight = set()
+        self._inflight_condition = threading.Condition()
+        self._closing = False
+
+    def _authorized(self, headers: Mapping[str, str]) -> bool:
+        value = headers.get("authorization", "")
+        if not value.startswith("Bearer "):
+            return False
+        candidate = value[7:]
+        digest = hashlib.sha256(candidate.encode("utf-8")).digest()
+        return hmac.compare_digest(digest, self._token_digest)
+
+    @staticmethod
+    def _error(status: int, code: str) -> RuntimeHostResponse:
+        return RuntimeHostResponse(status=status, body={"error": {"code": code}})
+
+    def _readiness(self) -> RuntimeHostResponse:
+        return RuntimeHostResponse(status=200, body={"status": "ready"})
+
+    def handle(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes = b"",
+    ) -> RuntimeHostResponse:
+        normalized_headers = {
+            str(key).lower(): str(value) for key, value in headers.items()
+        }
+        if method == "GET" and path == "/healthz":
+            return RuntimeHostResponse(status=200, body={"status": "ok"})
+        if method == "GET" and path == "/readyz":
+            return self._readiness()
+        if path != "/v1/runtime/execute":
+            return self._error(404, "not_found")
+        if method != "POST":
+            return self._error(405, "method_not_allowed")
+        if not self._authorized(normalized_headers):
+            return self._error(401, "unauthorized")
+        content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
+        if content_type.strip().lower() != "application/json":
+            return self._error(415, "content_type_unsupported")
+        if len(body) > self.max_request_bytes:
+            return self._error(413, "request_too_large")
+        try:
+            request = _mapping(
+                _strict_json_loads(body, "request_invalid_json"), "request_invalid"
+            )
+            _exact_keys(
+                request,
+                required=("requestId", "input"),
+                code="request_invalid",
+            )
+            request_id = _identifier("request_id", request["requestId"], 256)
+        except RuntimeHostError as exc:
+            return self._error(400, exc.code)
+        with self._inflight_condition:
+            if self._closing:
+                return self._error(503, "runtime_host_stopping")
+            if request_id in self._inflight:
+                return self._error(409, "request_in_progress")
+            self._inflight.add(request_id)
+        try:
+            result = self._runner.execute(
+                request["input"], request_id, self.request_timeout_seconds
+            )
+        except RuntimeHostError as exc:
+            status = 504 if exc.code == "runtime_request_timeout" else 503
+            return self._error(status, exc.code)
+        except RuntimeExecutionError as exc:
+            if exc.code in {"input_schema_invalid", "request_payload_not_json"}:
+                status = 422
+            elif exc.retryable or exc.code in {
+                "state_store_failed",
+                "gateway_unavailable",
+                "model_transport_failed",
+                "circuit_open",
+            }:
+                status = 503
+            else:
+                status = 500
+            return self._error(status, exc.code)
+        except Exception:
+            return self._error(500, "runtime_internal_error")
+        finally:
+            with self._inflight_condition:
+                self._inflight.discard(request_id)
+                self._inflight_condition.notify_all()
+        return RuntimeHostResponse(
+            status=200,
+            body={
+                "requestId": result.request_id,
+                "output": result.output,
+                "modelName": result.model_name,
+                "attempts": result.attempts,
+                "toolCalls": result.tool_calls,
+                "usedFallback": result.used_fallback,
+            },
+        )
+
+    def close(self, drain_timeout_seconds: float = 30.0) -> None:
+        timeout = _positive_number("drain_timeout_seconds", drain_timeout_seconds, 600)
+        deadline = time.monotonic() + timeout
+        with self._inflight_condition:
+            self._closing = True
+            while self._inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._inflight_condition.wait(timeout=remaining)
+            drained = not self._inflight
+        self._runner.close()
+        if not drained:
+            raise RuntimeHostError("runtime_shutdown_timeout")
+
+
+def build_reference_runtime_host(
+    config: RuntimeHostConfig,
+    *,
+    environment: Optional[Mapping[str, str]] = None,
+    evidence_emitter: Optional[EvidenceEmitter] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[ReferenceRuntimeHost, bool]:
+    """Activate configured artifacts and construct the tenant request host."""
+
+    env = environment if environment is not None else os.environ
+    dsn = env.get(config.database_dsn_env, "").strip()
+    if not dsn:
+        raise RuntimeHostError("runtime_database_url_missing")
+    api_token = env.get(config.api_token_env, "")
+    if not api_token:
+        raise RuntimeHostError("runtime_api_token_missing")
+    if len(api_token.encode("utf-8")) < 32:
+        raise RuntimeHostError("api_token_too_short")
+    model_api_key = None
+    if config.model_gateway_api_key_env is not None:
+        model_api_key = env.get(config.model_gateway_api_key_env, "")
+        if not model_api_key:
+            raise RuntimeHostError("model_gateway_api_key_missing")
+    model_adapter = OpenAICompatibleModelAdapter(
+        config.model_gateway_base_url,
+        api_key=model_api_key,
+        endpoint_path=config.model_gateway_endpoint_path,
+        timeout_seconds=config.model_gateway_timeout_seconds,
+        max_response_bytes=config.model_gateway_max_response_bytes,
+    )
+    policy = RuntimeAdmissionPolicy(
+        expected_org_id=config.org_id,
+        expected_environment=config.environment,
+        expected_release_id=config.release_id,
+        expected_deployment_id=config.deployment_id,
+        expected_runtime=config.runtime_target,
+        supported_capabilities=available_runtime_capabilities(),
+    )
+    admitted, activation = activate_runtime_release(
+        config.bundle,
+        config.promotion_attestation,
+        bundle_trust_store=config.bundle_trust_store,
+        promotion_trust_store=config.promotion_trust_store,
+        activation_store=PostgresRuntimeActivationStore(
+            dsn,
+            tenant_id=config.tenant_id,
+        ),
+        runtime_id=config.runtime_id,
+        policy=policy,
+        now=now or datetime.now(timezone.utc),
+    )
+    kernel = RuntimeKernel(
+        admitted,
+        model_adapter=model_adapter,
+        evidence_emitter=evidence_emitter or JsonLineEvidenceEmitter(),
+        runtime_id=config.runtime_id,
+        runtime_version=config.runtime_version,
+        execution_policy=RuntimeExecutionPolicy(
+            timeout_seconds=config.model_gateway_timeout_seconds,
+        ),
+        state_store=PostgresRuntimeStateStore(
+            dsn,
+            tenant_id=config.tenant_id,
+            runtime_id=config.runtime_id,
+        ),
+    )
+    return (
+        ReferenceRuntimeHost(
+            kernel,
+            api_token=api_token,
+            request_timeout_seconds=config.request_timeout_seconds,
+            max_request_bytes=config.max_request_bytes,
+        ),
+        activation.created,
+    )
+
+
+class _RuntimeHttpServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: Tuple[str, int], application: ReferenceRuntimeHost):
+        self.application = application
+        super().__init__(address, _RuntimeRequestHandler)
+
+
+class _RuntimeRequestHandler(BaseHTTPRequestHandler):
+    server: _RuntimeHttpServer
+    protocol_version = "HTTP/1.1"
+    server_version = "prometa-runtime"
+    sys_version = ""
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return None
+
+    def _body(self) -> Tuple[bytes, Optional[RuntimeHostResponse]]:
+        if self.headers.get("transfer-encoding") is not None:
+            return b"", ReferenceRuntimeHost._error(400, "request_framing_invalid")
+        values = self.headers.get_all("content-length", [])
+        if not values:
+            return b"", ReferenceRuntimeHost._error(411, "content_length_required")
+        if len(values) != 1:
+            return b"", ReferenceRuntimeHost._error(400, "request_framing_invalid")
+        try:
+            length = int(values[0])
+        except ValueError:
+            return b"", ReferenceRuntimeHost._error(400, "request_framing_invalid")
+        if length < 0:
+            return b"", ReferenceRuntimeHost._error(400, "request_framing_invalid")
+        if length > self.server.application.max_request_bytes:
+            return b"", ReferenceRuntimeHost._error(413, "request_too_large")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            return b"", ReferenceRuntimeHost._error(400, "request_body_incomplete")
+        return body, None
+
+    def _dispatch(self) -> None:
+        path = self.path.split("?", 1)[0]
+        headers = dict(self.headers.items())
+        body = b""
+        response = None
+        if self.command == "POST" and path == "/v1/runtime/execute":
+            authorizations = self.headers.get_all("authorization", [])
+            if len(authorizations) != 1 or not self.server.application._authorized(
+                {"authorization": authorizations[0] if authorizations else ""}
+            ):
+                response = ReferenceRuntimeHost._error(401, "unauthorized")
+            else:
+                body, response = self._body()
+        if response is None:
+            response = self.server.application.handle(
+                self.command,
+                path,
+                headers,
+                body,
+            )
+        try:
+            encoded = json.dumps(
+                dict(response.body),
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            response = ReferenceRuntimeHost._error(500, "runtime_response_invalid")
+            encoded = b'{"error":{"code":"runtime_response_invalid"}}'
+        self.close_connection = True
+        self.send_response(response.status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.send_header("cache-control", "no-store")
+        self.send_header("x-content-type-options", "nosniff")
+        if response.status == 401:
+            self.send_header("www-authenticate", "Bearer")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    do_GET = _dispatch
+    do_POST = _dispatch
+    do_PUT = _dispatch
+    do_PATCH = _dispatch
+    do_DELETE = _dispatch
+
+
+def serve_reference_runtime_host(
+    application: ReferenceRuntimeHost,
+    *,
+    bind_host: str = "0.0.0.0",
+    port: int = 8080,
+) -> None:
+    """Serve until SIGINT/SIGTERM, then drain HTTP and stop the kernel loop."""
+
+    if not bind_host or not 1 <= port <= 65535:
+        raise RuntimeHostError("listen_address_invalid")
+    server = _RuntimeHttpServer((bind_host, port), application)
+    stopping = threading.Event()
+
+    def stop(signum=None, frame=None):
+        if stopping.is_set():
+            return
+        stopping.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for selected in (signal.SIGINT, signal.SIGTERM):
+            previous[selected] = signal.signal(selected, stop)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    finally:
+        server.server_close()
+        try:
+            application.close()
+        finally:
+            for selected, handler in previous.items():
+                signal.signal(selected, handler)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="prometa-runtime-host",
+        description="Serve one activated tenant-owned Orchestra runtime release.",
+    )
+    parser.add_argument(
+        "--config",
+        default=os.environ.get(
+            "PROMETA_RUNTIME_CONFIG", "/etc/prometa-runtime/config.json"
+        ),
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("PROMETA_RUNTIME_HOST", "0.0.0.0")
+    )
+    parser.add_argument("--port", type=int, default=os.environ.get("PORT", "8080"))
+    args = parser.parse_args(argv)
+    application = None
+    try:
+        config = load_runtime_host_config(Path(args.config))
+        application, created = build_reference_runtime_host(config)
+        print(
+            json.dumps(
+                {
+                    "type": "prometa.runtime.host",
+                    "status": "ready",
+                    "activation": "created" if created else "joined",
+                    "runtimeId": config.runtime_id,
+                    "releaseId": config.release_id,
+                    "deploymentId": config.deployment_id,
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        serve_reference_runtime_host(application, bind_host=args.host, port=args.port)
+        return 0
+    except (
+        BundleVerificationError,
+        RuntimeExecutionError,
+        RuntimeHostError,
+        RuntimePersistenceError,
+    ) as exc:
+        if application is not None:
+            application.close()
+        print(
+            json.dumps(
+                {"type": "prometa.runtime.host", "status": "failed", "code": exc.code},
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    except Exception:
+        if application is not None:
+            application.close()
+        print(
+            '{"type":"prometa.runtime.host","status":"failed","code":"host_bootstrap_failed"}',
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
+__all__ = [
+    "HOST_CONFIG_VERSION",
+    "DEFAULT_MAX_REQUEST_BYTES",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "RuntimeHostError",
+    "RuntimeHostConfig",
+    "RuntimeHostResponse",
+    "JsonLineEvidenceEmitter",
+    "ReferenceRuntimeHost",
+    "load_runtime_host_config",
+    "build_reference_runtime_host",
+    "serve_reference_runtime_host",
+    "main",
+]

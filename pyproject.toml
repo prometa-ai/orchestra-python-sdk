@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prometa-sdk"
-version = "0.17.0"
+version = "0.18.0"
 description = "Official Python SDK for the Prometa Agentic Lifecycle Intelligence Platform"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -56,11 +56,18 @@ runtime-postgres = [
     "jsonschema>=4.23,<5",
     "psycopg[binary]>=3.2,<4",
 ]
+runtime-host = [
+    "cryptography>=42",
+    "jsonschema>=4.23,<5",
+    "psycopg[binary]>=3.2,<4",
+]
 dev = ["pytest>=7", "ruff>=0.5"]
 
 [project.scripts]
 prometa-runtime-conformance = "prometa.runtime.conformance:main"
 prometa-runtime-postgres-init = "prometa.runtime.postgres:main"
+prometa-runtime-host = "prometa.runtime.host:main"
+prometa-runtime-host-conformance-driver = "prometa.runtime.host_conformance:main"
 
 [project.urls]
 Homepage = "https://prometa.io"

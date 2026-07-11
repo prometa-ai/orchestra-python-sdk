@@ -150,11 +150,34 @@ class AdmittedRuntimeRelease:
         return self.bundle.artifact_digest
 
 
+@dataclass(frozen=True)
+class RuntimeActivationResult:
+    """Durable rollout activation result for a tenant runtime replica."""
+
+    created: bool
+
+
 class AdmissionReplayStore(Protocol):
     """Atomic replay reservation boundary for a bundle/attestation pair."""
 
     def reserve_pair(self, bundle_jti: str, promotion_jti: str) -> bool:
         """Return true only when both identities were newly reserved."""
+
+
+class RuntimeActivationStore(Protocol):
+    """Restart-safe activation boundary for a deployment's runtime replicas."""
+
+    def activate_or_join(
+        self,
+        *,
+        runtime_id: str,
+        deployment_id: str,
+        release_id: str,
+        artifact_digest: str,
+        bundle_jti: str,
+        promotion_jti: str,
+    ) -> RuntimeActivationResult:
+        """Create one activation or join its exact immutable identity."""
 
 
 class InMemoryAdmissionReplayStore:
@@ -176,6 +199,49 @@ class InMemoryAdmissionReplayStore:
             self._bundle_jtis.add(bundle_jti)
             self._promotion_jtis.add(promotion_jti)
             return True
+
+
+class InMemoryRuntimeActivationStore:
+    """Thread-safe activation store for tests and single-process hosts."""
+
+    def __init__(self) -> None:
+        self._activations = {}
+        self._bundle_jtis = {}
+        self._promotion_jtis = {}
+        self._lock = threading.Lock()
+
+    def activate_or_join(
+        self,
+        *,
+        runtime_id: str,
+        deployment_id: str,
+        release_id: str,
+        artifact_digest: str,
+        bundle_jti: str,
+        promotion_jti: str,
+    ) -> RuntimeActivationResult:
+        activation_key = (runtime_id, deployment_id)
+        identity = (
+            release_id,
+            artifact_digest,
+            bundle_jti,
+            promotion_jti,
+        )
+        with self._lock:
+            existing = self._activations.get(activation_key)
+            if existing is not None:
+                if existing != identity:
+                    raise BundleVerificationError("runtime_activation_conflict")
+                return RuntimeActivationResult(created=False)
+            known_digest = self._bundle_jtis.get(bundle_jti)
+            if known_digest is not None and known_digest != artifact_digest:
+                raise BundleVerificationError("runtime_activation_conflict")
+            if promotion_jti in self._promotion_jtis:
+                raise BundleVerificationError("runtime_activation_conflict")
+            self._activations[activation_key] = identity
+            self._bundle_jtis[bundle_jti] = artifact_digest
+            self._promotion_jtis[promotion_jti] = activation_key
+            return RuntimeActivationResult(created=True)
 
 
 def _mapping(value: Any, code: str) -> Mapping[str, Any]:
@@ -542,13 +608,12 @@ def _cross_check_release_identity(
         raise BundleVerificationError("promotion_agent_mismatch")
 
 
-def admit_runtime_release(
+def _verify_runtime_release(
     bundle: Mapping[str, Any],
     promotion_attestation: Mapping[str, Any],
     *,
     bundle_trust_store: BundleTrustStore,
     promotion_trust_store: BundleTrustStore,
-    replay_store: AdmissionReplayStore,
     policy: RuntimeAdmissionPolicy,
     now: Optional[datetime] = None,
     revoked_bundle_key_ids: Iterable[str] = (),
@@ -557,10 +622,8 @@ def admit_runtime_release(
     revoked_promotion_jtis: Iterable[str] = (),
     revoked_attestation_ids: Iterable[str] = (),
 ) -> AdmittedRuntimeRelease:
-    """Verify, bind, negotiate, and atomically reserve one runtime release."""
+    """Verify, bind, and negotiate a release before a replay/activation write."""
 
-    if replay_store is None:
-        raise BundleVerificationError("replay_store_required")
     verified_bundle = verify_bundle_envelope(
         bundle,
         bundle_trust_store,
@@ -598,13 +661,106 @@ def admit_runtime_release(
         supported_capabilities=policy.supported_capabilities,
         require_runtime_contract=policy.require_runtime_contract,
     )
-    if not replay_store.reserve_pair(verified_bundle.jti, verified_promotion.jti):
-        raise BundleVerificationError("replayed_runtime_release")
     return AdmittedRuntimeRelease(
         bundle=verified_bundle,
         promotion=verified_promotion,
         config=config,
     )
+
+
+def admit_runtime_release(
+    bundle: Mapping[str, Any],
+    promotion_attestation: Mapping[str, Any],
+    *,
+    bundle_trust_store: BundleTrustStore,
+    promotion_trust_store: BundleTrustStore,
+    replay_store: AdmissionReplayStore,
+    policy: RuntimeAdmissionPolicy,
+    now: Optional[datetime] = None,
+    revoked_bundle_key_ids: Iterable[str] = (),
+    revoked_bundle_jtis: Iterable[str] = (),
+    revoked_promotion_key_ids: Iterable[str] = (),
+    revoked_promotion_jtis: Iterable[str] = (),
+    revoked_attestation_ids: Iterable[str] = (),
+) -> AdmittedRuntimeRelease:
+    """Verify, bind, negotiate, and atomically reserve one runtime release."""
+
+    if replay_store is None:
+        raise BundleVerificationError("replay_store_required")
+    admitted = _verify_runtime_release(
+        bundle,
+        promotion_attestation,
+        bundle_trust_store=bundle_trust_store,
+        promotion_trust_store=promotion_trust_store,
+        policy=policy,
+        now=now,
+        revoked_bundle_key_ids=revoked_bundle_key_ids,
+        revoked_bundle_jtis=revoked_bundle_jtis,
+        revoked_promotion_key_ids=revoked_promotion_key_ids,
+        revoked_promotion_jtis=revoked_promotion_jtis,
+        revoked_attestation_ids=revoked_attestation_ids,
+    )
+    if not replay_store.reserve_pair(admitted.bundle.jti, admitted.promotion.jti):
+        raise BundleVerificationError("replayed_runtime_release")
+    return admitted
+
+
+def activate_runtime_release(
+    bundle: Mapping[str, Any],
+    promotion_attestation: Mapping[str, Any],
+    *,
+    bundle_trust_store: BundleTrustStore,
+    promotion_trust_store: BundleTrustStore,
+    activation_store: RuntimeActivationStore,
+    runtime_id: str,
+    policy: RuntimeAdmissionPolicy,
+    now: Optional[datetime] = None,
+    revoked_bundle_key_ids: Iterable[str] = (),
+    revoked_bundle_jtis: Iterable[str] = (),
+    revoked_promotion_key_ids: Iterable[str] = (),
+    revoked_promotion_jtis: Iterable[str] = (),
+    revoked_attestation_ids: Iterable[str] = (),
+) -> Tuple[AdmittedRuntimeRelease, RuntimeActivationResult]:
+    """Verify a release and create or join its exact deployment activation.
+
+    Unlike one-shot admission, exact replicas and restarts may join an existing
+    activation. The store must reject changed activation identity, promotion
+    JTI reuse, and a bundle JTI bound to different artifact bytes.
+    """
+
+    if activation_store is None:
+        raise BundleVerificationError("activation_store_required")
+    if (
+        not isinstance(runtime_id, str)
+        or not runtime_id.strip()
+        or runtime_id != runtime_id.strip()
+        or len(runtime_id) > 128
+    ):
+        raise ValueError("runtime_id must be a trimmed string of 1-128 characters")
+    admitted = _verify_runtime_release(
+        bundle,
+        promotion_attestation,
+        bundle_trust_store=bundle_trust_store,
+        promotion_trust_store=promotion_trust_store,
+        policy=policy,
+        now=now,
+        revoked_bundle_key_ids=revoked_bundle_key_ids,
+        revoked_bundle_jtis=revoked_bundle_jtis,
+        revoked_promotion_key_ids=revoked_promotion_key_ids,
+        revoked_promotion_jtis=revoked_promotion_jtis,
+        revoked_attestation_ids=revoked_attestation_ids,
+    )
+    result = activation_store.activate_or_join(
+        runtime_id=runtime_id,
+        deployment_id=policy.expected_deployment_id,
+        release_id=policy.expected_release_id,
+        artifact_digest=admitted.artifact_digest,
+        bundle_jti=admitted.bundle.jti,
+        promotion_jti=admitted.promotion.jti,
+    )
+    if not isinstance(result, RuntimeActivationResult):
+        raise BundleVerificationError("activation_store_invalid")
+    return admitted, result
 
 
 __all__ = [
@@ -625,8 +781,12 @@ __all__ = [
     "RuntimeBundleConfig",
     "RuntimeAdmissionPolicy",
     "AdmittedRuntimeRelease",
+    "RuntimeActivationResult",
     "AdmissionReplayStore",
+    "RuntimeActivationStore",
     "InMemoryAdmissionReplayStore",
+    "InMemoryRuntimeActivationStore",
     "parse_runtime_bundle",
     "admit_runtime_release",
+    "activate_runtime_release",
 ]

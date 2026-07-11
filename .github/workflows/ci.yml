@@ -75,3 +75,50 @@ jobs:
           pytest -q
           tests/test_runtime_*.py
           tests/test_promotion_attestation.py
+
+  runtime-host-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host conformance runner
+        run: pip install ".[dev,runtime-host]"
+
+      - name: Render reference Compose topology
+        env:
+          PROMETA_RUNTIME_POSTGRES_PASSWORD: ci-runtime-password
+          PROMETA_RUNTIME_API_TOKEN: ci-runtime-token-0123456789abcdefghijkl
+        run: docker compose -f deploy/reference-runtime/compose.yaml config >/dev/null
+
+      - name: Build non-root reference host image
+        run: >-
+          docker build
+          -f deploy/reference-runtime/Dockerfile
+          -t prometa-runtime-host:${{ github.sha }}
+          .
+
+      - name: Verify image identity and installed API
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
+          docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
+            -c "import prometa; from prometa.runtime import ReferenceRuntimeHost; assert prometa.__version__ == '0.18.0'"
+
+      - name: Run deployment profile through fresh host containers
+        run: >-
+          prometa-runtime-conformance
+          --profile deployment
+          --driver-name reference-host-container
+          --command "docker run --rm -i --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:${{ github.sha }}"
+          --compact
+          --output runtime-host-conformance.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-host-conformance
+          path: runtime-host-conformance.json

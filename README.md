@@ -9,10 +9,10 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.17.0 adds deployment-oriented
-conformance profiles and a bounded subprocess-driver protocol on top of the
-optional Phase 2A tenant-runtime kernel and PostgreSQL durability adapters. It
-adds no dependency or runtime behavior to the default observability install.
+and joinable on the platform. Version 0.18.0 adds a first tenant-deployed
+reference host, restart-safe PostgreSQL release activation, and a non-root
+container around the optional Phase 2A kernel. It adds no dependency or runtime
+behavior to the default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -52,7 +52,7 @@ adds no dependency or runtime behavior to the default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.17.0**. Release history is on
+Current source version: **0.18.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit
@@ -212,9 +212,10 @@ JTIs are reserved together only after every check passes.
 Bundle integrity, promotion authorization, and runtime evidence remain
 separate. The platform stays outside the synchronous request path; the model
 gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
-and emergency stop are tenant-owned. The shipped increment does not yet include
-a production MCP transport adapter, durable HITL task workflow, memory,
-compression, A2A, or the Phase 3 reference host.
+and emergency stop are tenant-owned. The first reference host is model-only and
+tenant-deployed. The shipped increment does not include a production MCP
+transport adapter, durable HITL task workflow, memory, compression, A2A,
+rollout automation, a Helm chart, or production certification.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -243,9 +244,11 @@ lower-privilege runtime credential for request traffic. The DSN must be a
 libpq-compatible PostgreSQL DSN; ORM-only query parameters such as Prisma's
 `?schema=public` are not accepted by psycopg. Migration and runtime DSNs must
 resolve to the same database schema/search path. The serving role needs
-`SELECT, INSERT` on `prometa_runtime_admission_replay` and
-`SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_request_state`; it does not
-need DDL privileges.
+`SELECT, INSERT` on `prometa_runtime_admission_replay`,
+`SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_request_state`, and
+`SELECT, INSERT, UPDATE` on `prometa_runtime_release_activation`, plus
+`SELECT, INSERT` on `prometa_runtime_bundle_identity`; it does not need DDL
+privileges.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -283,6 +286,36 @@ replica handoff and retention. State writes are atomic last-write-wins
 snapshots; they are not an exactly-once request lock or a resumable HITL
 workflow.
 
+#### Reference tenant runtime host
+
+Install the host extra only in the tenant runtime image:
+
+```bash
+pip install "prometa-sdk[runtime-host]"
+```
+
+`prometa-runtime-host` loads one strict mounted configuration, verifies both
+signed artifacts, and atomically creates or joins an immutable release
+activation in tenant PostgreSQL. Exact replicas and restarts may join. A fresh
+promotion can authorize the same signed bundle bytes for a new deployment;
+changed activation identity, promotion-JTI reuse, or a bundle JTI bound to a
+different artifact digest fails closed. The host then serves:
+
+- `GET /healthz` for liveness;
+- `GET /readyz` for payload-free readiness;
+- `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
+
+The request endpoint calls only the tenant model gateway and tenant state
+store. It validates schemas before model invocation, rejects duplicate
+in-flight IDs within a replica, returns stable payload-free errors, and shuts
+down its persistent kernel event loop gracefully. It does not claim
+cross-replica exactly-once request execution, TLS termination, distributed rate
+limiting, or overload fairness.
+
+The non-root container, Compose example, strict configuration shape, and
+operator commands live in
+[`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
+
 #### Runtime conformance
 
 The installed runner validates signed admission, tamper and replay denial,
@@ -298,7 +331,7 @@ Profiles are explicit:
 - `core` retains the existing six-case library contract;
 - `resilience` tests local admission during control-plane outage, offline-lease
   expiry, replay/state-store outages, and bounded model-plane failure;
-- `deployment` runs both profiles and is the expected pre-hosting gate.
+- `deployment` runs both profiles and is the expected image/deployment gate.
 
 To exercise another process, container wrapper, or adapter to a deployed tenant
 runtime, provide a command. The runner parses it to argv and executes it directly
@@ -361,9 +394,10 @@ check outcomes, error codes, model-call counts, and evidence event names; they
 exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
 runtime can implement `RuntimeConformanceDriver` and select a factory with
 `--driver package.module:create_driver`. This is an adapter-level test contract,
-not a hosted runtime API or certification by the Prometa control plane. A green
-deployment profile is retained evidence; production certification still
-requires the future reference host's topology, isolation, and outage proof.
+not certification by the Prometa control plane. A green deployment profile is
+retained evidence; production certification still requires topology-specific
+network/process/database chaos, isolation, load, and recovery proof around the
+reference host.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

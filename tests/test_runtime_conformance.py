@@ -98,6 +98,18 @@ def test_subprocess_driver_passes_combined_deployment_profile() -> None:
     assert len(report.checks) == 11
 
 
+def test_reference_host_process_passes_combined_deployment_profile() -> None:
+    driver = SubprocessRuntimeConformanceDriver(
+        (sys.executable, "-m", "prometa.runtime.host_conformance"),
+        name="reference-host-process",
+        timeout_seconds=10,
+    )
+    report = asyncio.run(run_runtime_conformance(driver, profile="deployment"))
+    assert report.passed is True
+    assert report.driver_name == "reference-host-process"
+    assert len(report.checks) == 11
+
+
 def test_subprocess_driver_bounds_timeout_output_and_errors() -> None:
     case = RuntimeConformanceCase(
         case_id="admission.valid",

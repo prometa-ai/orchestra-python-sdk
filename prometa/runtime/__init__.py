@@ -5,7 +5,8 @@ enforcement, and the Phase 2A kernel. The default ``prometa-sdk`` installation
 remains dependency-free and telemetry-first, and no execution path calls the
 Orchestra control plane synchronously. Install
 ``prometa-sdk[runtime-postgres]`` only for the optional shared durability
-adapters.
+adapters, or ``prometa-sdk[runtime-host]`` for the first tenant-deployed
+model-only host and its PostgreSQL dependency.
 """
 
 from .trust import (
@@ -41,10 +42,14 @@ from .admission import (
     RuntimeBundleConfig,
     RuntimeAdmissionPolicy,
     AdmittedRuntimeRelease,
+    RuntimeActivationResult,
     AdmissionReplayStore,
+    RuntimeActivationStore,
     InMemoryAdmissionReplayStore,
+    InMemoryRuntimeActivationStore,
     parse_runtime_bundle,
     admit_runtime_release,
+    activate_runtime_release,
 )
 from .kernel import (
     RuntimeExecutionError,
@@ -80,6 +85,7 @@ from .postgres import (
     RuntimeStateRecord,
     install_postgres_runtime_schema,
     PostgresAdmissionReplayStore,
+    PostgresRuntimeActivationStore,
     PostgresRuntimeStateStore,
 )
 from .conformance import (
@@ -98,6 +104,20 @@ from .conformance import (
     run_runtime_conformance,
     runtime_conformance_command_main,
 )
+from .host import (
+    HOST_CONFIG_VERSION,
+    DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    RuntimeHostError,
+    RuntimeHostConfig,
+    RuntimeHostResponse,
+    JsonLineEvidenceEmitter,
+    ReferenceRuntimeHost,
+    load_runtime_host_config,
+    build_reference_runtime_host,
+    serve_reference_runtime_host,
+)
+from .host_conformance import ReferenceHostConformanceDriver
 
 __all__ = [
     "BundleTrustEntry",
@@ -128,10 +148,14 @@ __all__ = [
     "RuntimeBundleConfig",
     "RuntimeAdmissionPolicy",
     "AdmittedRuntimeRelease",
+    "RuntimeActivationResult",
     "AdmissionReplayStore",
+    "RuntimeActivationStore",
     "InMemoryAdmissionReplayStore",
+    "InMemoryRuntimeActivationStore",
     "parse_runtime_bundle",
     "admit_runtime_release",
+    "activate_runtime_release",
     "RuntimeExecutionError",
     "ModelAdapterError",
     "RuntimeEvidenceEvent",
@@ -163,6 +187,7 @@ __all__ = [
     "RuntimeStateRecord",
     "install_postgres_runtime_schema",
     "PostgresAdmissionReplayStore",
+    "PostgresRuntimeActivationStore",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
     "CONFORMANCE_COMMAND_PROTOCOL_VERSION",
@@ -178,4 +203,16 @@ __all__ = [
     "load_runtime_conformance_fixture",
     "run_runtime_conformance",
     "runtime_conformance_command_main",
+    "HOST_CONFIG_VERSION",
+    "DEFAULT_MAX_REQUEST_BYTES",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "RuntimeHostError",
+    "RuntimeHostConfig",
+    "RuntimeHostResponse",
+    "JsonLineEvidenceEmitter",
+    "ReferenceRuntimeHost",
+    "load_runtime_host_config",
+    "build_reference_runtime_host",
+    "serve_reference_runtime_host",
+    "ReferenceHostConformanceDriver",
 ]

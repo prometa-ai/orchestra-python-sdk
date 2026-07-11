@@ -11,13 +11,17 @@ import argparse
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from .admission import RuntimeActivationResult
+
 
 _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
+_SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS prometa_runtime_schema_migrations (
@@ -47,8 +51,41 @@ CREATE TABLE IF NOT EXISTS prometa_runtime_request_state (
 CREATE INDEX IF NOT EXISTS prometa_runtime_request_state_updated_idx
     ON prometa_runtime_request_state (tenant_id, runtime_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_release_activation (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    release_id TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    bundle_jti TEXT NOT NULL,
+    promotion_jti TEXT NOT NULL,
+    activated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_joined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, runtime_id, deployment_id),
+    UNIQUE (tenant_id, promotion_jti)
+);
+
+ALTER TABLE prometa_runtime_release_activation
+    DROP CONSTRAINT IF EXISTS
+    prometa_runtime_release_activation_tenant_id_bundle_jti_key;
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_bundle_identity (
+    tenant_id TEXT NOT NULL,
+    bundle_jti TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, bundle_jti)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_release_activation_release_idx
+    ON prometa_runtime_release_activation (tenant_id, release_id);
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (2)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -82,6 +119,12 @@ def _validate_identifier(name: str, value: str) -> str:
             "%s must be a trimmed string of 1-%d characters"
             % (name, _MAX_IDENTIFIER_LENGTH)
         )
+    return value
+
+
+def _validate_digest(value: str) -> str:
+    if not isinstance(value, str) or _SHA256_DIGEST.fullmatch(value) is None:
+        raise ValueError("artifact_digest must be sha256:<hex>")
     return value
 
 
@@ -170,6 +213,98 @@ class PostgresAdmissionReplayStore(_PostgresTenantStore):
             raise
         except Exception:
             raise RuntimePersistenceError("replay_store_unavailable") from None
+
+
+class PostgresRuntimeActivationStore(_PostgresTenantStore):
+    """Restart-safe immutable activation shared by tenant runtime replicas."""
+
+    def activate_or_join(
+        self,
+        *,
+        runtime_id: str,
+        deployment_id: str,
+        release_id: str,
+        artifact_digest: str,
+        bundle_jti: str,
+        promotion_jti: str,
+    ) -> RuntimeActivationResult:
+        runtime = _validate_identifier("runtime_id", runtime_id)
+        deployment = _validate_identifier("deployment_id", deployment_id)
+        release = _validate_identifier("release_id", release_id)
+        digest = _validate_digest(artifact_digest)
+        bundle = _validate_identifier("bundle_jti", bundle_jti)
+        promotion = _validate_identifier("promotion_jti", promotion_jti)
+        identity = (release, digest, bundle, promotion)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_bundle_identity (
+                            tenant_id, bundle_jti, artifact_digest
+                        ) VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (self.tenant_id, bundle, digest),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT artifact_digest
+                        FROM prometa_runtime_bundle_identity
+                        WHERE tenant_id = %s AND bundle_jti = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, bundle),
+                    )
+                    bundle_identity = cursor.fetchone()
+                    if bundle_identity is None or bundle_identity[0] != digest:
+                        raise RuntimePersistenceError("runtime_activation_conflict")
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_release_activation (
+                            tenant_id, runtime_id, deployment_id, release_id,
+                            artifact_digest, bundle_jti, promotion_jti
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING runtime_id
+                        """,
+                        (
+                            self.tenant_id,
+                            runtime,
+                            deployment,
+                            release,
+                            digest,
+                            bundle,
+                            promotion,
+                        ),
+                    )
+                    if cursor.fetchone() is not None:
+                        return RuntimeActivationResult(created=True)
+                    cursor.execute(
+                        """
+                        SELECT release_id, artifact_digest, bundle_jti, promotion_jti
+                        FROM prometa_runtime_release_activation
+                        WHERE tenant_id = %s AND runtime_id = %s AND deployment_id = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, runtime, deployment),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None or tuple(existing) != identity:
+                        raise RuntimePersistenceError("runtime_activation_conflict")
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_release_activation
+                        SET last_joined_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s AND runtime_id = %s AND deployment_id = %s
+                        """,
+                        (self.tenant_id, runtime, deployment),
+                    )
+                    return RuntimeActivationResult(created=False)
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("activation_store_unavailable") from None
 
 
 class PostgresRuntimeStateStore(_PostgresTenantStore):
@@ -314,6 +449,7 @@ __all__ = [
     "RuntimeStateRecord",
     "install_postgres_runtime_schema",
     "PostgresAdmissionReplayStore",
+    "PostgresRuntimeActivationStore",
     "PostgresRuntimeStateStore",
     "main",
 ]

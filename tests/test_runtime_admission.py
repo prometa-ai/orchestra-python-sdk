@@ -26,8 +26,10 @@ from prometa.runtime import (
     BundleTrustStore,
     BundleVerificationError,
     InMemoryAdmissionReplayStore,
+    InMemoryRuntimeActivationStore,
     RuntimeAdmissionPolicy,
     VerifiedBundle,
+    activate_runtime_release,
     admit_runtime_release,
     parse_runtime_bundle,
     verify_bundle_envelope,
@@ -141,6 +143,57 @@ def test_signed_and_promoted_runtime_contract_admits_atomically(vector) -> None:
         "replayed_runtime_release",
         lambda: _admit(vector, replay_store=replay),
     )
+
+
+def test_runtime_activation_allows_exact_replicas_and_rejects_identity_drift(
+    vector,
+) -> None:
+    store = InMemoryRuntimeActivationStore()
+    values = {
+        "bundle": vector["bundle"],
+        "promotion_attestation": vector["attestation"],
+        "bundle_trust_store": _trust(vector["bundleTrust"]),
+        "promotion_trust_store": _trust(vector["promotionTrust"]),
+        "activation_store": store,
+        "runtime_id": "runtime-host-1",
+        "policy": _policy(vector),
+        "now": _instant(vector["verification"]["now"]),
+    }
+    admitted, first = activate_runtime_release(**values)
+    joined_admission, joined = activate_runtime_release(**values)
+
+    assert first.created is True
+    assert joined.created is False
+    assert joined_admission.artifact_digest == admitted.artifact_digest
+
+    redeployed = store.activate_or_join(
+        runtime_id="runtime-host-2",
+        deployment_id="deployment-redeploy",
+        release_id=vector["verification"]["expectedReleaseId"],
+        artifact_digest=admitted.artifact_digest,
+        bundle_jti="runtime-kernel-bundle-v1",
+        promotion_jti="runtime-kernel-promotion-redeploy",
+    )
+    assert redeployed.created is True
+
+    changed_policy = _policy(vector, expected_release_id="release-other")
+    _assert_code(
+        "wrong_release",
+        lambda: activate_runtime_release(**{**values, "policy": changed_policy}),
+    )
+    with pytest.raises(ValueError, match="runtime_id"):
+        activate_runtime_release(**{**values, "runtime_id": " "})
+
+    with pytest.raises(BundleVerificationError) as caught:
+        store.activate_or_join(
+            runtime_id="runtime-host-3",
+            deployment_id="deployment-digest-conflict",
+            release_id=vector["verification"]["expectedReleaseId"],
+            artifact_digest="sha256:" + "a" * 64,
+            bundle_jti="runtime-kernel-bundle-v1",
+            promotion_jti="runtime-kernel-promotion-digest-conflict",
+        )
+    assert caught.value.code == "runtime_activation_conflict"
 
 
 def test_failed_second_signature_does_not_partially_reserve_bundle(vector) -> None:

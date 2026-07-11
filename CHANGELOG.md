@@ -7,6 +7,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-12
+
+### Added
+
+- A tenant-deployed reference HTTP host with bearer authentication, strict and
+  bounded JSON requests, health/readiness endpoints, a persistent kernel event
+  loop, duplicate in-flight request denial, bounded execution, and graceful
+  shutdown.
+- Restart-safe release activation contracts plus a PostgreSQL activation store:
+  one replica creates the immutable rollout identity, exact replicas/restarts
+  join it, fresh promotions can authorize the same bundle bytes for redeploy,
+  and changed identity, promotion replay, or JTI/digest mismatch fails closed.
+- A `runtime-host` optional extra, `prometa-runtime-host` entry point, non-root
+  multi-stage container, PostgreSQL-first Compose example, and strict mounted
+  configuration format with environment-only credentials.
+- A reference-host conformance driver that exercises execution cases through
+  the authenticated host boundary and can run in a fresh container per case.
+
+### Security
+
+- The host advertises only installed model/evidence/schema capabilities; tools,
+  guardrails, and HITL remain unavailable unless future tenant adapters are
+  configured explicitly.
+- API, model, and database credentials are never accepted in the mounted JSON
+  document or included in host errors and evidence output.
+
 ## [0.17.0] - 2026-07-12
 
 ### Added

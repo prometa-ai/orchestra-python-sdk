@@ -1,0 +1,67 @@
+{
+  "fixtureVersion": 1,
+  "description": "Orchestra promotion attestation v1 review-workflow cross-language conformance vector",
+  "trust": {
+    "issuer": "https://orchestra.example.test/promotion",
+    "keyId": "promotion-review-test-key-v1",
+    "publicKeySpkiDerBase64": "MCowBQYDK2VwAyEADw9m1lBFcoS98apCPkno/wA1z2I9hCb3rU6u5mVu5+Q="
+  },
+  "verification": {
+    "now": "2026-07-11T12:05:00.000Z",
+    "expectedOrgId": "org-golden",
+    "expectedAudience": "prometa-runtime-admission",
+    "expectedEnvironment": "prod",
+    "expectedArtifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expectedReleaseId": "release-review-v1",
+    "expectedDeploymentId": "deployment-review-v1",
+    "expectedRuntime": "tenant-runtime",
+    "minimumApprovals": 2,
+    "requiredApprovalRoles": {
+      "Compliance Officer": 1,
+      "Security": 1
+    }
+  },
+  "attestation": {
+    "attestationId": "attestation-review-golden-v1",
+    "attestationVersion": 1,
+    "algorithm": "ed25519",
+    "canonicalization": "signed-payload-json-v1",
+    "issuer": "https://orchestra.example.test/promotion",
+    "keyId": "promotion-review-test-key-v1",
+    "signedPayload": "{\"agentId\":\"agent-review-v1\",\"approvalRequest\":{\"expiresAt\":\"2026-07-11T12:12:00.000Z\",\"policyDigest\":\"sha256:ab333428d5751c9eb5acd003e7ef79aa60a3ee269bd1995b6e5d73d8589cbeb7\",\"requestId\":\"review-golden-v1\",\"requestedAt\":\"2026-07-11T12:00:15.000Z\",\"requesterIdentity\":\"user:requester-golden\"},\"approvalRequirement\":{\"minimum\":2,\"policy\":\"fixture:review-v1\",\"reviewRequestRequired\":true,\"roleRequirements\":[{\"minimum\":1,\"role\":\"Compliance Officer\"},{\"minimum\":1,\"role\":\"Security\"}],\"separationOfDuties\":true},\"approvals\":[{\"approvalId\":\"approval-compliance\",\"approvedAt\":\"2026-07-11T12:00:30.000Z\",\"expiresAt\":\"2026-07-11T12:12:00.000Z\",\"identity\":\"user:compliance-golden\",\"method\":\"prometa-session\",\"requestId\":\"review-golden-v1\",\"role\":\"Compliance Officer\",\"scopeDigest\":\"sha256:d34f6b147200dd57dfb931e01f7bb8fc699eda0dbb7044cbbcae1ee818c8b445\"},{\"approvalId\":\"approval-security\",\"approvedAt\":\"2026-07-11T12:00:30.000Z\",\"expiresAt\":\"2026-07-11T12:12:00.000Z\",\"identity\":\"user:security-golden\",\"method\":\"prometa-session\",\"requestId\":\"review-golden-v1\",\"role\":\"Security\",\"scopeDigest\":\"sha256:d34f6b147200dd57dfb931e01f7bb8fc699eda0dbb7044cbbcae1ee818c8b445\"}],\"artifactDigest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"artifactId\":\"artifact-review-v1\",\"artifactType\":\"orchestra.promotion-attestation\",\"attestationVersion\":1,\"audience\":\"prometa-runtime-admission\",\"decisionAllow\":true,\"decisionEvaluatedAt\":\"2026-07-11T12:00:00.000Z\",\"decisionId\":\"decision-review-v1\",\"decisionValidUntil\":\"2026-07-11T12:20:00.000Z\",\"deploymentId\":\"deployment-review-v1\",\"evidenceDigest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"expiresAt\":\"2026-07-11T12:10:00.000Z\",\"gateStage\":\"prod\",\"issuedAt\":\"2026-07-11T12:02:00.000Z\",\"issuer\":\"https://orchestra.example.test/promotion\",\"jti\":\"promotion-review-golden-v1\",\"keyId\":\"promotion-review-test-key-v1\",\"manifestId\":\"manifest-review-v1\",\"manifestVersion\":8,\"notBefore\":\"2026-07-11T12:02:00.000Z\",\"offlineLeaseExpiresAt\":\"2026-07-11T12:08:00.000Z\",\"orgId\":\"org-golden\",\"policySetDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"releaseId\":\"release-review-v1\",\"requestedRuntime\":\"tenant-runtime\",\"revocationRef\":\"urn:prometa:promotion-attestation:attestation-review-golden-v1\",\"subject\":\"promotion-attestation:attestation-review-golden-v1\",\"targetEnvironment\":\"prod\"}",
+    "signature": "eXnzlWIyXVdZUlsRmbf3In5kT6P7TT0Upmy/bmyTIAeb3ey/iw1Dpu3NYBiG53Z4vx6UjRxapiUZf2KT6d0YDw==",
+    "signed": true,
+    "authorization": {
+      "artifactId": "artifact-review-v1",
+      "artifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "decisionId": "decision-review-v1",
+      "releaseId": "release-review-v1",
+      "deploymentId": "deployment-review-v1",
+      "targetEnvironment": "prod",
+      "requestedRuntime": "tenant-runtime",
+      "approvalRequestId": "review-golden-v1",
+      "approvalRequirement": {
+        "minimum": 2,
+        "policy": "fixture:review-v1",
+        "roleRequirements": [
+          {
+            "role": "Compliance Officer",
+            "minimum": 1
+          },
+          {
+            "role": "Security",
+            "minimum": 1
+          }
+        ],
+        "separationOfDuties": true,
+        "reviewRequestRequired": true
+      },
+      "approvalIds": [
+        "approval-compliance",
+        "approval-security"
+      ],
+      "expiresAt": "2026-07-11T12:10:00.000Z",
+      "offlineLeaseExpiresAt": "2026-07-11T12:08:00.000Z"
+    }
+  }
+}

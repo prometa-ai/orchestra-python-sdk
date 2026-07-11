@@ -9,7 +9,7 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.13.0 includes an optional,
+and joinable on the platform. Version 0.14.0 includes an optional,
 purposefully narrow tenant-runtime admission kit: trust-store verification for
 signed builder bundles and promotion attestations, plus authenticated lifecycle
 receipt submission. It does not execute agents or add dependencies to the
@@ -53,7 +53,7 @@ default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.13.0**. Release history is on
+Current source version: **0.14.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime admission kit
@@ -141,6 +141,7 @@ verified_promotion = verify_promotion_attestation(
     expected_deployment_id="deployment-42",
     expected_runtime="tenant-runtime",
     minimum_approvals=1,
+    required_approval_roles={"Compliance Officer": 1, "Security": 1},
     now=datetime.now(timezone.utc),
     seen_jtis=set(admitted_promotion_jtis),
 )
@@ -181,8 +182,11 @@ release authorization. New attestations can include identity-distinct human
 approvals whose canonical scope binds the gate decision, artifact, environment,
 agent, runtime, release, and deployment. The verifier recomputes that scope,
 checks approval validity, and enforces the greater of the signed platform
-minimum and the tenant-local `minimum_approvals`. Attestations issued before
-this extension remain compatible and have a signed minimum of zero.
+minimum and the tenant-local `minimum_approvals`. For review-workflow
+attestations it also verifies the signed request-policy digest, request
+validity window, role-specific quorum, requester/approver separation, and any
+stricter tenant-local `required_approval_roles`. Attestations issued before
+these extensions remain compatible and have a signed minimum of zero.
 
 Receipt submission requires an API key carrying the platform's explicit
 `runtime:write` scope and is safe to retry with the same `receiptId` and

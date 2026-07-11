@@ -30,6 +30,9 @@ APPROVAL_SCOPE_DIGEST = (
     "sha256:0ed1f9a9663483de64301e1124424a21354e62a91dc5aa2a0536eb3214a34c03"
 )
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "promotion-attestation-v1.json"
+REVIEW_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "promotion-attestation-review-v1.json"
+)
 
 
 def _public_key(private_key) -> str:
@@ -215,6 +218,42 @@ def test_typescript_golden_vector_verifies_exact_payload_bytes() -> None:
     assert verified.jti == "promotion-golden-v1"
 
 
+def test_typescript_review_vector_verifies_role_and_request_evidence() -> None:
+    vector = json.loads(REVIEW_FIXTURE_PATH.read_text(encoding="utf-8"))
+    trust = vector["trust"]
+    expected = vector["verification"]
+    store = BundleTrustStore(
+        [
+            BundleTrustEntry(
+                issuer=trust["issuer"],
+                key_id=trust["keyId"],
+                public_key_spki_der_base64=trust["publicKeySpkiDerBase64"],
+                allowed_org_ids=frozenset({expected["expectedOrgId"]}),
+                allowed_audiences=frozenset({expected["expectedAudience"]}),
+                allowed_environments=frozenset(
+                    {expected["expectedEnvironment"]}
+                ),
+            )
+        ]
+    )
+    verified = verify_promotion_attestation(
+        vector["attestation"],
+        store,
+        expected_org_id=expected["expectedOrgId"],
+        expected_audience=expected["expectedAudience"],
+        expected_environment=expected["expectedEnvironment"],
+        expected_artifact_digest=expected["expectedArtifactDigest"],
+        expected_release_id=expected["expectedReleaseId"],
+        expected_deployment_id=expected["expectedDeploymentId"],
+        expected_runtime=expected["expectedRuntime"],
+        minimum_approvals=expected["minimumApprovals"],
+        required_approval_roles=expected["requiredApprovalRoles"],
+        now=datetime.fromisoformat(expected["now"].replace("Z", "+00:00")),
+    )
+    assert verified.attestation_id == "attestation-review-golden-v1"
+    assert verified.claims["approvalRequest"]["requestId"] == "review-golden-v1"
+
+
 @pytest.mark.parametrize(
     ("option", "value", "code"),
     [
@@ -379,6 +418,153 @@ def test_approval_policy_and_expiry_evidence_fail_closed(signed_attestation) -> 
                 _signed(private_key), store, minimum_approvals=value
             ),
         )
+
+
+def test_review_request_role_quorum_and_separation_are_enforced(
+    signed_attestation,
+) -> None:
+    private_key, _, store = signed_attestation
+
+    def with_review(claims) -> None:
+        requirement = {
+            "minimum": 2,
+            "policy": "env:review-policy-v2",
+            "roleRequirements": [
+                {"role": "Compliance Officer", "minimum": 1},
+                {"role": "Security", "minimum": 1},
+            ],
+            "separationOfDuties": True,
+            "reviewRequestRequired": True,
+        }
+        claims["approvalRequirement"] = requirement
+        claims["approvalRequest"] = {
+            "requestId": "review-1",
+            "requesterIdentity": "user:requester-1",
+            "requestedAt": "2026-07-10T12:00:15.000Z",
+            "expiresAt": "2026-07-10T12:12:00.000Z",
+            "policyDigest": "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    requirement,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        claims["approvals"] = [
+            _approval(
+                claims,
+                approvalId="approval-compliance",
+                requestId="review-1",
+                identity="user:compliance-1",
+                role="Compliance Officer",
+            ),
+            _approval(
+                claims,
+                approvalId="approval-security",
+                requestId="review-1",
+                identity="user:security-1",
+                role="Security",
+            ),
+        ]
+
+    envelope = _signed(private_key, with_review)
+    verified = _verify(
+        envelope,
+        store,
+        required_approval_roles={"Security": 1},
+    )
+    assert verified.claims["approvalRequest"]["requestId"] == "review-1"
+
+    mirrored = copy.deepcopy(envelope)
+    claims = json.loads(mirrored["signedPayload"])
+    mirrored["authorization"].update(
+        {
+            "approvalRequirement": claims["approvalRequirement"],
+            "approvalIds": [item["approvalId"] for item in claims["approvals"]],
+            "approvalRequestId": "review-1",
+        }
+    )
+    assert _verify(mirrored, store).attestation_id == "attestation-1"
+    mirrored["authorization"]["approvalRequestId"] = "review-attacker"
+    _assert_code(
+        "transport_authorization_mismatch", lambda: _verify(mirrored, store)
+    )
+
+    def mutated_review(mutator):
+        def apply(claims) -> None:
+            with_review(claims)
+            mutator(claims)
+
+        return _signed(private_key, apply)
+
+    _assert_code(
+        "requester_approval_forbidden",
+        lambda: _verify(
+            mutated_review(
+                lambda claims: claims["approvals"][0].update(
+                    {"identity": "user:requester-1"}
+                )
+            ),
+            store,
+        ),
+    )
+    _assert_code(
+        "approval_request_mismatch",
+        lambda: _verify(
+            mutated_review(
+                lambda claims: claims["approvals"][0].update(
+                    {"requestId": "review-2"}
+                )
+            ),
+            store,
+        ),
+    )
+    _assert_code(
+        "invalid_approval_request",
+        lambda: _verify(
+            mutated_review(
+                lambda claims: claims["approvalRequest"].update(
+                    {"policyDigest": "sha256:" + "f" * 64}
+                )
+            ),
+            store,
+        ),
+    )
+    _assert_code(
+        "approval_request_required",
+        lambda: _verify(
+            mutated_review(lambda claims: claims.pop("approvalRequest")), store
+        ),
+    )
+    _assert_code(
+        "insufficient_role_approvals",
+        lambda: _verify(
+            mutated_review(
+                lambda claims: claims["approvals"][1].update(
+                    {"role": "Compliance Officer"}
+                )
+            ),
+            store,
+        ),
+    )
+    _assert_code(
+        "insufficient_role_approvals",
+        lambda: _verify(
+            envelope,
+            store,
+            required_approval_roles={"Security": 2},
+        ),
+    )
+    _assert_code(
+        "invalid_required_approval_roles",
+        lambda: _verify(
+            envelope,
+            store,
+            required_approval_roles={"Security": 0},
+        ),
+    )
 
 
 def test_revocation_replay_expiry_and_offline_lease(signed_attestation) -> None:

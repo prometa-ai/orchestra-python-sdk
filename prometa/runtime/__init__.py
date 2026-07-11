@@ -3,7 +3,9 @@
 Install ``prometa-sdk[runtime]`` for cryptographic admission, JSON Schema
 enforcement, and the Phase 2A kernel. The default ``prometa-sdk`` installation
 remains dependency-free and telemetry-first, and no execution path calls the
-Orchestra control plane synchronously.
+Orchestra control plane synchronously. Install
+``prometa-sdk[runtime-postgres]`` only for the optional shared durability
+adapters.
 """
 
 from .trust import (
@@ -73,6 +75,24 @@ from .kernel import (
     RuntimeKernel,
 )
 from .model_gateway import OpenAICompatibleModelAdapter
+from .postgres import (
+    RuntimePersistenceError,
+    RuntimeStateRecord,
+    install_postgres_runtime_schema,
+    PostgresAdmissionReplayStore,
+    PostgresRuntimeStateStore,
+)
+from .conformance import (
+    CONFORMANCE_REPORT_VERSION,
+    RuntimeConformanceCase,
+    RuntimeConformanceObservation,
+    RuntimeConformanceDriver,
+    RuntimeConformanceCheck,
+    RuntimeConformanceReport,
+    SdkRuntimeConformanceDriver,
+    load_runtime_conformance_fixture,
+    run_runtime_conformance,
+)
 
 __all__ = [
     "BundleTrustEntry",
@@ -134,4 +154,18 @@ __all__ = [
     "available_runtime_capabilities",
     "RuntimeKernel",
     "OpenAICompatibleModelAdapter",
+    "RuntimePersistenceError",
+    "RuntimeStateRecord",
+    "install_postgres_runtime_schema",
+    "PostgresAdmissionReplayStore",
+    "PostgresRuntimeStateStore",
+    "CONFORMANCE_REPORT_VERSION",
+    "RuntimeConformanceCase",
+    "RuntimeConformanceObservation",
+    "RuntimeConformanceDriver",
+    "RuntimeConformanceCheck",
+    "RuntimeConformanceReport",
+    "SdkRuntimeConformanceDriver",
+    "load_runtime_conformance_fixture",
+    "run_runtime_conformance",
 ]

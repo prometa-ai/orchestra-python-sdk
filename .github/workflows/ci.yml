@@ -37,6 +37,23 @@ jobs:
 
   runtime-contract:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: runtime_test
+          POSTGRES_PASSWORD: runtime_test
+          POSTGRES_DB: runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U runtime_test -d runtime_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PROMETA_RUNTIME_TEST_POSTGRES_DSN: >-
+        postgresql://runtime_test:runtime_test@localhost:5432/runtime_test
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +62,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install runtime extra + dev tools
-        run: pip install ".[dev,runtime]"
+        run: pip install ".[dev,runtime-postgres]"
 
       - name: Ruff
         run: >-

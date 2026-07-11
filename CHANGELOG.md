@@ -7,6 +7,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-11
+
+### Added
+
+- A reusable `prometa-runtime-conformance` runner and Python driver protocol
+  covering valid admission/execution, signed-envelope tampering, replay,
+  schema-before-model ordering, joinable evidence, and fail-closed evidence.
+- A packaged copy of the cross-repo signed runtime fixture and sanitized,
+  machine-readable conformance report v1.
+- Optional `runtime-postgres` adapters for atomic tenant-wide replay
+  reservation and tenant/runtime-scoped, versioned request-state snapshots.
+- Explicit PostgreSQL schema installation plus integration tests proving a
+  single winner under concurrent replay races and cross-replica state reads.
+
+### Changed
+
+- Runtime-contract CI now provisions PostgreSQL 16 and exercises the durable
+  adapters in addition to the in-memory protocol implementations.
+- Core `prometa-sdk` and `prometa-sdk[runtime]` remain free of PostgreSQL driver
+  dependencies; psycopg is installed only by `prometa-sdk[runtime-postgres]`.
+
+### Fixed
+
+- `InMemoryRuntimeStateStore` no longer binds an `asyncio.Lock` before an event
+  loop exists, restoring supported Python 3.9 construction and cross-loop use.
+
 ## [0.15.0] - 2026-07-11
 
 ### Added

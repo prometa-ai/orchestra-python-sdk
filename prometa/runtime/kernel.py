@@ -247,10 +247,10 @@ class RuntimeStateStore(Protocol):
 class InMemoryRuntimeStateStore:
     def __init__(self) -> None:
         self.states: Dict[str, Mapping[str, Any]] = {}
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
 
     async def save(self, request_id: str, state: Mapping[str, Any]) -> None:
-        async with self._lock:
+        with self._lock:
             self.states[request_id] = dict(state)
 
 

@@ -9,10 +9,10 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.14.0 includes an optional,
-purposefully narrow tenant-runtime admission kit: trust-store verification for
-signed builder bundles and promotion attestations, plus authenticated lifecycle
-receipt submission. It does not execute agents or add dependencies to the
+and joinable on the platform. Version 0.15.0 adds the first optional Phase 2A
+tenant-runtime kernel: combined signed-artifact admission, typed runtime
+contracts, schema and guard enforcement, bounded model/tool execution, and
+joinable decision evidence. It adds no dependency or runtime behavior to the
 default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
@@ -53,69 +53,57 @@ default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.14.0**. Release history is on
+Current source version: **0.15.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
-### Optional tenant-runtime admission kit
+### Optional tenant-runtime kit
 
 The default install remains dependency-free and telemetry-first. Install the
-runtime extra only in a tenant component that admits signed Agent Builder
-artifacts and reports release lifecycle evidence:
+runtime extra only in a tenant-owned component that admits signed Agent Builder
+artifacts, invokes tenant models/tools, and reports release lifecycle evidence:
 
 ```bash
 pip install "prometa-sdk[runtime]"
 ```
 
 ```python
+import asyncio
 import json
 import os
 from datetime import datetime, timezone
 
+from prometa import Prometa
 from prometa.runtime import (
+    InMemoryAdmissionReplayStore,
+    OpenAICompatibleModelAdapter,
+    PrometaEvidenceEmitter,
     BundleTrustEntry,
     BundleTrustStore,
+    RuntimeAdmissionPolicy,
+    RuntimeKernel,
     RuntimeReceiptClient,
+    admit_runtime_release,
+    available_runtime_capabilities,
     build_runtime_receipt,
-    verify_bundle_envelope,
-    verify_promotion_attestation,
 )
 
 with open("agent-bundle.json", encoding="utf-8") as bundle_file:
     bundle = json.load(bundle_file)
-trusted_public_key = os.environ["ORCHESTRA_BUNDLE_PUBLIC_KEY"]
-trust_store = BundleTrustStore(
+with open("promotion-attestation.json", encoding="utf-8") as attestation_file:
+    attestation = json.load(attestation_file)
+
+bundle_trust_store = BundleTrustStore(
     [
         BundleTrustEntry(
             issuer="https://orchestra.example.com",
             key_id="orchestra-bundle-2026-07",
-            public_key_spki_der_base64=trusted_public_key,
-            allowed_org_ids=frozenset({"org_acme"}),
+            public_key_spki_der_base64=os.environ["ORCHESTRA_BUNDLE_PUBLIC_KEY"],
+            allowed_org_ids=frozenset({"org_example"}),
             allowed_audiences=frozenset({"prometa-runtime"}),
             allowed_environments=frozenset({"prod"}),
         )
     ]
 )
-admitted_bundle_jtis = set()
-admitted_promotion_jtis = set()
-# Stage replay checks in copies. Commit both real replay records only after the
-# bundle and promotion pass; use one durable transaction in a real runtime.
-staged_bundle_jtis = set(admitted_bundle_jtis)
-
-verified = verify_bundle_envelope(
-    bundle,
-    trust_store,
-    expected_org_id="org_acme",
-    expected_audience="prometa-runtime",
-    expected_environment="prod",
-    now=datetime.now(timezone.utc),
-    seen_jtis=staged_bundle_jtis,
-)
-
-with open("promotion-attestation.json", encoding="utf-8") as attestation_file:
-    attestation = json.load(attestation_file)
-
-# Provision this purpose-specific key as a second trust entry. It may use a
-# different issuer/key lifecycle from bundle signing.
 promotion_trust_store = BundleTrustStore(
     [
         BundleTrustEntry(
@@ -124,37 +112,64 @@ promotion_trust_store = BundleTrustStore(
             public_key_spki_der_base64=os.environ[
                 "ORCHESTRA_PROMOTION_PUBLIC_KEY"
             ],
-            allowed_org_ids=frozenset({"org_acme"}),
+            allowed_org_ids=frozenset({"org_example"}),
             allowed_audiences=frozenset({"prometa-runtime-admission"}),
             allowed_environments=frozenset({"prod"}),
         )
     ]
 )
-verified_promotion = verify_promotion_attestation(
+
+# Replace this with a tenant database implementation whose reserve_pair()
+# performs one unique transaction when the host has multiple replicas.
+replay_store = InMemoryAdmissionReplayStore()
+admitted = admit_runtime_release(
+    bundle,
     attestation,
-    promotion_trust_store,
-    expected_org_id="org_acme",
-    expected_audience="prometa-runtime-admission",
-    expected_environment="prod",
-    expected_artifact_digest=verified.artifact_digest,
-    expected_release_id="release-2026-07-10.1",
-    expected_deployment_id="deployment-42",
-    expected_runtime="tenant-runtime",
-    minimum_approvals=1,
-    required_approval_roles={"Compliance Officer": 1, "Security": 1},
+    bundle_trust_store=bundle_trust_store,
+    promotion_trust_store=promotion_trust_store,
+    replay_store=replay_store,
+    policy=RuntimeAdmissionPolicy(
+        expected_org_id="org_example",
+        expected_environment="prod",
+        expected_release_id="release-2026-07-10.1",
+        expected_deployment_id="deployment-42",
+        expected_runtime="tenant-runtime",
+        supported_capabilities=available_runtime_capabilities(),
+        minimum_approvals=1,
+        required_approval_roles={"Compliance Officer": 1, "Security": 1},
+    ),
     now=datetime.now(timezone.utc),
-    seen_jtis=set(admitted_promotion_jtis),
 )
 
-# This in-memory example is single-process. A production host atomically checks
-# and reserves both JTIs in its durable admission transaction.
-admitted_bundle_jtis.add(verified.jti)
-admitted_promotion_jtis.add(verified_promotion.jti)
-run_config = verified.content
+telemetry = Prometa(
+    endpoint="https://orchestra.example.com/api/v2/otlp/v1/traces",
+    api_key=os.environ["PROMETA_API_KEY"],
+    solution_id="customer-support",
+    agent_name=admitted.config.manifest.name,
+    agent_id=admitted.config.manifest.agent_id,
+    stage="production",
+)
+kernel = RuntimeKernel(
+    admitted,
+    model_adapter=OpenAICompatibleModelAdapter(
+        "http://inference-engine.tenant.svc:8080",
+        api_key=os.environ.get("MODEL_GATEWAY_API_KEY"),
+    ),
+    evidence_emitter=PrometaEvidenceEmitter(telemetry),
+    runtime_id="tenant-runtime-01",
+    runtime_version="1.0.0",
+)
+result = asyncio.run(
+    kernel.execute(
+        {"question": "Where is my order?"},
+        request_id="request-42",
+    )
+)
+print(result.output)
 
 receipt = build_runtime_receipt(
-    attestation_id=verified_promotion.attestation_id,
-    artifact_digest=verified.artifact_digest,
+    attestation_id=admitted.promotion.attestation_id,
+    artifact_digest=admitted.artifact_digest,
     release_id="release-2026-07-10.1",
     deployment_id="deployment-42",
     target_environment="prod",
@@ -170,35 +185,50 @@ RuntimeReceiptClient(
 ).submit(receipt)
 ```
 
-The verifier ignores the public key embedded in the transport bundle and
-resolves `(issuer, keyId)` from the tenant-controlled trust store. It rejects
-unsigned, tampered, expired, revoked, replayed, wrong-org, wrong-audience,
-wrong-environment, offline-lease-expired, and non-deployable artifacts.
+`available_runtime_capabilities()` advertises only installed and configured
+components. A bundle declaring guardrails or tools is refused unless the host
+supplies a `GuardEvaluator` or tenant `ToolBroker`; the built-in broker denies
+all calls. Tool arguments, request payloads, and structured outputs are checked
+against the schemas inside the verified bundle before crossing their boundary.
+Guard-transformed values are checked again, and server-declared tool guard
+requirements cannot be skipped merely because the bundle has no local guard
+block.
 
-Bundle integrity, promotion authorization, and runtime evidence are separate.
-The promotion verifier requires a purpose-specific signed payload and exact
-artifact/release/deployment/runtime bindings; a bundle signature alone is not
-release authorization. New attestations can include identity-distinct human
-approvals whose canonical scope binds the gate decision, artifact, environment,
-agent, runtime, release, and deployment. The verifier recomputes that scope,
-checks approval validity, and enforces the greater of the signed platform
-minimum and the tenant-local `minimum_approvals`. For review-workflow
-attestations it also verifies the signed request-policy digest, request
-validity window, role-specific quorum, requester/approver separation, and any
-stricter tenant-local `required_approval_roles`. Attestations issued before
-these extensions remain compatible and have a signed minimum of zero.
+The kernel bounds model/tool timeouts, retries, exponential backoff, circuit
+breaking, topology steps, cancellation, and deterministic fallback. It refuses
+model retry or fallback after a tool call and rejects duplicate tool-call IDs.
+The initial kernel accepts only `single-react` bundles; other signed topology
+patterns fail admission until their execution contracts exist. It emits
+identity-only decision evidence by default, not raw prompts or tool payloads.
+Every event carries the verified bundle, attestation, policy decision, release,
+deployment, runtime, environment, manifest, solution, and agent identities.
+
+The verifier ignores the public key embedded in the transport bundle and
+resolves `(issuer, keyId)` from the tenant-controlled trust store. Combined
+admission rejects unsigned, tampered, expired, revoked, replayed, wrong-org,
+wrong-audience, wrong-environment, offline-lease-expired, non-deployable,
+non-promoted, contract-downgraded, or unsupported-capability artifacts. The two
+JTIs are reserved together only after every check passes.
+
+Bundle integrity, promotion authorization, and runtime evidence remain
+separate. The platform stays outside the synchronous request path; the model
+gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
+and emergency stop are tenant-owned. The shipped increment does not yet include
+a production MCP transport adapter, durable HITL task workflow, memory,
+compression, A2A, or the Phase 3 reference host.
+
+The human-review protocol receives request or tool context only inside the
+tenant process. The default evidence adapter never copies that payload into
+telemetry.
 
 Receipt submission requires an API key carrying the platform's explicit
 `runtime:write` scope and is safe to retry with the same `receiptId` and
-semantic payload.
+semantic payload. A receipt is an authenticated runtime assertion, not an
+independent proof of cluster state.
 
-A receipt is an API-key-authenticated assertion from the tenant runtime, not an
-independent workload signature or proof of cluster state. Provision a narrow,
-expiring key per runtime trust boundary.
-
-This remains an admission and evidence kit, not an agent executor. Importing
-`prometa.runtime` does not add dependencies to `import prometa` or change
-telemetry behavior; only cryptographic verification needs the `runtime` extra.
+Importing `prometa.runtime` does not add dependencies to `import prometa` or
+change telemetry behavior. Cryptographic and JSON Schema enforcement are
+installed only through the `runtime` extra.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

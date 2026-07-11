@@ -1,8 +1,9 @@
-"""Optional tenant-runtime contracts.
+"""Optional tenant-owned runtime contracts and secure execution kernel.
 
-Install ``prometa-sdk[runtime]`` for cryptographic artifact verification. The
-receipt builder/client remain standard-library-only, and the default
-``prometa-sdk`` installation remains dependency-free and telemetry-first.
+Install ``prometa-sdk[runtime]`` for cryptographic admission, JSON Schema
+enforcement, and the Phase 2A kernel. The default ``prometa-sdk`` installation
+remains dependency-free and telemetry-first, and no execution path calls the
+Orchestra control plane synchronously.
 """
 
 from .trust import (
@@ -20,6 +21,58 @@ from .receipts import (
     RuntimeReceiptSubmissionError,
     build_runtime_receipt,
 )
+from .admission import (
+    RUNTIME_CONTRACT_VERSION,
+    CAPABILITY_MODEL_INVOKE,
+    CAPABILITY_EVIDENCE_EMIT,
+    CAPABILITY_SCHEMA_VALIDATE,
+    CAPABILITY_GUARD_EVALUATE,
+    CAPABILITY_TOOL_BROKER,
+    CAPABILITY_HUMAN_ESCALATION,
+    BASE_RUNTIME_CAPABILITIES,
+    KNOWN_RUNTIME_CAPABILITIES,
+    RuntimeManifest,
+    RuntimeModel,
+    RuntimeTool,
+    RuntimeGuardrail,
+    RuntimeContract,
+    RuntimeBundleConfig,
+    RuntimeAdmissionPolicy,
+    AdmittedRuntimeRelease,
+    AdmissionReplayStore,
+    InMemoryAdmissionReplayStore,
+    parse_runtime_bundle,
+    admit_runtime_release,
+)
+from .kernel import (
+    RuntimeExecutionError,
+    ModelAdapterError,
+    RuntimeEvidenceEvent,
+    EvidenceEmitter,
+    InMemoryEvidenceEmitter,
+    PrometaEvidenceEmitter,
+    ModelToolCall,
+    ModelInvocationRequest,
+    ModelInvocationResponse,
+    ModelAdapter,
+    GuardRequest,
+    GuardDecision,
+    GuardEvaluator,
+    HumanEscalationRequest,
+    HumanEscalationDecision,
+    HumanEscalation,
+    ToolInvocationRequest,
+    ToolInvocationResult,
+    ToolBroker,
+    DenyAllToolBroker,
+    RuntimeStateStore,
+    InMemoryRuntimeStateStore,
+    RuntimeExecutionPolicy,
+    RuntimeExecutionResult,
+    available_runtime_capabilities,
+    RuntimeKernel,
+)
+from .model_gateway import OpenAICompatibleModelAdapter
 
 __all__ = [
     "BundleTrustEntry",
@@ -33,4 +86,52 @@ __all__ = [
     "RuntimeReceiptError",
     "RuntimeReceiptSubmissionError",
     "build_runtime_receipt",
+    "RUNTIME_CONTRACT_VERSION",
+    "CAPABILITY_MODEL_INVOKE",
+    "CAPABILITY_EVIDENCE_EMIT",
+    "CAPABILITY_SCHEMA_VALIDATE",
+    "CAPABILITY_GUARD_EVALUATE",
+    "CAPABILITY_TOOL_BROKER",
+    "CAPABILITY_HUMAN_ESCALATION",
+    "BASE_RUNTIME_CAPABILITIES",
+    "KNOWN_RUNTIME_CAPABILITIES",
+    "RuntimeManifest",
+    "RuntimeModel",
+    "RuntimeTool",
+    "RuntimeGuardrail",
+    "RuntimeContract",
+    "RuntimeBundleConfig",
+    "RuntimeAdmissionPolicy",
+    "AdmittedRuntimeRelease",
+    "AdmissionReplayStore",
+    "InMemoryAdmissionReplayStore",
+    "parse_runtime_bundle",
+    "admit_runtime_release",
+    "RuntimeExecutionError",
+    "ModelAdapterError",
+    "RuntimeEvidenceEvent",
+    "EvidenceEmitter",
+    "InMemoryEvidenceEmitter",
+    "PrometaEvidenceEmitter",
+    "ModelToolCall",
+    "ModelInvocationRequest",
+    "ModelInvocationResponse",
+    "ModelAdapter",
+    "GuardRequest",
+    "GuardDecision",
+    "GuardEvaluator",
+    "HumanEscalationRequest",
+    "HumanEscalationDecision",
+    "HumanEscalation",
+    "ToolInvocationRequest",
+    "ToolInvocationResult",
+    "ToolBroker",
+    "DenyAllToolBroker",
+    "RuntimeStateStore",
+    "InMemoryRuntimeStateStore",
+    "RuntimeExecutionPolicy",
+    "RuntimeExecutionResult",
+    "available_runtime_capabilities",
+    "RuntimeKernel",
+    "OpenAICompatibleModelAdapter",
 ]

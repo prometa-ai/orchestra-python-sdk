@@ -50,13 +50,11 @@ jobs:
       - name: Ruff
         run: >-
           ruff check prometa/runtime
-          tests/test_runtime_trust.py
+          tests/test_runtime_*.py
           tests/test_promotion_attestation.py
-          tests/test_runtime_receipts.py
 
       - name: Runtime trust conformance
         run: >-
           pytest -q
-          tests/test_runtime_trust.py
+          tests/test_runtime_*.py
           tests/test_promotion_attestation.py
-          tests/test_runtime_receipts.py

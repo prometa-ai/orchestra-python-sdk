@@ -7,6 +7,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-11
+
+### Added
+
+- Phase 2A runtime-contract admission that verifies a bundle and independent
+  promotion attestation together, cross-checks manifest/agent identity,
+  negotiates versioned capabilities, and atomically reserves both replay IDs.
+- Strict typed runtime configuration for models, topology, guardrails, tools,
+  request/output schemas, and the additive Builder `runtimeContract` v1.
+- A tenant-owned execution kernel with JSON Schema validation, guard/HITL/tool
+  protocols, deny-by-default tool brokering, bounded retries and timeouts,
+  deterministic model fallback, circuit breaking, cancellation, and state hooks.
+- Fail-closed revalidation after guard transformations, enforcement of
+  server-declared tool guard requirements, duplicate tool-call rejection, and
+  denial of model retry/fallback after a tool call.
+- Explicit rejection of unsupported non-`single-react` topologies and ambiguous
+  model, tool, or guard identifiers instead of silently choosing semantics.
+- Fail-before-model `human.escalation.v1` negotiation whenever signed tool or
+  guard policy can require tenant human review.
+- Joinable evidence events carrying bundle, attestation, policy, release,
+  deployment, runtime, environment, manifest, solution, and agent identities.
+- A standard-library OpenAI-compatible adapter for tenant model gateways,
+  including structured outputs, tool calls, bounded responses, and normalized
+  retry semantics.
+- A cross-language signed-and-attested runtime-kernel fixture and tenant sample.
+
+### Changed
+
+- The `runtime` extra now includes `jsonschema`; the default telemetry package
+  remains dependency-free and importing `prometa.runtime` remains lazy-safe.
+- Legacy signed bundles remain integrity-verifiable, but execution admission
+  requires `runtimeContract` v1 by default to prevent silent capability drift.
+
 ## [0.14.0] - 2026-07-11
 
 ### Added

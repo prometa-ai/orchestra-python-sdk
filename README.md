@@ -9,11 +9,10 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.15.0 adds the first optional Phase 2A
-tenant-runtime kernel: combined signed-artifact admission, typed runtime
-contracts, schema and guard enforcement, bounded model/tool execution, and
-joinable decision evidence. It adds no dependency or runtime behavior to the
-default observability install.
+and joinable on the platform. Version 0.16.0 advances the optional Phase 2A
+tenant-runtime kernel with a reusable conformance runner and explicitly opted-in
+PostgreSQL replay/state adapters for multi-replica hosts. It adds no dependency
+or runtime behavior to the default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -53,7 +52,7 @@ default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.15.0**. Release history is on
+Current source version: **0.16.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit
@@ -229,6 +228,77 @@ independent proof of cluster state.
 Importing `prometa.runtime` does not add dependencies to `import prometa` or
 change telemetry behavior. Cryptographic and JSON Schema enforcement are
 installed only through the `runtime` extra.
+
+#### Multi-replica durability
+
+Install the database extra only when replicas must share replay and request
+state:
+
+```bash
+pip install "prometa-sdk[runtime-postgres]"
+```
+
+Run the fixed schema installer once with a migration credential, then use a
+lower-privilege runtime credential for request traffic. The DSN must be a
+libpq-compatible PostgreSQL DSN; ORM-only query parameters such as Prisma's
+`?schema=public` are not accepted by psycopg. Migration and runtime DSNs must
+resolve to the same database schema/search path. The serving role needs
+`SELECT, INSERT` on `prometa_runtime_admission_replay` and
+`SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_request_state`; it does not
+need DDL privileges.
+
+```bash
+export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
+prometa-runtime-postgres-init
+```
+
+```python
+import os
+
+from prometa.runtime import (
+    PostgresAdmissionReplayStore,
+    PostgresRuntimeStateStore,
+    install_postgres_runtime_schema,
+)
+
+install_postgres_runtime_schema(os.environ["RUNTIME_MIGRATION_DATABASE_URL"])
+
+replay_store = PostgresAdmissionReplayStore(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+)
+state_store = PostgresRuntimeStateStore(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+    runtime_id="tenant-runtime-01",
+)
+```
+
+Pass `replay_store` to `admit_runtime_release()` and `state_store` to
+`RuntimeKernel`. Replay reservation uses one database transaction with
+tenant-wide unique bundle and promotion identities, so changing replicas or
+runtime IDs cannot make the same authorization reusable. Request state is
+tenant/runtime scoped and versioned, with `load()` and `delete()` available for
+replica handoff and retention. State writes are atomic last-write-wins
+snapshots; they are not an exactly-once request lock or a resumable HITL
+workflow.
+
+#### Runtime conformance
+
+The installed runner validates signed admission, tamper and replay denial,
+schema-before-model ordering, joinable completion evidence, and fail-closed
+evidence behavior:
+
+```bash
+prometa-runtime-conformance --output runtime-conformance-report.json
+```
+
+The command exits nonzero when a check fails. Reports contain fixture identity,
+check outcomes, error codes, model-call counts, and evidence event names; they
+exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
+runtime can implement `RuntimeConformanceDriver` and select a factory with
+`--driver package.module:create_driver`. This is an adapter-level test contract,
+not a hosted runtime API or certification by the Prometa control plane.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

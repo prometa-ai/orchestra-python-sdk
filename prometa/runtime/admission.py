@@ -1,0 +1,632 @@
+"""Combined admission and typed configuration for tenant runtime bundles.
+
+Bundle integrity and promotion authorization remain separate signatures. This
+module verifies both, cross-checks their shared identity, negotiates the
+versioned runtime contract, and reserves both replay identities atomically.
+It performs no network call to the Orchestra control plane.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+from typing import (
+    Any,
+    FrozenSet,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
+from .trust import (
+    BundleTrustStore,
+    BundleVerificationError,
+    VerifiedBundle,
+    VerifiedPromotionAttestation,
+    verify_bundle_envelope,
+    verify_promotion_attestation,
+)
+
+
+RUNTIME_CONTRACT_VERSION = 1
+CAPABILITY_MODEL_INVOKE = "model.invoke.v1"
+CAPABILITY_EVIDENCE_EMIT = "evidence.emit.v1"
+CAPABILITY_SCHEMA_VALIDATE = "schema.validate.v1"
+CAPABILITY_GUARD_EVALUATE = "guard.evaluate.v1"
+CAPABILITY_TOOL_BROKER = "tool.broker.v1"
+CAPABILITY_HUMAN_ESCALATION = "human.escalation.v1"
+BASE_RUNTIME_CAPABILITIES = frozenset(
+    {CAPABILITY_MODEL_INVOKE, CAPABILITY_EVIDENCE_EMIT}
+)
+KNOWN_RUNTIME_CAPABILITIES = frozenset(
+    {
+        CAPABILITY_MODEL_INVOKE,
+        CAPABILITY_EVIDENCE_EMIT,
+        CAPABILITY_SCHEMA_VALIDATE,
+        CAPABILITY_GUARD_EVALUATE,
+        CAPABILITY_TOOL_BROKER,
+        CAPABILITY_HUMAN_ESCALATION,
+    }
+)
+
+
+@dataclass(frozen=True)
+class RuntimeManifest:
+    manifest_id: str
+    name: str
+    version: int
+    agent_id: str
+    solution_name: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeModel:
+    name: str
+    provider: str
+    model_name: str
+    role: str
+    temperature: Optional[float]
+    max_output_tokens: Optional[int]
+    structured_output: bool
+
+
+@dataclass(frozen=True)
+class RuntimeTool:
+    name: str
+    source: str
+    operation: str
+    input_schema: Mapping[str, Any]
+    mcp_server: Optional[str]
+    side_effects: str
+    risk_level: str
+    auth_binding: str
+    scopes: Tuple[str, ...]
+    approval_required: bool
+    required_guardrails: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RuntimeGuardrail:
+    name: str
+    guardrail_type: str
+    on_violation: str
+    applies_to: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    contract_version: int
+    required_capabilities: FrozenSet[str]
+    input_schema: Optional[Mapping[str, Any]]
+    output_schema: Optional[Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class RuntimeBundleConfig:
+    manifest: RuntimeManifest
+    system_prompt: str
+    models: Tuple[RuntimeModel, ...]
+    primary_model: RuntimeModel
+    topology: Mapping[str, Any]
+    tools: Tuple[RuntimeTool, ...]
+    guardrails: Tuple[RuntimeGuardrail, ...]
+    contract: RuntimeContract
+
+    @property
+    def max_iterations(self) -> int:
+        value = self.topology.get("maxIterations", 1)
+        return value if type(value) is int and 1 <= value <= 64 else 1
+
+
+@dataclass(frozen=True)
+class RuntimeAdmissionPolicy:
+    expected_org_id: str
+    expected_environment: str
+    expected_release_id: str
+    expected_deployment_id: str
+    expected_runtime: str
+    supported_capabilities: FrozenSet[str]
+    expected_bundle_audience: str = "prometa-runtime"
+    expected_promotion_audience: str = "prometa-runtime-admission"
+    minimum_approvals: int = 0
+    required_approval_roles: Optional[Mapping[str, int]] = None
+    max_clock_skew_seconds: int = 60
+    enforce_offline_lease: bool = True
+    require_runtime_contract: bool = True
+
+
+@dataclass(frozen=True)
+class AdmittedRuntimeRelease:
+    bundle: VerifiedBundle
+    promotion: VerifiedPromotionAttestation
+    config: RuntimeBundleConfig
+
+    @property
+    def artifact_digest(self) -> str:
+        return self.bundle.artifact_digest
+
+
+class AdmissionReplayStore(Protocol):
+    """Atomic replay reservation boundary for a bundle/attestation pair."""
+
+    def reserve_pair(self, bundle_jti: str, promotion_jti: str) -> bool:
+        """Return true only when both identities were newly reserved."""
+
+
+class InMemoryAdmissionReplayStore:
+    """Thread-safe single-process replay store for tests and small hosts.
+
+    Multi-replica production hosts should implement ``AdmissionReplayStore``
+    with a durable unique transaction in their tenant-owned state store.
+    """
+
+    def __init__(self) -> None:
+        self._bundle_jtis = set()
+        self._promotion_jtis = set()
+        self._lock = threading.Lock()
+
+    def reserve_pair(self, bundle_jti: str, promotion_jti: str) -> bool:
+        with self._lock:
+            if bundle_jti in self._bundle_jtis or promotion_jti in self._promotion_jtis:
+                return False
+            self._bundle_jtis.add(bundle_jti)
+            self._promotion_jtis.add(promotion_jti)
+            return True
+
+
+def _mapping(value: Any, code: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BundleVerificationError(code)
+    return value
+
+
+def _sequence(value: Any, code: str, maximum: int = 128) -> Sequence[Any]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise BundleVerificationError(code)
+    return value
+
+
+def _string(value: Mapping[str, Any], key: str, code: str) -> str:
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise BundleVerificationError(code, "Missing or invalid %s" % key)
+    if candidate != candidate.strip():
+        raise BundleVerificationError(code, "Invalid whitespace in %s" % key)
+    return candidate
+
+
+def _optional_string(value: Mapping[str, Any], key: str, code: str) -> Optional[str]:
+    candidate = value.get(key)
+    if candidate is None:
+        return None
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise BundleVerificationError(code)
+    return candidate
+
+
+def _optional_number(value: Mapping[str, Any], key: str, code: str) -> Optional[float]:
+    candidate = value.get(key)
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise BundleVerificationError(code)
+    numeric = float(candidate)
+    if not 0 <= numeric <= 2:
+        raise BundleVerificationError(code)
+    return numeric
+
+
+def _optional_positive_int(
+    value: Mapping[str, Any], key: str, code: str
+) -> Optional[int]:
+    candidate = value.get(key)
+    if candidate is None:
+        return None
+    if type(candidate) is not int or candidate < 1 or candidate > 1_000_000:
+        raise BundleVerificationError(code)
+    return candidate
+
+
+def _string_tuple(value: Any, code: str, maximum: int = 128) -> Tuple[str, ...]:
+    entries = _sequence(value, code, maximum)
+    if any(not isinstance(entry, str) or not entry for entry in entries):
+        raise BundleVerificationError(code)
+    if len(set(entries)) != len(entries):
+        raise BundleVerificationError(code)
+    return tuple(entries)
+
+
+def _json_copy(value: Mapping[str, Any], code: str) -> Mapping[str, Any]:
+    try:
+        return json.loads(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise BundleVerificationError(code) from exc
+
+
+def _reject_remote_refs(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key == "$ref" and isinstance(child, str) and not child.startswith("#"):
+                raise BundleVerificationError("remote_schema_ref_denied")
+            _reject_remote_refs(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_remote_refs(child)
+
+
+def _validate_json_schema(value: Any, code: str) -> Optional[Mapping[str, Any]]:
+    if value is None:
+        return None
+    schema = _json_copy(_mapping(value, code), code)
+    _reject_remote_refs(schema)
+    try:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+    except ImportError as exc:  # pragma: no cover - core-only smoke owns this path
+        raise BundleVerificationError(
+            "runtime_dependency_missing",
+            "Install prometa-sdk[runtime] to validate runtime schemas",
+        ) from exc
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise BundleVerificationError(code, "Invalid JSON Schema") from exc
+    return schema
+
+
+def _parse_model(value: Any) -> RuntimeModel:
+    model = _mapping(value, "invalid_runtime_model")
+    role = _string(model, "role", "invalid_runtime_model")
+    if role not in {"primary", "router", "embedding"}:
+        raise BundleVerificationError("invalid_runtime_model")
+    structured = model.get("structuredOutput", False)
+    if type(structured) is not bool:
+        raise BundleVerificationError("invalid_runtime_model")
+    return RuntimeModel(
+        name=_string(model, "name", "invalid_runtime_model"),
+        provider=_string(model, "provider", "invalid_runtime_model"),
+        model_name=_string(model, "modelName", "invalid_runtime_model"),
+        role=role,
+        temperature=_optional_number(model, "temperature", "invalid_runtime_model"),
+        max_output_tokens=_optional_positive_int(
+            model, "maxOutputTokens", "invalid_runtime_model"
+        ),
+        structured_output=structured,
+    )
+
+
+def _parse_tool(value: Any) -> RuntimeTool:
+    tool = _mapping(value, "invalid_runtime_tool")
+    schema = _validate_json_schema(tool.get("inputSchema"), "invalid_tool_input_schema")
+    if schema is None:
+        raise BundleVerificationError("tool_input_schema_missing")
+    approval = tool.get("approvalRequired", False)
+    if type(approval) is not bool:
+        raise BundleVerificationError("invalid_runtime_tool")
+    scopes = _string_tuple(tool.get("scopes", []), "invalid_runtime_tool")
+    required_guardrails = _string_tuple(
+        tool.get("requiredGuardrails", []), "invalid_runtime_tool"
+    )
+    source = _string(tool, "source", "invalid_runtime_tool")
+    side_effects = _string(tool, "sideEffects", "invalid_runtime_tool")
+    risk_level = _string(tool, "riskLevel", "invalid_runtime_tool")
+    auth_binding = _string(tool, "authBinding", "invalid_runtime_tool")
+    mcp_server = _optional_string(tool, "mcpServer", "invalid_runtime_tool")
+    if source not in {"mcp", "native", "rest", "graphql"}:
+        raise BundleVerificationError("invalid_runtime_tool")
+    if side_effects not in {"read-only", "write", "destructive"}:
+        raise BundleVerificationError("invalid_runtime_tool")
+    if risk_level not in {"low", "medium", "high", "critical"}:
+        raise BundleVerificationError("invalid_runtime_tool")
+    if auth_binding not in {"none", "api-key", "oauth", "service-account"}:
+        raise BundleVerificationError("invalid_runtime_tool")
+    if (source == "mcp") != (mcp_server is not None):
+        raise BundleVerificationError("invalid_runtime_tool")
+    return RuntimeTool(
+        name=_string(tool, "name", "invalid_runtime_tool"),
+        source=source,
+        operation=_string(tool, "operation", "invalid_runtime_tool"),
+        input_schema=schema,
+        mcp_server=mcp_server,
+        side_effects=side_effects,
+        risk_level=risk_level,
+        auth_binding=auth_binding,
+        scopes=scopes,
+        approval_required=approval,
+        required_guardrails=required_guardrails,
+    )
+
+
+def _parse_guardrail(value: Any) -> RuntimeGuardrail:
+    guardrail = _mapping(value, "invalid_runtime_guardrail")
+    guardrail_type = _string(guardrail, "guardrailType", "invalid_runtime_guardrail")
+    if guardrail_type not in {
+        "input-filter",
+        "output-filter",
+        "pii-dlp",
+        "secret-dlp",
+        "mcp-risk-gate",
+        "content-policy",
+        "eval-gate",
+        "cost-budget",
+        "human-approval",
+    }:
+        raise BundleVerificationError("invalid_runtime_guardrail")
+    on_violation = _string(guardrail, "onViolation", "invalid_runtime_guardrail")
+    if on_violation not in {"block", "redact", "escalate", "log"}:
+        raise BundleVerificationError("invalid_runtime_guardrail")
+    applies_to = _optional_string(guardrail, "appliesTo", "invalid_runtime_guardrail")
+    if applies_to not in {None, "input", "output", "tool-calls", "all"}:
+        raise BundleVerificationError("invalid_runtime_guardrail")
+    return RuntimeGuardrail(
+        name=_string(guardrail, "name", "invalid_runtime_guardrail"),
+        guardrail_type=guardrail_type,
+        on_violation=on_violation,
+        applies_to=applies_to,
+    )
+
+
+def parse_runtime_bundle(
+    bundle: VerifiedBundle,
+    *,
+    supported_capabilities: Iterable[str],
+    require_runtime_contract: bool = True,
+) -> RuntimeBundleConfig:
+    """Parse verified bytes into strict immutable execution configuration."""
+
+    content = _mapping(bundle.content, "invalid_runtime_bundle")
+    manifest_value = _mapping(content.get("manifest"), "invalid_runtime_manifest")
+    agent_id = _string(manifest_value, "agentId", "invalid_runtime_manifest")
+    version = manifest_value.get("version")
+    if type(version) is not int or version < 1:
+        raise BundleVerificationError("invalid_runtime_manifest")
+    manifest = RuntimeManifest(
+        manifest_id=_string(manifest_value, "id", "invalid_runtime_manifest"),
+        name=_string(manifest_value, "name", "invalid_runtime_manifest"),
+        version=version,
+        agent_id=agent_id,
+        solution_name=_optional_string(
+            manifest_value, "solutionName", "invalid_runtime_manifest"
+        ),
+    )
+
+    system_prompt = _string(content, "systemPrompt", "invalid_system_prompt")
+    models = tuple(
+        _parse_model(value)
+        for value in _sequence(content.get("models"), "invalid_runtime_models", 32)
+    )
+    primaries = tuple(model for model in models if model.role == "primary")
+    if len(primaries) != 1:
+        raise BundleVerificationError("invalid_primary_model")
+    if len({model.name for model in models}) != len(models):
+        raise BundleVerificationError("ambiguous_runtime_model")
+    if _parse_model(content.get("primaryModel")) != primaries[0]:
+        raise BundleVerificationError("primary_model_mismatch")
+
+    tools = tuple(
+        _parse_tool(value)
+        for value in _sequence(content.get("tools", []), "invalid_runtime_tools", 128)
+    )
+    guardrails = tuple(
+        _parse_guardrail(value)
+        for value in _sequence(
+            content.get("guardrails", []), "invalid_runtime_guardrails", 128
+        )
+    )
+    tool_identifiers = {}
+    for index, tool in enumerate(tools):
+        for identifier in {tool.name, tool.operation}:
+            owner = tool_identifiers.setdefault(identifier, index)
+            if owner != index:
+                raise BundleVerificationError("ambiguous_runtime_tool")
+    if len({guardrail.name for guardrail in guardrails}) != len(guardrails):
+        raise BundleVerificationError("ambiguous_runtime_guardrail")
+    topology = _json_copy(
+        _mapping(content.get("topology"), "invalid_runtime_topology"),
+        "invalid_runtime_topology",
+    )
+    max_iterations = topology.get("maxIterations", 1)
+    if type(max_iterations) is not int or not 1 <= max_iterations <= 64:
+        raise BundleVerificationError("invalid_runtime_topology")
+    if _string(topology, "pattern", "invalid_runtime_topology") != "single-react":
+        raise BundleVerificationError("unsupported_runtime_topology")
+
+    raw_contract = content.get("runtimeContract")
+    if raw_contract is None:
+        if require_runtime_contract:
+            raise BundleVerificationError("runtime_contract_missing")
+        legacy_required = set(BASE_RUNTIME_CAPABILITIES)
+        if tools:
+            legacy_required.add(CAPABILITY_SCHEMA_VALIDATE)
+            legacy_required.add(CAPABILITY_TOOL_BROKER)
+        if guardrails or any(tool.required_guardrails for tool in tools):
+            legacy_required.add(CAPABILITY_GUARD_EVALUATE)
+        if any(tool.approval_required for tool in tools) or any(
+            guardrail.on_violation == "escalate"
+            or guardrail.guardrail_type == "human-approval"
+            for guardrail in guardrails
+        ):
+            legacy_required.add(CAPABILITY_HUMAN_ESCALATION)
+        contract = RuntimeContract(
+            contract_version=0,
+            required_capabilities=frozenset(legacy_required),
+            input_schema=None,
+            output_schema=None,
+        )
+    else:
+        contract_value = _mapping(raw_contract, "invalid_runtime_contract")
+        if contract_value.get("contractVersion") != RUNTIME_CONTRACT_VERSION:
+            raise BundleVerificationError("unsupported_runtime_contract")
+        requirements = _string_tuple(
+            contract_value.get("requiredCapabilities"),
+            "invalid_runtime_capabilities",
+            64,
+        )
+        required = frozenset(requirements)
+        if not BASE_RUNTIME_CAPABILITIES.issubset(required):
+            raise BundleVerificationError("runtime_capability_downgrade")
+        input_schema = _validate_json_schema(
+            contract_value.get("inputSchema"), "invalid_input_schema"
+        )
+        output_schema = _validate_json_schema(
+            contract_value.get("outputSchema"), "invalid_output_schema"
+        )
+        inferred = set(BASE_RUNTIME_CAPABILITIES)
+        if input_schema is not None or output_schema is not None or tools:
+            inferred.add(CAPABILITY_SCHEMA_VALIDATE)
+        if tools:
+            inferred.add(CAPABILITY_TOOL_BROKER)
+        if guardrails or any(tool.required_guardrails for tool in tools):
+            inferred.add(CAPABILITY_GUARD_EVALUATE)
+        if any(tool.approval_required for tool in tools) or any(
+            guardrail.on_violation == "escalate"
+            or guardrail.guardrail_type == "human-approval"
+            for guardrail in guardrails
+        ):
+            inferred.add(CAPABILITY_HUMAN_ESCALATION)
+        if not inferred.issubset(required):
+            raise BundleVerificationError("runtime_capability_downgrade")
+        contract = RuntimeContract(
+            contract_version=RUNTIME_CONTRACT_VERSION,
+            required_capabilities=required,
+            input_schema=input_schema,
+            output_schema=output_schema,
+        )
+
+    supported = frozenset(supported_capabilities)
+    unknown_supported = supported - KNOWN_RUNTIME_CAPABILITIES
+    if unknown_supported:
+        raise BundleVerificationError("unknown_local_runtime_capability")
+    missing = contract.required_capabilities - supported
+    if missing:
+        raise BundleVerificationError(
+            "unsupported_runtime_capability",
+            "Unsupported runtime capabilities: %s" % ", ".join(sorted(missing)),
+        )
+
+    return RuntimeBundleConfig(
+        manifest=manifest,
+        system_prompt=system_prompt,
+        models=models,
+        primary_model=primaries[0],
+        topology=topology,
+        tools=tools,
+        guardrails=guardrails,
+        contract=contract,
+    )
+
+
+def _cross_check_release_identity(
+    bundle: VerifiedBundle,
+    promotion: VerifiedPromotionAttestation,
+) -> None:
+    manifest = _mapping(bundle.content.get("manifest"), "invalid_runtime_manifest")
+    claims = promotion.claims
+    if claims.get("manifestId") != manifest.get("id"):
+        raise BundleVerificationError("promotion_manifest_mismatch")
+    if claims.get("manifestVersion") != manifest.get("version"):
+        raise BundleVerificationError("promotion_manifest_version_mismatch")
+    if claims.get("agentId") != manifest.get("agentId"):
+        raise BundleVerificationError("promotion_agent_mismatch")
+
+
+def admit_runtime_release(
+    bundle: Mapping[str, Any],
+    promotion_attestation: Mapping[str, Any],
+    *,
+    bundle_trust_store: BundleTrustStore,
+    promotion_trust_store: BundleTrustStore,
+    replay_store: AdmissionReplayStore,
+    policy: RuntimeAdmissionPolicy,
+    now: Optional[datetime] = None,
+    revoked_bundle_key_ids: Iterable[str] = (),
+    revoked_bundle_jtis: Iterable[str] = (),
+    revoked_promotion_key_ids: Iterable[str] = (),
+    revoked_promotion_jtis: Iterable[str] = (),
+    revoked_attestation_ids: Iterable[str] = (),
+) -> AdmittedRuntimeRelease:
+    """Verify, bind, negotiate, and atomically reserve one runtime release."""
+
+    if replay_store is None:
+        raise BundleVerificationError("replay_store_required")
+    verified_bundle = verify_bundle_envelope(
+        bundle,
+        bundle_trust_store,
+        expected_org_id=policy.expected_org_id,
+        expected_audience=policy.expected_bundle_audience,
+        expected_environment=policy.expected_environment,
+        now=now,
+        revoked_key_ids=revoked_bundle_key_ids,
+        revoked_jtis=revoked_bundle_jtis,
+        max_clock_skew_seconds=policy.max_clock_skew_seconds,
+        enforce_offline_lease=policy.enforce_offline_lease,
+    )
+    verified_promotion = verify_promotion_attestation(
+        promotion_attestation,
+        promotion_trust_store,
+        expected_org_id=policy.expected_org_id,
+        expected_audience=policy.expected_promotion_audience,
+        expected_environment=policy.expected_environment,
+        expected_artifact_digest=verified_bundle.artifact_digest,
+        expected_release_id=policy.expected_release_id,
+        expected_deployment_id=policy.expected_deployment_id,
+        expected_runtime=policy.expected_runtime,
+        minimum_approvals=policy.minimum_approvals,
+        required_approval_roles=policy.required_approval_roles,
+        now=now,
+        revoked_key_ids=revoked_promotion_key_ids,
+        revoked_jtis=revoked_promotion_jtis,
+        revoked_attestation_ids=revoked_attestation_ids,
+        max_clock_skew_seconds=policy.max_clock_skew_seconds,
+        enforce_offline_lease=policy.enforce_offline_lease,
+    )
+    _cross_check_release_identity(verified_bundle, verified_promotion)
+    config = parse_runtime_bundle(
+        verified_bundle,
+        supported_capabilities=policy.supported_capabilities,
+        require_runtime_contract=policy.require_runtime_contract,
+    )
+    if not replay_store.reserve_pair(verified_bundle.jti, verified_promotion.jti):
+        raise BundleVerificationError("replayed_runtime_release")
+    return AdmittedRuntimeRelease(
+        bundle=verified_bundle,
+        promotion=verified_promotion,
+        config=config,
+    )
+
+
+__all__ = [
+    "RUNTIME_CONTRACT_VERSION",
+    "CAPABILITY_MODEL_INVOKE",
+    "CAPABILITY_EVIDENCE_EMIT",
+    "CAPABILITY_SCHEMA_VALIDATE",
+    "CAPABILITY_GUARD_EVALUATE",
+    "CAPABILITY_TOOL_BROKER",
+    "CAPABILITY_HUMAN_ESCALATION",
+    "BASE_RUNTIME_CAPABILITIES",
+    "KNOWN_RUNTIME_CAPABILITIES",
+    "RuntimeManifest",
+    "RuntimeModel",
+    "RuntimeTool",
+    "RuntimeGuardrail",
+    "RuntimeContract",
+    "RuntimeBundleConfig",
+    "RuntimeAdmissionPolicy",
+    "AdmittedRuntimeRelease",
+    "AdmissionReplayStore",
+    "InMemoryAdmissionReplayStore",
+    "parse_runtime_bundle",
+    "admit_runtime_release",
+]

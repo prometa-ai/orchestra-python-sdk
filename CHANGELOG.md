@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-11
+
+### Added
+
+- Fail-closed verification of addressable promotion review requests, including
+  the signed request-policy digest, request validity window, exact request ID,
+  role-specific approval quorum, and requester/approver separation of duties.
+- Optional tenant-local `required_approval_roles` policy, merged strictly with
+  the platform-signed role minimums.
+- A TypeScript-generated review-workflow conformance vector covering the full
+  signed request, role, approval, and transport-mirror contract.
+
+### Changed
+
+- The unsigned transport authorization mirror now accepts and verifies the
+  platform's signed `approvalRequirement`, `approvalIds`, and
+  `approvalRequestId` projections instead of rejecting those known fields.
+- Promotion-attestation v1 remains compatible with pre-workflow attestations;
+  richer review evidence is additive and still signed by the purpose-specific
+  promotion key.
+
 ## [0.13.0] - 2026-07-11
 
 ### Added

@@ -440,6 +440,56 @@ def _require_sha256_digest(claims: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _normalize_role_requirements(
+    value: Any, *, code: str = "invalid_approvals"
+) -> Tuple[Tuple[str, int], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > MAX_PROMOTION_APPROVALS:
+        raise BundleVerificationError(code)
+    requirements = []
+    seen = set()
+    total = 0
+    for item in value:
+        if not isinstance(item, dict):
+            raise BundleVerificationError(code)
+        role = _required_string(item, "role", code)
+        minimum = item.get("minimum")
+        normalized = role.strip().lower()
+        if (
+            role != role.strip()
+            or len(role) > 100
+            or not normalized
+            or normalized in seen
+            or type(minimum) is not int
+            or minimum < 1
+            or minimum > MAX_PROMOTION_APPROVALS
+        ):
+            raise BundleVerificationError(code)
+        seen.add(normalized)
+        total += minimum
+        requirements.append((role, minimum))
+    if total > MAX_PROMOTION_APPROVALS:
+        raise BundleVerificationError(code)
+    # Preserve the signed array order when reconstructing the policy snapshot
+    # digest. The platform already emits canonical order, and re-sorting here
+    # would make verification depend on Python and JavaScript locale behavior.
+    return tuple(requirements)
+
+
+def _local_role_requirements(
+    value: Optional[Mapping[str, int]],
+) -> Tuple[Tuple[str, int], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise BundleVerificationError("invalid_required_approval_roles")
+    return _normalize_role_requirements(
+        [{"role": role, "minimum": minimum} for role, minimum in value.items()],
+        code="invalid_required_approval_roles",
+    )
+
+
 def verify_promotion_attestation(
     attestation: Mapping[str, Any],
     trust_store: BundleTrustStore,
@@ -452,6 +502,7 @@ def verify_promotion_attestation(
     expected_deployment_id: str,
     expected_runtime: str,
     minimum_approvals: int = 0,
+    required_approval_roles: Optional[Mapping[str, int]] = None,
     now: Optional[datetime] = None,
     revoked_key_ids: Iterable[str] = (),
     revoked_jtis: Iterable[str] = (),
@@ -487,6 +538,7 @@ def verify_promotion_attestation(
         or minimum_approvals > MAX_PROMOTION_APPROVALS
     ):
         raise BundleVerificationError("invalid_minimum_approvals")
+    local_role_requirements = _local_role_requirements(required_approval_roles)
     if type(max_clock_skew_seconds) is not int or max_clock_skew_seconds < 0:
         raise BundleVerificationError("invalid_clock_skew")
     if type(max_signed_payload_bytes) is not int or max_signed_payload_bytes < 1:
@@ -620,6 +672,10 @@ def verify_promotion_attestation(
     approval_requirement = claims.get("approvalRequirement")
     if approval_requirement is None:
         signed_minimum_approvals = 0
+        signed_policy = "legacy-platform-default-v1"
+        signed_role_requirements: Tuple[Tuple[str, int], ...] = ()
+        separation_of_duties = False
+        review_request_required = False
     else:
         if not isinstance(approval_requirement, dict):
             raise BundleVerificationError("invalid_approvals")
@@ -630,7 +686,71 @@ def verify_promotion_attestation(
             or signed_minimum_approvals > MAX_PROMOTION_APPROVALS
         ):
             raise BundleVerificationError("invalid_approvals")
-        _required_string(approval_requirement, "policy", "invalid_approvals")
+        signed_policy = _required_string(
+            approval_requirement, "policy", "invalid_approvals"
+        )
+        signed_role_requirements = _normalize_role_requirements(
+            approval_requirement.get("roleRequirements")
+        )
+        separation_of_duties = approval_requirement.get(
+            "separationOfDuties", False
+        )
+        review_request_required = approval_requirement.get(
+            "reviewRequestRequired", False
+        )
+        if type(separation_of_duties) is not bool or type(
+            review_request_required
+        ) is not bool:
+            raise BundleVerificationError("invalid_approvals")
+        if sum(item[1] for item in signed_role_requirements) > signed_minimum_approvals:
+            raise BundleVerificationError("invalid_approvals")
+
+    normalized_requirement = {
+        "minimum": signed_minimum_approvals,
+        "policy": signed_policy,
+        "roleRequirements": [
+            {"role": role, "minimum": minimum}
+            for role, minimum in signed_role_requirements
+        ],
+        "separationOfDuties": separation_of_duties,
+        "reviewRequestRequired": review_request_required,
+    }
+
+    approval_request = claims.get("approvalRequest")
+    request_id: Optional[str] = None
+    requester_identity: Optional[str] = None
+    request_requested_at: Optional[datetime] = None
+    request_expires_at: Optional[datetime] = None
+    if approval_request is None:
+        if separation_of_duties or review_request_required:
+            raise BundleVerificationError("approval_request_required")
+    else:
+        if not isinstance(approval_request, dict):
+            raise BundleVerificationError("invalid_approval_request")
+        request_id = _required_string(
+            approval_request, "requestId", "invalid_approval_request"
+        )
+        requester_identity = _required_string(
+            approval_request, "requesterIdentity", "invalid_approval_request"
+        )
+        request_policy_digest = _require_sha256_digest(
+            approval_request, "policyDigest"
+        )
+        request_requested_at = _parse_instant(approval_request, "requestedAt")
+        request_expires_at = _parse_instant(approval_request, "expiresAt")
+        if (
+            not (
+                requester_identity.startswith("user:")
+                or requester_identity.startswith("api-key:")
+            )
+            or requester_identity in {"user:", "api-key:"}
+            or request_policy_digest != _digest_json(normalized_requirement)
+            or request_requested_at < decision_evaluated_at
+            or request_requested_at > issued_at
+            or request_expires_at < expires_at
+            or request_expires_at > decision_valid_until
+        ):
+            raise BundleVerificationError("invalid_approval_request")
 
     approvals = claims.get("approvals")
     if not isinstance(approvals, list) or len(approvals) > MAX_PROMOTION_APPROVALS:
@@ -648,13 +768,14 @@ def verify_promotion_attestation(
     expected_scope_digest = _digest_json(approval_scope)
     approval_ids = set()
     approval_identities = set()
+    approval_role_counts: Dict[str, int] = {}
     for approval in approvals:
         if not isinstance(approval, dict):
             raise BundleVerificationError("invalid_approvals")
         approval_id = _required_string(approval, "approvalId", "invalid_approvals")
         identity = _required_string(approval, "identity", "invalid_approvals")
         method = _required_string(approval, "method", "invalid_approvals")
-        _required_string(approval, "role", "invalid_approvals")
+        role = _required_string(approval, "role", "invalid_approvals")
         scope_digest = _require_sha256_digest(approval, "scopeDigest")
         approved_at = _parse_instant(approval, "approvedAt")
         approval_expires_at = _parse_instant(approval, "expiresAt")
@@ -664,6 +785,14 @@ def verify_promotion_attestation(
             or approval_expires_at <= approved_at
             or approval_expires_at < expires_at
             or approval_expires_at > decision_valid_until
+            or (
+                request_requested_at is not None
+                and approved_at < request_requested_at
+            )
+            or (
+                request_expires_at is not None
+                and approval_expires_at > request_expires_at
+            )
         ):
             raise BundleVerificationError("invalid_approvals")
         if not identity.startswith("user:") or identity == "user:":
@@ -672,14 +801,33 @@ def verify_promotion_attestation(
             raise BundleVerificationError("invalid_approvals")
         if scope_digest != expected_scope_digest:
             raise BundleVerificationError("approval_scope_mismatch")
+        approval_request_id = approval.get("requestId")
+        if request_id is not None:
+            if approval_request_id != request_id:
+                raise BundleVerificationError("approval_request_mismatch")
+        elif approval_request_id is not None:
+            raise BundleVerificationError("approval_request_required")
+        if separation_of_duties and identity == requester_identity:
+            raise BundleVerificationError("requester_approval_forbidden")
         if approval_id in approval_ids or identity in approval_identities:
             raise BundleVerificationError("duplicate_approval_identity")
         approval_ids.add(approval_id)
         approval_identities.add(identity)
+        role_key = role.strip().lower()
+        approval_role_counts[role_key] = approval_role_counts.get(role_key, 0) + 1
 
     required_approvals = max(signed_minimum_approvals, minimum_approvals)
     if len(approval_identities) < required_approvals:
         raise BundleVerificationError("insufficient_approvals")
+    effective_roles: Dict[str, Tuple[str, int]] = {}
+    for role, minimum in signed_role_requirements + local_role_requirements:
+        key = role.lower()
+        existing = effective_roles.get(key)
+        if existing is None or minimum > existing[1]:
+            effective_roles[key] = (role, minimum)
+    for role_key, (_, minimum) in effective_roles.items():
+        if approval_role_counts.get(role_key, 0) < minimum:
+            raise BundleVerificationError("insufficient_role_approvals")
 
     if transport_id in frozenset(revoked_attestation_ids):
         raise BundleVerificationError("revoked_attestation")
@@ -703,6 +851,14 @@ def verify_promotion_attestation(
             "expiresAt": claims.get("expiresAt"),
             "offlineLeaseExpiresAt": claims.get("offlineLeaseExpiresAt"),
         }
+        if "approvalRequirement" in mirror:
+            expected_mirror["approvalRequirement"] = approval_requirement
+        if "approvalIds" in mirror:
+            expected_mirror["approvalIds"] = [
+                approval["approvalId"] for approval in approvals
+            ]
+        if "approvalRequestId" in mirror:
+            expected_mirror["approvalRequestId"] = request_id
         if mirror != expected_mirror:
             raise BundleVerificationError("transport_authorization_mismatch")
 

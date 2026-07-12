@@ -1,0 +1,20 @@
+{{- include "prometa-runtime.validateValues" . }}
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime
+spec:
+  {{- if not (empty .Values.podDisruptionBudget.minAvailable) }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "prometa-runtime.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: runtime
+{{- end }}

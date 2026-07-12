@@ -1,0 +1,12 @@
+The Prometa reference runtime is tenant-plane software. This release does not
+install or move the Orchestra control plane into the synchronous request path.
+
+Service: {{ include "prometa-runtime.fullname" . }}:{{ .Values.service.port }}
+Health:  /healthz
+Ready:   /readyz
+Execute: /v1/runtime/execute
+
+The chart references, but never creates, the runtime config and credential
+objects. NetworkPolicy is fail-closed by default. Verify that your values allow
+only the intended gateway ingress plus PostgreSQL, model, DNS, and telemetry
+egress before promotion.

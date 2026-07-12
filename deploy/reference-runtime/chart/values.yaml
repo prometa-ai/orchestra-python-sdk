@@ -1,0 +1,154 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+revisionHistoryLimit: 5
+
+image:
+  repository: prometa-runtime-host
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+# Compatible with Kubernetes restricted Pod Security and OpenShift-assigned UIDs.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# The chart never creates this object. It must contain one immutable, signed
+# runtime-host config document. Set exactly one source.
+runtimeConfig:
+  existingSecret: ""
+  existingConfigMap: ""
+  key: config.json
+  targetFile: config.json
+
+# The chart never creates this Secret. Use separate runtime and migration
+# database identities in production; modelGatewayApiKeyKey may be absent.
+credentials:
+  existingSecret: ""
+  databaseUrlKey: database-url
+  apiTokenKey: api-token
+  modelGatewayApiKeyKey: model-gateway-api-key
+  modelGatewayApiKeyOptional: true
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+containerPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+probes:
+  startup:
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+gracefulShutdown:
+  terminationGracePeriodSeconds: 45
+  # Allows endpoint removal to propagate before Kubernetes sends SIGTERM.
+  preStopSleepSeconds: 5
+
+# Installs the fixed PostgreSQL schema before install/upgrade. The migration DSN
+# may live in a different Secret from the lower-privilege runtime credentials.
+migration:
+  enabled: true
+  # Pre-install hooks run before this chart can create its runtime account.
+  # Name a pre-provisioned workload identity account here when required.
+  serviceAccountName: default
+  existingSecret: ""
+  databaseUrlKey: migration-database-url
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 300
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  networkPolicy:
+    enabled: true
+    allowDNS: true
+    dnsNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    # Rendering fails until the operator adds an explicit database rule.
+    egress: []
+
+# Enabled and fail-closed by default: no ingress, and rendering requires an
+# explicit destination list. Add only the tenant gateway, PostgreSQL, model
+# gateway, and telemetry destinations the signed runtime actually needs.
+networkPolicy:
+  enabled: true
+  allowDNS: true
+  dnsNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: kube-system
+  ingress: []
+  egress: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: ""
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: ""
+  behavior: {}
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

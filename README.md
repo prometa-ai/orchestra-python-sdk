@@ -215,7 +215,8 @@ gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
 and emergency stop are tenant-owned. The first reference host is model-only and
 tenant-deployed. The shipped increment does not include a production MCP
 transport adapter, durable HITL task workflow, memory, compression, A2A,
-rollout automation, a Helm chart, or production certification.
+rollout automation, topology-specific load/chaos proof, or production
+certification.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -312,8 +313,8 @@ down its persistent kernel event loop gracefully. It does not claim
 cross-replica exactly-once request execution, TLS termination, distributed rate
 limiting, or overload fairness.
 
-The non-root container, Compose example, strict configuration shape, and
-operator commands live in
+The non-root container, Compose example, tenant-owned Helm chart, strict
+configuration shape, and operator commands live in
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
 
 #### Runtime conformance

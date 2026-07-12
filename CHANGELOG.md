@@ -22,6 +22,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A `runtime-host` optional extra, `prometa-runtime-host` entry point, non-root
   multi-stage container, PostgreSQL-first Compose example, and strict mounted
   configuration format with environment-only credentials.
+- A tenant-owned Helm chart with reference-only config/credential inputs,
+  migration-before-serve hooks, workload identity annotations, restricted pod
+  security, probes, resources, optional HPA/PDB, and fail-closed runtime and
+  migration NetworkPolicies.
 - A reference-host conformance driver that exercises execution cases through
   the authenticated host boundary and can run in a fresh container per case.
 
@@ -32,6 +36,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   configured explicitly.
 - API, model, and database credentials are never accepted in the mounted JSON
   document or included in host errors and evidence output.
+- Kubernetes defaults allow no runtime ingress and refuse to render enabled
+  policies until the operator explicitly scopes database/model destinations;
+  migration egress is validated separately.
 
 ## [0.17.0] - 2026-07-12
 

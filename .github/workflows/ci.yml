@@ -122,3 +122,73 @@ jobs:
         with:
           name: runtime-host-conformance
           path: runtime-host-conformance.json
+
+  runtime-host-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint production reference values
+        run: >-
+          helm lint --strict
+          deploy/reference-runtime/chart
+          -f deploy/reference-runtime/chart/values.production.example.yaml
+
+      - name: Verify fail-closed values and render variants
+        run: |
+          set -euo pipefail
+          chart=deploy/reference-runtime/chart
+          example=$chart/values.production.example.yaml
+
+          if helm template missing-inputs "$chart" >/dev/null 2>&1; then
+            echo "chart rendered without external config and credential references" >&2
+            exit 1
+          fi
+
+          if helm template missing-egress "$chart" \
+            --set runtimeConfig.existingSecret=runtime-config \
+            --set credentials.existingSecret=runtime-credentials \
+            >/dev/null 2>&1; then
+            echo "chart rendered enabled policies without explicit egress" >&2
+            exit 1
+          fi
+
+          if helm template reserved-env "$chart" -f "$example" \
+            --set 'extraEnv[0].name=PROMETA_RUNTIME_API_TOKEN' \
+            --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
+            echo "chart allowed a reserved environment override" >&2
+            exit 1
+          fi
+
+          helm template production "$chart" -f "$example" >runtime-chart.yaml
+          test "$(grep -c '^kind: NetworkPolicy$' runtime-chart.yaml)" = "2"
+          grep -q '^kind: HorizontalPodAutoscaler$' runtime-chart.yaml
+          grep -q '^kind: PodDisruptionBudget$' runtime-chart.yaml
+          grep -q 'automountServiceAccountToken: false' runtime-chart.yaml
+          grep -q 'readOnlyRootFilesystem: true' runtime-chart.yaml
+          grep -q 'helm.sh/hook: pre-install,pre-upgrade' runtime-chart.yaml
+          if grep -q '^kind: Secret$' runtime-chart.yaml; then
+            echo "chart must reference, not create, credentials" >&2
+            exit 1
+          fi
+
+          helm template configmap "$chart" \
+            --set runtimeConfig.existingConfigMap=runtime-config \
+            --set credentials.existingSecret=runtime-credentials \
+            --set migration.enabled=false \
+            --set networkPolicy.enabled=false >runtime-chart-configmap.yaml
+          grep -q 'configMap:' runtime-chart-configmap.yaml
+          if grep -q '^kind: Job$' runtime-chart-configmap.yaml; then
+            echo "disabled migration unexpectedly rendered a Job" >&2
+            exit 1
+          fi
+
+      - name: Package tenant runtime chart
+        run: helm package deploy/reference-runtime/chart --destination dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prometa-runtime-chart
+          path: dist/prometa-runtime-*.tgz

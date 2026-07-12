@@ -1,0 +1,66 @@
+{{- include "prometa-runtime.validateValues" . }}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometa-runtime.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: runtime
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.networkPolicy.ingress }}
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+    {{- else }} []
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.allowDNS }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and (not .Values.networkPolicy.allowDNS) (empty .Values.networkPolicy.egress) }} []
+    {{- end }}
+{{- end }}
+{{- if and .Values.migration.enabled .Values.migration.networkPolicy.enabled }}
+---
+# This temporary hook policy exists before the migration Job and is removed
+# after a successful hook. Failed migrations retain it for diagnosis.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}-migrate
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometa-runtime.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    {{- if .Values.migration.networkPolicy.allowDNS }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.migration.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- end }}
+    {{- with .Values.migration.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and (not .Values.migration.networkPolicy.allowDNS) (empty .Values.migration.networkPolicy.egress) }} []
+    {{- end }}
+{{- end }}

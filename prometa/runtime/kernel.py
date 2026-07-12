@@ -39,6 +39,7 @@ from .admission import (
     RuntimeModel,
     RuntimeTool,
 )
+from .tasks import RuntimeTaskClaim
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -464,6 +465,32 @@ class RuntimeKernel:
             raise
         except Exception as exc:
             raise RuntimeExecutionError("evidence_emit_failed") from exc
+
+    def emit_task_claim(self, claim: RuntimeTaskClaim) -> None:
+        """Emit joinable evidence for a durable claim or recovery decision."""
+
+        if (
+            not isinstance(claim, RuntimeTaskClaim)
+            or claim.attempt < 1
+            or claim.sequence < 1
+            or claim.transition not in {"claimed", "retried", "recovered"}
+            or not isinstance(claim.lease_expires_at, datetime)
+            or claim.lease_expires_at.tzinfo is None
+        ):
+            raise ValueError("claim must be a valid RuntimeTaskClaim")
+        self._emit(
+            "runtime.task.claim",
+            claim.transition,
+            claim.request_id,
+            {
+                "prometa.task.attempt": claim.attempt,
+                "prometa.task.sequence": claim.sequence,
+                "prometa.task.lease_expires_at": claim.lease_expires_at
+                .astimezone(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            },
+        )
 
     async def _save_state(self, request_id: str, status: str, **extra: Any) -> None:
         if self.state_store is not None:

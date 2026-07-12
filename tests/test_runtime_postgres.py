@@ -16,9 +16,13 @@ from prometa.runtime import (
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
     PostgresRuntimeStateStore,
+    PostgresRuntimeTaskStore,
     RuntimeReleaseHandoff,
     RuntimePersistenceError,
+    RuntimeTaskClaim,
+    RuntimeTaskError,
     build_runtime_receipt,
+    canonical_payload_digest,
     install_postgres_runtime_schema,
 )
 from prometa.runtime.postgres import main as postgres_init_main
@@ -180,6 +184,26 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
                 }
             )
         )
+
+    tasks = PostgresRuntimeTaskStore(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        runtime_id="runtime-1",
+        connect=_unavailable,
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        tasks.claim(
+            "request-1",
+            input_digest=canonical_payload_digest({"question": "hello"}),
+            artifact_digest="sha256:" + "a" * 64,
+            release_id="release-1",
+            deployment_id="deployment-1",
+            recoverable=True,
+            max_attempts=3,
+            lease_seconds=30,
+        )
+    assert caught.value.code == "task_store_unavailable"
+    assert "password" not in str(caught.value)
 
 
 def test_state_validation_is_finite_and_bounded() -> None:
@@ -480,3 +504,141 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
         assert await second.load("request-shared") is None
 
     asyncio.run(state_scenario())
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_postgres_task_leases_recover_and_replay_ordered_history() -> None:
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    tenant_id = "task-%s" % uuid.uuid4().hex
+    runtime_id = "runtime-task-shared"
+    now = datetime(2026, 7, 12, 9, 0, tzinfo=timezone.utc)
+    input_digest = canonical_payload_digest({"question": "hello"})
+    artifact_digest = "sha256:" + "a" * 64
+
+    def claim(store, request_id="request-shared", **overrides):
+        values = {
+            "input_digest": input_digest,
+            "artifact_digest": artifact_digest,
+            "release_id": "release-task",
+            "deployment_id": "deployment-task",
+            "recoverable": True,
+            "max_attempts": 3,
+            "lease_seconds": 30,
+            "now": now,
+        }
+        values.update(overrides)
+        return store.claim(request_id, **values)
+
+    isolated_tenant = PostgresRuntimeTaskStore(
+        dsn,
+        tenant_id=tenant_id + "-other",
+        runtime_id=runtime_id,
+    )
+    isolated_runtime = PostgresRuntimeTaskStore(
+        dsn,
+        tenant_id=tenant_id,
+        runtime_id=runtime_id + "-other",
+    )
+    assert isolated_tenant.get("request-shared") is None
+    assert isolated_runtime.get("request-shared") is None
+
+    def concurrent_claim(_):
+        store = PostgresRuntimeTaskStore(
+            dsn,
+            tenant_id=tenant_id,
+            runtime_id=runtime_id,
+        )
+        try:
+            return claim(store)
+        except RuntimeTaskError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        outcomes = list(executor.map(concurrent_claim, range(24)))
+    claims = [item for item in outcomes if isinstance(item, RuntimeTaskClaim)]
+    assert len(claims) == 1
+    assert outcomes.count("task_in_progress") == 23
+    first = claims[0]
+
+    store = PostgresRuntimeTaskStore(
+        dsn,
+        tenant_id=tenant_id,
+        runtime_id=runtime_id,
+    )
+    with pytest.raises(RuntimeTaskError) as caught:
+        claim(
+            store,
+            input_digest=canonical_payload_digest({"question": "changed"}),
+        )
+    assert caught.value.code == "task_identity_conflict"
+
+    retry_event = store.fail(
+        first,
+        reason="gateway_unavailable",
+        retryable=True,
+        now=now + timedelta(seconds=1),
+    )
+    assert retry_event.transition == "retry_scheduled"
+    second = claim(store, now=now + timedelta(seconds=2))
+    assert second.transition == "retried"
+    assert second.attempt == 2
+    with pytest.raises(RuntimeTaskError) as caught:
+        store.complete(
+            first,
+            output_digest=canonical_payload_digest({"answer": "stale"}),
+            model_name="golden-model",
+            model_attempts=1,
+            tool_calls=0,
+            used_fallback=False,
+            now=now + timedelta(seconds=3),
+        )
+    assert caught.value.code == "task_lease_lost"
+    completed = store.complete(
+        second,
+        output_digest=canonical_payload_digest({"answer": "done"}),
+        model_name="golden-model",
+        model_attempts=2,
+        tool_calls=0,
+        used_fallback=False,
+        now=now + timedelta(seconds=3),
+    )
+    assert completed.status == "completed"
+    snapshot = store.get("request-shared")
+    assert snapshot is not None
+    assert snapshot.record.status == "completed"
+    assert snapshot.record.attempt == 2
+    assert [event.transition for event in snapshot.events] == [
+        "claimed",
+        "retry_scheduled",
+        "retried",
+        "completed",
+    ]
+    with pytest.raises(RuntimeTaskError) as caught:
+        claim(store)
+    assert caught.value.code == "task_already_completed"
+
+    orphan = claim(
+        store,
+        request_id="request-orphan",
+        lease_seconds=10,
+        now=now,
+    )
+    recovered = claim(
+        store,
+        request_id="request-orphan",
+        lease_seconds=10,
+        now=now + timedelta(seconds=11),
+    )
+    assert recovered.transition == "recovered"
+    assert recovered.attempt == 2
+    assert recovered.claim_token != orphan.claim_token
+    orphan_snapshot = store.get("request-orphan")
+    assert orphan_snapshot is not None
+    assert [event.transition for event in orphan_snapshot.events] == [
+        "claimed",
+        "recovered",
+    ]

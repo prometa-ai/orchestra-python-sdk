@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -27,8 +28,11 @@ from prometa.runtime import (
     BundleTrustStore,
     InMemoryAdmissionReplayStore,
     InMemoryEvidenceEmitter,
+    InMemoryRuntimeTaskStore,
     JsonLineEvidenceEmitter,
+    ModelAdapterError,
     ModelInvocationResponse,
+    PostgresRuntimeTaskStore,
     ReferenceRuntimeHost,
     RuntimeAdmissionPolicy,
     RuntimeEvidenceEvent,
@@ -37,6 +41,7 @@ from prometa.runtime import (
     RuntimeKernel,
     admit_runtime_release,
     build_reference_runtime_host,
+    canonical_payload_digest,
     install_postgres_runtime_schema,
     load_runtime_host_config,
 )
@@ -107,7 +112,7 @@ class SleepingModelAdapter:
         raise AssertionError("cancelled request resumed")
 
 
-def _host(adapter, *, timeout=2.0):
+def _host(adapter, *, timeout=2.0, task_store=None):
     _, admitted = _admitted()
     kernel = RuntimeKernel(
         admitted,
@@ -121,6 +126,8 @@ def _host(adapter, *, timeout=2.0):
         api_token=API_TOKEN,
         request_timeout_seconds=timeout,
         max_request_bytes=1024,
+        task_store=task_store,
+        task_lease_seconds=max(10.0, timeout + 1),
     )
 
 
@@ -254,6 +261,225 @@ def test_reference_host_rejects_parallel_duplicate_request_ids() -> None:
     assert first[0].status == 200
 
 
+def test_reference_hosts_coordinate_durable_tasks_and_replay_status() -> None:
+    store = InMemoryRuntimeTaskStore()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAdapter:
+        async def invoke(self, request):
+            entered.set()
+            await asyncio.to_thread(release.wait)
+            return ModelInvocationResponse(content=_vector()["sampleOutput"])
+
+    first_host = _host(BlockingAdapter(), task_store=store)
+    second_host = _host(
+        RecordingModelAdapter(_vector()["sampleOutput"]), task_store=store
+    )
+    responses = []
+    thread = threading.Thread(
+        target=lambda: responses.append(
+            _execute(
+                first_host,
+                {
+                    "requestId": "request-durable",
+                    "input": _vector()["sampleInput"],
+                },
+            )
+        )
+    )
+    thread.start()
+    assert entered.wait(timeout=1)
+    try:
+        duplicate = _execute(
+            second_host,
+            {
+                "requestId": "request-durable",
+                "input": _vector()["sampleInput"],
+            },
+        )
+        assert duplicate.status == 409
+        assert duplicate.body == {"error": {"code": "task_in_progress"}}
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    try:
+        assert responses[0].status == 200
+        unauthorized = second_host.handle(
+            "GET", "/v1/runtime/tasks/request-durable", {}, b""
+        )
+        assert unauthorized.status == 401
+        status = second_host.handle(
+            "GET",
+            "/v1/runtime/tasks/request-durable",
+            {"authorization": "Bearer %s" % API_TOKEN},
+        )
+        assert status.status == 200
+        assert status.body["taskLifecycleVersion"] == 1
+        assert status.body["status"] == "completed"
+        assert status.body["attempt"] == 1
+        assert status.body["outputDigest"].startswith("sha256:")
+        assert [item["transition"] for item in status.body["lifecycle"]] == [
+            "claimed",
+            "completed",
+        ]
+        assert "input" not in status.body
+        assert "output" not in status.body
+        repeated = _execute(
+            second_host,
+            {
+                "requestId": "request-durable",
+                "input": _vector()["sampleInput"],
+            },
+        )
+        assert repeated.status == 409
+        assert repeated.body == {
+            "error": {"code": "task_already_completed"}
+        }
+        changed = _execute(
+            second_host,
+            {
+                "requestId": "request-durable",
+                "input": {"question": "changed"},
+            },
+        )
+        assert changed.status == 409
+        assert changed.body == {"error": {"code": "task_identity_conflict"}}
+        missing = second_host.handle(
+            "GET",
+            "/v1/runtime/tasks/missing",
+            {"authorization": "Bearer %s" % API_TOKEN},
+        )
+        assert missing.status == 404
+        claim_events = [
+            event
+            for event in first_host.kernel.evidence_emitter.events
+            if event.name == "runtime.task.claim"
+        ]
+        assert claim_events[0].outcome == "claimed"
+        assert "question" not in repr(claim_events)
+    finally:
+        first_host.close()
+        second_host.close()
+
+
+def test_reference_host_retries_payload_free_task_after_retryable_failure() -> None:
+    store = InMemoryRuntimeTaskStore()
+
+    class RecoveringAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        async def invoke(self, request):
+            self.calls += 1
+            if self.calls <= 2:
+                raise ModelAdapterError("gateway_unavailable", retryable=True)
+            return ModelInvocationResponse(content=_vector()["sampleOutput"])
+
+    adapter = RecoveringAdapter()
+    host = _host(adapter, task_store=store)
+    request = {
+        "requestId": "request-retry",
+        "input": _vector()["sampleInput"],
+    }
+    try:
+        first = _execute(host, request)
+        assert first.status == 503
+        assert first.body == {"error": {"code": "gateway_unavailable"}}
+        retryable = store.get("request-retry")
+        assert retryable is not None
+        assert retryable.record.status == "retryable"
+
+        second = _execute(host, request)
+        assert second.status == 200
+        completed = store.get("request-retry")
+        assert completed is not None
+        assert completed.record.attempt == 2
+        assert [event.transition for event in completed.events] == [
+            "claimed",
+            "retry_scheduled",
+            "retried",
+            "completed",
+        ]
+    finally:
+        host.close()
+
+
+def test_reference_host_reclaims_an_expired_model_only_attempt() -> None:
+    store = InMemoryRuntimeTaskStore()
+    vector, admitted = _admitted()
+    promotion = admitted.promotion.claims
+    store.claim(
+        "request-orphan",
+        input_digest=canonical_payload_digest(vector["sampleInput"]),
+        artifact_digest=admitted.artifact_digest,
+        release_id=promotion["releaseId"],
+        deployment_id=promotion["deploymentId"],
+        recoverable=True,
+        max_attempts=3,
+        lease_seconds=10,
+        now=datetime.now(timezone.utc) - timedelta(seconds=11),
+    )
+    host = _host(
+        RecordingModelAdapter(vector["sampleOutput"]),
+        task_store=store,
+    )
+    try:
+        response = _execute(
+            host,
+            {"requestId": "request-orphan", "input": vector["sampleInput"]},
+        )
+        assert response.status == 200
+        snapshot = store.get("request-orphan")
+        assert snapshot is not None
+        assert snapshot.record.attempt == 2
+        assert [event.transition for event in snapshot.events] == [
+            "claimed",
+            "recovered",
+            "completed",
+        ]
+        claim_events = [
+            event
+            for event in host.kernel.evidence_emitter.events
+            if event.name == "runtime.task.claim"
+        ]
+        assert claim_events[0].outcome == "recovered"
+    finally:
+        host.close()
+
+
+def test_reference_host_fails_closed_when_task_store_is_unavailable() -> None:
+    def unavailable(dsn):
+        raise OSError("database unavailable at %s" % dsn)
+
+    adapter = RecordingModelAdapter(_vector()["sampleOutput"])
+    store = PostgresRuntimeTaskStore(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        runtime_id="runtime-1",
+        connect=unavailable,
+    )
+    host = _host(adapter, task_store=store)
+    try:
+        response = _execute(
+            host,
+            {"requestId": "request-outage", "input": _vector()["sampleInput"]},
+        )
+        assert response.status == 503
+        assert response.body == {"error": {"code": "task_store_unavailable"}}
+        assert adapter.requests == []
+        status = host.handle(
+            "GET",
+            "/v1/runtime/tasks/request-outage",
+            {"authorization": "Bearer %s" % API_TOKEN},
+        )
+        assert status.status == 503
+        assert "secret" not in repr(status.body)
+        assert "password" not in repr(status.body)
+    finally:
+        host.close()
+
+
 def test_reference_host_shutdown_drains_inflight_and_refuses_new_work() -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -294,7 +520,10 @@ def test_reference_host_shutdown_drains_inflight_and_refuses_new_work() -> None:
 
 def test_reference_host_serves_real_http_and_bounds_content_length() -> None:
     vector = _vector()
-    host = _host(RecordingModelAdapter(vector["sampleOutput"]))
+    host = _host(
+        RecordingModelAdapter(vector["sampleOutput"]),
+        task_store=InMemoryRuntimeTaskStore(),
+    )
     server = _RuntimeHttpServer(("127.0.0.1", 0), host)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -319,6 +548,28 @@ def test_reference_host_serves_real_http_and_bounds_content_length() -> None:
         )
         with urllib.request.urlopen(request, timeout=2) as response:
             assert json.loads(response.read())["output"] == vector["sampleOutput"]
+
+        status_request = urllib.request.Request(
+            base_url + "/v1/runtime/tasks/request-http",
+            headers={"authorization": "Bearer %s" % API_TOKEN},
+        )
+        with urllib.request.urlopen(status_request, timeout=2) as response:
+            task_status = json.loads(response.read())
+            assert task_status["taskLifecycleVersion"] == 1
+            assert task_status["status"] == "completed"
+            assert response.headers["cache-control"] == "no-store"
+
+        duplicate_auth = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=2
+        )
+        duplicate_auth.putrequest("GET", "/v1/runtime/tasks/request-http")
+        duplicate_auth.putheader("authorization", "Bearer %s" % API_TOKEN)
+        duplicate_auth.putheader("authorization", "Bearer %s" % API_TOKEN)
+        duplicate_auth.endheaders()
+        duplicate_response = duplicate_auth.getresponse()
+        assert duplicate_response.status == 401
+        duplicate_response.read()
+        duplicate_auth.close()
 
         oversized = urllib.request.Request(
             base_url + "/v1/runtime/execute",
@@ -414,6 +665,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert config.api_token_env == "PROMETA_RUNTIME_API_TOKEN"
     assert config.receipt_base_url is None
     assert config.control_plane_base_url is None
+    assert config.task_recovery_enabled is False
 
     invalid = _config_document()
     invalid["unknown"] = True
@@ -472,6 +724,25 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     )
     assert pull_config.control_plane_max_cache_age_seconds == 600
     assert pull_config.control_plane_max_clock_skew_seconds == 120
+
+    durable = _config_document()
+    durable["taskRecovery"] = {
+        "leaseSeconds": 90,
+        "maxAttempts": 4,
+        "historyLimit": 25,
+    }
+    path.write_text(json.dumps(durable), encoding="utf-8")
+    durable_config = load_runtime_host_config(path)
+    assert durable_config.task_recovery_enabled is True
+    assert durable_config.task_recovery_lease_seconds == 90
+    assert durable_config.task_recovery_max_attempts == 4
+    assert durable_config.task_recovery_history_limit == 25
+
+    durable["taskRecovery"]["leaseSeconds"] = 60
+    path.write_text(json.dumps(durable), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "task_recovery_lease_too_short"
 
     invalid_source = _config_document()
     invalid_source["controlPlanePull"] = pulled["controlPlanePull"]
@@ -643,6 +914,10 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
         receipt_lease_seconds=5,
         receipt_initial_backoff_seconds=0.01,
         receipt_max_backoff_seconds=0.1,
+        task_recovery_enabled=True,
+        task_recovery_lease_seconds=10,
+        task_recovery_max_attempts=3,
+        task_recovery_history_limit=20,
     )
     environment = {
         "RUNTIME_DSN": dsn,
@@ -677,6 +952,14 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             {"requestId": "request-first", "input": vector["sampleInput"]},
         )
         assert first_response.status == 200
+        first_status = first.handle(
+            "GET",
+            "/v1/runtime/tasks/request-first",
+            {"authorization": "Bearer %s" % API_TOKEN},
+        )
+        assert first_status.status == 200
+        assert first_status.body["status"] == "completed"
+        assert first_status.body["historyTruncated"] is False
         release_receipts.set()
         deadline = time.monotonic() + 3
         while len(received_receipts) < 2 and time.monotonic() < deadline:
@@ -699,6 +982,14 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             {"requestId": "request-second", "input": vector["sampleInput"]},
         )
         assert second_response.status == 200
+        duplicate = _execute(
+            second,
+            {"requestId": "request-first", "input": vector["sampleInput"]},
+        )
+        assert duplicate.status == 409
+        assert duplicate.body == {
+            "error": {"code": "task_already_completed"}
+        }
         assert first_response.body["output"] == vector["sampleOutput"]
         time.sleep(0.1)
         assert len(received_receipts) == 2

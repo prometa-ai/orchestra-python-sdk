@@ -45,3 +45,14 @@ def test_runtime_chart_references_external_sensitive_objects():
     assert "automountServiceAccountToken: false" in values
     assert "controlPlaneApiKeyKey: control-plane-api-key" in values
     assert "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" in rendered_sources
+
+
+def test_runtime_examples_enable_bounded_payload_free_task_recovery():
+    for name in ("config.example.json", "config.pull.example.json"):
+        document = (ROOT / "deploy/reference-runtime" / name).read_text(
+            encoding="utf-8"
+        )
+        assert '"taskRecovery"' in document
+        assert '"leaseSeconds": 90' in document
+        assert '"maxAttempts": 3' in document
+        assert '"historyLimit": 50' in document

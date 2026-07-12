@@ -20,6 +20,20 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from .admission import RuntimeActivationResult
 from .control_plane import RuntimeReleaseHandoff
 from .receipts import RuntimeReceiptOutboxItem
+from .tasks import (
+    RuntimeTaskClaim,
+    RuntimeTaskError,
+    RuntimeTaskEvent,
+    RuntimeTaskRecord,
+    RuntimeTaskSnapshot,
+    _TASK_STATUSES,
+    _claim_policy as _task_claim_policy,
+    _digest as _task_digest,
+    _error_code as _task_error_code,
+    _history_limit as _task_history_limit,
+    _identifier as _task_identifier,
+    _instant as _task_instant,
+)
 
 
 _MAX_IDENTIFIER_LENGTH = 128
@@ -142,6 +156,65 @@ CREATE INDEX IF NOT EXISTS prometa_runtime_release_cache_deployment_idx
         tenant_id, deployment_id, verified_at
     );
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_task (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    release_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    recoverable BOOLEAN NOT NULL,
+    max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 20),
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'retryable', 'completed', 'failed', 'blocked')
+    ),
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 20),
+    sequence BIGINT NOT NULL CHECK (sequence >= 1),
+    claim_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    last_error_code TEXT,
+    output_digest TEXT,
+    model_name TEXT,
+    model_attempts INTEGER CHECK (model_attempts IS NULL OR model_attempts >= 1),
+    tool_calls INTEGER CHECK (tool_calls IS NULL OR tool_calls >= 0),
+    used_fallback BOOLEAN,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, runtime_id, request_id),
+    CHECK (
+        (status = 'running' AND claim_token IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
+        OR
+        (status <> 'running' AND claim_token IS NULL
+            AND lease_expires_at IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_task_recovery_idx
+    ON prometa_runtime_task (
+        tenant_id, runtime_id, status, lease_expires_at, updated_at
+    );
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_task_event (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL CHECK (sequence >= 1),
+    transition TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'retryable', 'completed', 'failed', 'blocked')
+    ),
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 20),
+    reason TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, runtime_id, request_id, sequence),
+    FOREIGN KEY (tenant_id, runtime_id, request_id)
+        REFERENCES prometa_runtime_task (tenant_id, runtime_id, request_id)
+        ON DELETE CASCADE
+);
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
@@ -156,6 +229,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (4)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (5)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -284,7 +361,7 @@ def install_postgres_runtime_schema(
     *,
     connect: Optional[Callable[[str], Any]] = None,
 ) -> None:
-    """Install the fixed replay/state schema in a tenant-owned database."""
+    """Install the fixed runtime durability schema in a tenant-owned database."""
 
     if not isinstance(dsn, str) or not dsn.strip():
         raise ValueError("dsn must be a non-empty string")
@@ -856,6 +933,681 @@ class PostgresRuntimeReleaseCache(_PostgresTenantStore):
             raise RuntimePersistenceError("release_cache_record_invalid") from None
 
 
+class PostgresRuntimeTaskStore(_PostgresTenantStore):
+    """Atomic cross-replica task leases and ordered payload-free history."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        tenant_id: str,
+        runtime_id: str,
+        connect: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        super().__init__(dsn, tenant_id=tenant_id, connect=connect)
+        self.runtime_id = _validate_identifier("runtime_id", runtime_id)
+
+    def _insert_event(
+        self,
+        cursor: Any,
+        *,
+        request_id: str,
+        sequence: int,
+        transition: str,
+        status: str,
+        attempt: int,
+        occurred_at: datetime,
+        reason: Optional[str] = None,
+    ) -> None:
+        cursor.execute(
+            """
+            INSERT INTO prometa_runtime_task_event (
+                tenant_id, runtime_id, request_id, sequence,
+                transition, status, attempt, reason, occurred_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                self.tenant_id,
+                self.runtime_id,
+                request_id,
+                sequence,
+                transition,
+                status,
+                attempt,
+                reason,
+                occurred_at,
+            ),
+        )
+
+    @staticmethod
+    def _current_time(
+        cursor: Any, supplied: Optional[datetime]
+    ) -> datetime:
+        if supplied is not None:
+            return supplied
+        cursor.execute("SELECT CURRENT_TIMESTAMP")
+        row = cursor.fetchone()
+        if (
+            row is None
+            or not isinstance(row[0], datetime)
+            or row[0].tzinfo is None
+        ):
+            raise RuntimeTaskError("task_clock_invalid")
+        return row[0].astimezone(timezone.utc)
+
+    def claim(
+        self,
+        request_id: str,
+        *,
+        input_digest: str,
+        artifact_digest: str,
+        release_id: str,
+        deployment_id: str,
+        recoverable: bool,
+        max_attempts: int,
+        lease_seconds: float,
+        now: Optional[datetime] = None,
+    ) -> RuntimeTaskClaim:
+        request = _task_identifier("request_id", request_id)
+        input_value = _task_digest("input_digest", input_digest)
+        artifact = _task_digest("artifact_digest", artifact_digest)
+        release = _task_identifier("release_id", release_id, 200)
+        deployment = _task_identifier("deployment_id", deployment_id, 200)
+        if type(recoverable) is not bool:
+            raise ValueError("recoverable must be a boolean")
+        attempts, lease = _task_claim_policy(max_attempts, lease_seconds)
+        supplied_current = None if now is None else _task_instant(now)
+        token = uuid.uuid4().hex
+        result: Optional[RuntimeTaskClaim] = None
+        post_commit_error: Optional[str] = None
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    current = self._current_time(cursor, supplied_current)
+                    expires = current + timedelta(seconds=lease)
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_task (
+                            tenant_id, runtime_id, request_id, input_digest,
+                            artifact_digest, release_id, deployment_id,
+                            recoverable, max_attempts, status, attempt,
+                            sequence, claim_token, lease_expires_at,
+                            created_at, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            'running', 1, 1, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (tenant_id, runtime_id, request_id)
+                        DO NOTHING
+                        RETURNING request_id
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            request,
+                            input_value,
+                            artifact,
+                            release,
+                            deployment,
+                            recoverable,
+                            attempts,
+                            token,
+                            expires,
+                            current,
+                            current,
+                        ),
+                    )
+                    inserted = cursor.fetchone()
+                    if inserted is not None:
+                        self._insert_event(
+                            cursor,
+                            request_id=request,
+                            sequence=1,
+                            transition="claimed",
+                            status="running",
+                            attempt=1,
+                            occurred_at=current,
+                        )
+                        result = RuntimeTaskClaim(
+                            request_id=request,
+                            claim_token=token,
+                            attempt=1,
+                            sequence=1,
+                            transition="claimed",
+                            lease_expires_at=expires,
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            SELECT input_digest, artifact_digest, release_id,
+                                   deployment_id, recoverable, max_attempts,
+                                   status, attempt, sequence, lease_expires_at
+                            FROM prometa_runtime_task
+                            WHERE tenant_id = %s AND runtime_id = %s
+                              AND request_id = %s
+                            FOR UPDATE
+                            """,
+                            (self.tenant_id, self.runtime_id, request),
+                        )
+                        row = cursor.fetchone()
+                        try:
+                            if row is None:
+                                raise ValueError("missing task")
+                            stored_max_attempts = int(row[5])
+                            stored_identity = (
+                                _task_digest("input_digest", row[0]),
+                                _task_digest("artifact_digest", row[1]),
+                                _task_identifier("release_id", row[2], 200),
+                                _task_identifier("deployment_id", row[3], 200),
+                                row[4],
+                                stored_max_attempts,
+                            )
+                            status = str(row[6])
+                            attempt = int(row[7])
+                            sequence = int(row[8])
+                            lease_expires_at = row[9]
+                            if (
+                                type(row[4]) is not bool
+                                or not 1 <= stored_max_attempts <= 20
+                                or status not in _TASK_STATUSES
+                                or not 1 <= attempt <= 20
+                                or not 1 <= sequence
+                                or (status == "running")
+                                != isinstance(lease_expires_at, datetime)
+                                or (
+                                    isinstance(lease_expires_at, datetime)
+                                    and lease_expires_at.tzinfo is None
+                                )
+                            ):
+                                raise ValueError("invalid task")
+                        except (IndexError, TypeError, ValueError):
+                            raise RuntimeTaskError("task_record_invalid") from None
+                        expected_identity = (
+                            input_value,
+                            artifact,
+                            release,
+                            deployment,
+                            recoverable,
+                            attempts,
+                        )
+                        if stored_identity != expected_identity:
+                            raise RuntimeTaskError("task_identity_conflict")
+                        if (
+                            status == "running"
+                            and lease_expires_at.astimezone(timezone.utc) > current
+                        ):
+                            raise RuntimeTaskError("task_in_progress")
+                        terminal_errors = {
+                            "completed": "task_already_completed",
+                            "failed": "task_terminal",
+                            "blocked": "task_recovery_blocked",
+                        }
+                        if status in terminal_errors:
+                            raise RuntimeTaskError(terminal_errors[status])
+                        if status not in {"running", "retryable"}:
+                            raise RuntimeTaskError("task_record_invalid")
+                        next_sequence = sequence + 1
+                        if not recoverable:
+                            next_status = "blocked"
+                            transition = "recovery_blocked"
+                            reason = "task_recovery_blocked"
+                            post_commit_error = reason
+                        elif attempt >= attempts:
+                            next_status = "failed"
+                            transition = "attempts_exhausted"
+                            reason = "task_attempts_exhausted"
+                            post_commit_error = reason
+                        else:
+                            next_status = "running"
+                            transition = (
+                                "recovered" if status == "running" else "retried"
+                            )
+                            reason = None
+                        if post_commit_error is not None:
+                            cursor.execute(
+                                """
+                                UPDATE prometa_runtime_task
+                                SET status = %s, sequence = %s,
+                                    claim_token = NULL,
+                                    lease_expires_at = NULL,
+                                    last_error_code = %s,
+                                    updated_at = %s,
+                                    completed_at = %s
+                                WHERE tenant_id = %s AND runtime_id = %s
+                                  AND request_id = %s
+                                """,
+                                (
+                                    next_status,
+                                    next_sequence,
+                                    reason,
+                                    current,
+                                    current if next_status == "failed" else None,
+                                    self.tenant_id,
+                                    self.runtime_id,
+                                    request,
+                                ),
+                            )
+                            self._insert_event(
+                                cursor,
+                                request_id=request,
+                                sequence=next_sequence,
+                                transition=transition,
+                                status=next_status,
+                                attempt=attempt,
+                                occurred_at=current,
+                                reason=reason,
+                            )
+                        else:
+                            next_attempt = attempt + 1
+                            cursor.execute(
+                                """
+                                UPDATE prometa_runtime_task
+                                SET status = 'running', attempt = %s,
+                                    sequence = %s, claim_token = %s,
+                                    lease_expires_at = %s,
+                                    last_error_code = NULL,
+                                    updated_at = %s,
+                                    completed_at = NULL
+                                WHERE tenant_id = %s AND runtime_id = %s
+                                  AND request_id = %s
+                                """,
+                                (
+                                    next_attempt,
+                                    next_sequence,
+                                    token,
+                                    expires,
+                                    current,
+                                    self.tenant_id,
+                                    self.runtime_id,
+                                    request,
+                                ),
+                            )
+                            self._insert_event(
+                                cursor,
+                                request_id=request,
+                                sequence=next_sequence,
+                                transition=transition,
+                                status="running",
+                                attempt=next_attempt,
+                                occurred_at=current,
+                            )
+                            result = RuntimeTaskClaim(
+                                request_id=request,
+                                claim_token=token,
+                                attempt=next_attempt,
+                                sequence=next_sequence,
+                                transition=transition,
+                                lease_expires_at=expires,
+                            )
+            if post_commit_error is not None:
+                raise RuntimeTaskError(post_commit_error)
+            if result is None:
+                raise RuntimeTaskError("task_record_invalid")
+            return result
+        except (RuntimePersistenceError, RuntimeTaskError):
+            raise
+        except Exception:
+            raise RuntimePersistenceError("task_store_unavailable") from None
+
+    def _owned(
+        self,
+        cursor: Any,
+        claim: RuntimeTaskClaim,
+        current: datetime,
+    ) -> tuple[int, int, int, bool]:
+        if not isinstance(claim, RuntimeTaskClaim):
+            raise ValueError("claim must be a RuntimeTaskClaim")
+        request = _task_identifier("request_id", claim.request_id)
+        token = _task_identifier("claim_token", claim.claim_token, 200)
+        cursor.execute(
+            """
+            SELECT status, attempt, max_attempts, recoverable,
+                   claim_token, lease_expires_at, sequence
+            FROM prometa_runtime_task
+            WHERE tenant_id = %s AND runtime_id = %s AND request_id = %s
+            FOR UPDATE
+            """,
+            (self.tenant_id, self.runtime_id, request),
+        )
+        row = cursor.fetchone()
+        try:
+            if row is None:
+                raise ValueError("missing task")
+            status = str(row[0])
+            attempt = int(row[1])
+            max_attempts = int(row[2])
+            recoverable = row[3]
+            stored_token = str(row[4])
+            lease_expires_at = row[5]
+            sequence = int(row[6])
+        except (IndexError, TypeError, ValueError):
+            raise RuntimeTaskError("task_record_invalid") from None
+        if (
+            status != "running"
+            or type(recoverable) is not bool
+            or stored_token != token
+            or attempt != claim.attempt
+            or sequence != claim.sequence
+            or not isinstance(lease_expires_at, datetime)
+            or lease_expires_at.tzinfo is None
+            or lease_expires_at.astimezone(timezone.utc) <= current
+        ):
+            raise RuntimeTaskError("task_lease_lost")
+        return attempt, max_attempts, sequence, recoverable
+
+    def complete(
+        self,
+        claim: RuntimeTaskClaim,
+        *,
+        output_digest: str,
+        model_name: str,
+        model_attempts: int,
+        tool_calls: int,
+        used_fallback: bool,
+        now: Optional[datetime] = None,
+    ) -> RuntimeTaskEvent:
+        output = _task_digest("output_digest", output_digest)
+        model = _task_identifier("model_name", model_name, 256)
+        if type(model_attempts) is not int or model_attempts < 1:
+            raise ValueError("model_attempts must be a positive integer")
+        if type(tool_calls) is not int or tool_calls < 0:
+            raise ValueError("tool_calls must be a non-negative integer")
+        if type(used_fallback) is not bool:
+            raise ValueError("used_fallback must be a boolean")
+        supplied_current = None if now is None else _task_instant(now)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    current = self._current_time(cursor, supplied_current)
+                    attempt, _, sequence, _ = self._owned(cursor, claim, current)
+                    next_sequence = sequence + 1
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_task
+                        SET status = 'completed', sequence = %s,
+                            claim_token = NULL, lease_expires_at = NULL,
+                            output_digest = %s, model_name = %s,
+                            model_attempts = %s, tool_calls = %s,
+                            used_fallback = %s, updated_at = %s,
+                            completed_at = %s
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND request_id = %s
+                        """,
+                        (
+                            next_sequence,
+                            output,
+                            model,
+                            model_attempts,
+                            tool_calls,
+                            used_fallback,
+                            current,
+                            current,
+                            self.tenant_id,
+                            self.runtime_id,
+                            claim.request_id,
+                        ),
+                    )
+                    event = RuntimeTaskEvent(
+                        sequence=next_sequence,
+                        transition="completed",
+                        status="completed",
+                        attempt=attempt,
+                        occurred_at=current,
+                    )
+                    self._insert_event(
+                        cursor,
+                        request_id=claim.request_id,
+                        sequence=event.sequence,
+                        transition=event.transition,
+                        status=event.status,
+                        attempt=event.attempt,
+                        occurred_at=event.occurred_at,
+                    )
+                    return event
+        except (RuntimePersistenceError, RuntimeTaskError):
+            raise
+        except Exception:
+            raise RuntimePersistenceError("task_store_unavailable") from None
+
+    def fail(
+        self,
+        claim: RuntimeTaskClaim,
+        *,
+        reason: str,
+        retryable: bool,
+        now: Optional[datetime] = None,
+    ) -> RuntimeTaskEvent:
+        error = _task_error_code(reason)
+        if type(retryable) is not bool:
+            raise ValueError("retryable must be a boolean")
+        supplied_current = None if now is None else _task_instant(now)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    current = self._current_time(cursor, supplied_current)
+                    attempt, max_attempts, sequence, recoverable = self._owned(
+                        cursor, claim, current
+                    )
+                    can_retry = (
+                        retryable and recoverable and attempt < max_attempts
+                    )
+                    status = "retryable" if can_retry else "failed"
+                    transition = "retry_scheduled" if can_retry else "failed"
+                    next_sequence = sequence + 1
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_task
+                        SET status = %s, sequence = %s,
+                            claim_token = NULL, lease_expires_at = NULL,
+                            last_error_code = %s, updated_at = %s,
+                            completed_at = %s
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND request_id = %s
+                        """,
+                        (
+                            status,
+                            next_sequence,
+                            error,
+                            current,
+                            None if can_retry else current,
+                            self.tenant_id,
+                            self.runtime_id,
+                            claim.request_id,
+                        ),
+                    )
+                    event = RuntimeTaskEvent(
+                        sequence=next_sequence,
+                        transition=transition,
+                        status=status,
+                        attempt=attempt,
+                        occurred_at=current,
+                        reason=error,
+                    )
+                    self._insert_event(
+                        cursor,
+                        request_id=claim.request_id,
+                        sequence=event.sequence,
+                        transition=event.transition,
+                        status=event.status,
+                        attempt=event.attempt,
+                        occurred_at=event.occurred_at,
+                        reason=event.reason,
+                    )
+                    return event
+        except (RuntimePersistenceError, RuntimeTaskError):
+            raise
+        except Exception:
+            raise RuntimePersistenceError("task_store_unavailable") from None
+
+    def get(
+        self, request_id: str, *, history_limit: int = 50
+    ) -> Optional[RuntimeTaskSnapshot]:
+        request = _task_identifier("request_id", request_id)
+        limit = _task_history_limit(history_limit)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT artifact_digest, release_id, deployment_id,
+                               status, attempt, max_attempts, recoverable,
+                               sequence, lease_expires_at, last_error_code,
+                               output_digest, model_name, model_attempts,
+                               tool_calls, used_fallback, created_at,
+                               updated_at, completed_at
+                        FROM prometa_runtime_task
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND request_id = %s
+                        """,
+                        (self.tenant_id, self.runtime_id, request),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return None
+                    cursor.execute(
+                        """
+                        SELECT sequence, transition, status, attempt,
+                               occurred_at, reason
+                        FROM prometa_runtime_task_event
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND request_id = %s
+                        ORDER BY sequence DESC
+                        LIMIT %s
+                        """,
+                        (self.tenant_id, self.runtime_id, request, limit),
+                    )
+                    event_rows = cursor.fetchall()
+        except (RuntimePersistenceError, RuntimeTaskError):
+            raise
+        except Exception:
+            raise RuntimePersistenceError("task_store_unavailable") from None
+        try:
+            status = str(row[3])
+            recoverable = row[6]
+            lease_expires_at = row[8]
+            created_at = row[15]
+            updated_at = row[16]
+            completed_at = row[17]
+            if (
+                status not in _TASK_STATUSES
+                or type(recoverable) is not bool
+                or not isinstance(created_at, datetime)
+                or created_at.tzinfo is None
+                or not isinstance(updated_at, datetime)
+                or updated_at.tzinfo is None
+                or (
+                    lease_expires_at is not None
+                    and (
+                        not isinstance(lease_expires_at, datetime)
+                        or lease_expires_at.tzinfo is None
+                    )
+                )
+                or (status == "running")
+                != isinstance(lease_expires_at, datetime)
+                or (
+                    completed_at is not None
+                    and (
+                        not isinstance(completed_at, datetime)
+                        or completed_at.tzinfo is None
+                    )
+                )
+            ):
+                raise ValueError("invalid timestamps")
+            last_error = (
+                None if row[9] is None else _task_error_code(row[9])
+            )
+            output = None if row[10] is None else _task_digest(
+                "output_digest", row[10]
+            )
+            model = None if row[11] is None else _task_identifier(
+                "model_name", row[11], 256
+            )
+            record = RuntimeTaskRecord(
+                request_id=request,
+                artifact_digest=_task_digest("artifact_digest", row[0]),
+                release_id=_task_identifier("release_id", row[1], 200),
+                deployment_id=_task_identifier("deployment_id", row[2], 200),
+                status=status,
+                attempt=int(row[4]),
+                max_attempts=int(row[5]),
+                recoverable=recoverable,
+                sequence=int(row[7]),
+                lease_expires_at=lease_expires_at,
+                last_error_code=last_error,
+                output_digest=output,
+                model_name=model,
+                model_attempts=None if row[12] is None else int(row[12]),
+                tool_calls=None if row[13] is None else int(row[13]),
+                used_fallback=row[14],
+                created_at=created_at,
+                updated_at=updated_at,
+                completed_at=completed_at,
+            )
+            if (
+                not 1 <= record.attempt <= 20
+                or not 1 <= record.max_attempts <= 20
+                or record.attempt > record.max_attempts
+                or record.sequence < 1
+                or (
+                    record.used_fallback is not None
+                    and type(record.used_fallback) is not bool
+                )
+                or (record.status == "completed")
+                != (record.output_digest is not None)
+                or (record.status in {"completed", "failed"})
+                != (record.completed_at is not None)
+            ):
+                raise ValueError("invalid task projection")
+            events = []
+            for event_row in reversed(event_rows):
+                occurred_at = event_row[4]
+                reason = (
+                    None
+                    if event_row[5] is None
+                    else _task_error_code(event_row[5])
+                )
+                if (
+                    event_row[2] not in _TASK_STATUSES
+                    or not isinstance(occurred_at, datetime)
+                    or occurred_at.tzinfo is None
+                ):
+                    raise ValueError("invalid task event")
+                events.append(
+                    RuntimeTaskEvent(
+                        sequence=int(event_row[0]),
+                        transition=_task_identifier(
+                            "task_transition", event_row[1], 64
+                        ),
+                        status=event_row[2],
+                        attempt=int(event_row[3]),
+                        occurred_at=occurred_at,
+                        reason=reason,
+                    )
+                )
+        except (IndexError, TypeError, ValueError):
+            raise RuntimePersistenceError("task_record_invalid") from None
+        if (
+            not events
+            or events[-1].sequence != record.sequence
+            or any(
+                event.sequence < 1
+                or event.attempt < 1
+                or event.attempt > record.max_attempts
+                for event in events
+            )
+            or any(
+                later.sequence <= earlier.sequence
+                for earlier, later in zip(events, events[1:])
+            )
+        ):
+            raise RuntimePersistenceError("task_record_invalid")
+        return RuntimeTaskSnapshot(
+            record=record,
+            events=tuple(events),
+            history_truncated=record.sequence > len(events),
+        )
+
+
 class PostgresRuntimeStateStore(_PostgresTenantStore):
     """Shared JSON request-state store for tenant runtime replicas.
 
@@ -1001,6 +1753,7 @@ __all__ = [
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
     "PostgresRuntimeReleaseCache",
+    "PostgresRuntimeTaskStore",
     "PostgresRuntimeStateStore",
     "main",
 ]

@@ -14,11 +14,18 @@ runtime_image=${PROMETA_RUNTIME_TOPOLOGY_IMAGE:-prometa-runtime-host:topology-ce
 cluster=${PROMETA_RUNTIME_TOPOLOGY_CLUSTER:-prometa-runtime-topology}
 report=${PROMETA_RUNTIME_TOPOLOGY_REPORT:-"$root/runtime-topology-certification.json"}
 keep_cluster=${PROMETA_RUNTIME_KEEP_TOPOLOGY_CLUSTER:-false}
+receipt_proof=${PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF:-false}
+platform_container=${PROMETA_RUNTIME_TOPOLOGY_PLATFORM_CONTAINER:-}
+platform_verify_url=${PROMETA_RUNTIME_TOPOLOGY_PLATFORM_VERIFY_URL:-}
+platform_provisioner=${PROMETA_RUNTIME_TOPOLOGY_PLATFORM_PROVISIONER:-}
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/prometa-runtime-topology.XXXXXX")
 assets="$workdir/assets"
 kubeconfig="$workdir/kubeconfig"
 cluster_created=false
+platform_network_connected=false
+fixture_cleanup_required=false
+platform_network=
 
 profile_value() {
   "$python_command" "$fixture" profile-value --profile "$profile" --key "$1"
@@ -45,6 +52,14 @@ cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
     diagnostics
+  fi
+  if [ "$fixture_cleanup_required" = true ]; then
+    "$platform_provisioner" cleanup \
+      --fixture "$assets/platform-receipt-fixture.json" >/dev/null 2>&1 || true
+  fi
+  if [ "$platform_network_connected" = true ]; then
+    docker network disconnect "$platform_network" "$platform_container" \
+      >/dev/null 2>&1 || true
   fi
   if [ "$cluster_created" = true ] && [ "$keep_cluster" != true ]; then
     "$k3d_command" cluster delete "$cluster" >/dev/null 2>&1 || true
@@ -157,6 +172,23 @@ database_scalar() {
     -tAc "$query" | tr -d '[:space:]'
 }
 
+wait_database_scalar() {
+  tenant=$1
+  query=$2
+  expected=$3
+  actual=
+  for _ in {1..45}; do
+    actual=$(database_scalar "$tenant" "$query")
+    if [ "$actual" = "$expected" ]; then
+      printf '%s\n' "$actual"
+      return
+    fi
+    sleep 1
+  done
+  echo "Database observation did not converge for tenant $tenant: expected=$expected actual=$actual" >&2
+  return 2
+}
+
 verify_node_image() {
   node=$1
   image=$2
@@ -175,6 +207,33 @@ verify_node_image() {
 for required in docker "$python_command" "$kubectl_command" "$helm_command" "$k3d_command"; do
   require_command "$required"
 done
+
+case "$receipt_proof" in
+  false) ;;
+  true)
+    if [ -z "$platform_container" ] || [ -z "$platform_verify_url" ] || \
+       [ -z "$platform_provisioner" ]; then
+      echo "Live receipt proof requires platform container, verify URL, and provisioner." >&2
+      exit 2
+    fi
+    require_command "$platform_provisioner"
+    if [ "$(docker inspect -f '{{.State.Running}}' "$platform_container" 2>/dev/null)" != true ]; then
+      echo "Live receipt proof platform container is not running." >&2
+      exit 2
+    fi
+    "$python_command" -c '
+import sys
+from urllib.parse import urlsplit
+value = urlsplit(sys.argv[1])
+if value.scheme not in ("http", "https") or not value.hostname or value.username or value.password or value.path not in ("", "/") or value.query or value.fragment:
+    raise SystemExit("platform verify URL is invalid")
+' "$platform_verify_url"
+    ;;
+  *)
+    echo "PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF must be true or false." >&2
+    exit 2
+    ;;
+esac
 
 if [ "$(profile_value evidenceStatus)" != "reference-profile-not-production-certification" ]; then
   echo "Topology evidence status must remain explicitly non-production." >&2
@@ -221,13 +280,6 @@ docker build --provenance=false --load \
 printf 'FROM %s@%s\n' "$postgres_image" "$postgres_digest" | \
   docker build --provenance=false --load -t "$postgres_node_image" -
 
-"$python_command" "$fixture" prepare \
-  --profile "$profile" \
-  --output-dir "$assets" \
-  --probe-source "$probe_source" \
-  --runtime-image "$runtime_image" \
-  --runtime-version "$runtime_version"
-
 "$k3d_command" cluster create "$cluster" \
   --servers "$server_nodes" \
   --agents "$agent_nodes" \
@@ -241,6 +293,43 @@ printf 'FROM %s@%s\n' "$postgres_image" "$postgres_digest" | \
 cluster_created=true
 "$k3d_command" kubeconfig get "$cluster" >"$kubeconfig"
 chmod 0600 "$kubeconfig"
+
+receipt_prepare_args=()
+if [ "$receipt_proof" = true ]; then
+  platform_network="k3d-$cluster"
+  docker network connect "$platform_network" "$platform_container"
+  platform_network_connected=true
+  platform_ip=$(docker inspect "$platform_container" | "$python_command" -c '
+import json, sys
+network = sys.argv[1]
+document = json.load(sys.stdin)
+try:
+    address = document[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+except (IndexError, KeyError, TypeError):
+    raise SystemExit("platform network address unavailable")
+if not address:
+    raise SystemExit("platform network address unavailable")
+print(address)
+' "$platform_network")
+  receipt_prepare_args+=(
+    --receipt-base-url "http://$platform_ip:3000"
+    --receipt-endpoint-cidr "$platform_ip/32"
+  )
+fi
+
+"$python_command" "$fixture" prepare \
+  --profile "$profile" \
+  --output-dir "$assets" \
+  --probe-source "$probe_source" \
+  --runtime-image "$runtime_image" \
+  --runtime-version "$runtime_version" \
+  "${receipt_prepare_args[@]}"
+
+if [ "$receipt_proof" = true ]; then
+  fixture_cleanup_required=true
+  "$platform_provisioner" setup \
+    --fixture "$assets/platform-receipt-fixture.json"
+fi
 
 "$k3d_command" image import --cluster "$cluster" \
   "$runtime_image" "$postgres_node_image"
@@ -339,6 +428,12 @@ probe runtime-b "$runtime_pod_b" socket \
   --host postgres.data-a.svc.cluster.local --port 5432 --expect denied
 probe runtime-b "$runtime_pod_b" socket \
   --host model-gateway.models-a.svc.cluster.local --port 8000 --expect denied
+if [ "$receipt_proof" = true ]; then
+  probe runtime-a "$runtime_pod_a" socket \
+    --host "$platform_ip" --port 3000 --expect allowed
+  probe runtime-b "$runtime_pod_b" socket \
+    --host "$platform_ip" --port 3000 --expect allowed
+fi
 
 count_before=$(model_count a)
 probe gateway-a probe duplicates --urls "$urls_a" \
@@ -430,6 +525,26 @@ kubernetes_version=$(
     "$python_command" -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"])'
 )
 
+receipt_report_args=()
+if [ "$receipt_proof" = true ]; then
+  "$python_command" "$fixture" verify-platform-receipts \
+    --fixture "$assets/platform-receipt-fixture.json" \
+    --base-url "$platform_verify_url" \
+    --output "$workdir/platform-receipt-proof.json" \
+    --timeout-seconds 90
+  delivered_a=$(wait_database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status = 'delivered';" 2)
+  delivered_b=$(wait_database_scalar b \
+    "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status = 'delivered';" 2)
+  test "$(database_scalar a "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status <> 'delivered';")" -eq 0
+  test "$(database_scalar b "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status <> 'delivered';")" -eq 0
+  receipt_report_args+=(
+    --receipt-proof "$workdir/platform-receipt-proof.json"
+    --receipt-outbox-delivered-a "$delivered_a"
+    --receipt-outbox-delivered-b "$delivered_b"
+  )
+fi
+
 mkdir -p "$(dirname -- "$report")"
 "$python_command" "$fixture" report \
   --profile "$profile" \
@@ -438,6 +553,7 @@ mkdir -p "$(dirname -- "$report")"
   --activation-count-a "$activation_a" \
   --activation-count-b "$activation_b" \
   --node-count-a "$node_count_a" \
-  --node-count-b "$node_count_b"
+  --node-count-b "$node_count_b" \
+  "${receipt_report_args[@]}"
 
 echo "Tenant runtime topology certification passed: $report"

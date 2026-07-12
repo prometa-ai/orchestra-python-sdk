@@ -873,17 +873,38 @@ class PostgresRuntimeReceiptOutbox(_PostgresTenantStore):
                     cursor.execute(
                         """
                         WITH candidate AS (
-                            SELECT receipt_id
-                            FROM prometa_runtime_receipt_outbox
-                            WHERE tenant_id = %s
-                              AND status = 'pending'
-                              AND available_at <= CURRENT_TIMESTAMP
+                            SELECT current_receipt.receipt_id
+                            FROM prometa_runtime_receipt_outbox AS current_receipt
+                            WHERE current_receipt.tenant_id = %s
+                              AND current_receipt.status = 'pending'
+                              AND current_receipt.available_at <= CURRENT_TIMESTAMP
                               AND (
-                                  leased_until IS NULL
-                                  OR leased_until <= CURRENT_TIMESTAMP
+                                  current_receipt.leased_until IS NULL
+                                  OR current_receipt.leased_until
+                                      <= CURRENT_TIMESTAMP
                               )
-                            ORDER BY created_at, sequence, receipt_id
-                            FOR UPDATE SKIP LOCKED
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM prometa_runtime_receipt_outbox AS earlier
+                                  WHERE earlier.tenant_id
+                                      = current_receipt.tenant_id
+                                    AND earlier.status = 'pending'
+                                    AND earlier.payload->>'deploymentId'
+                                      = current_receipt.payload->>'deploymentId'
+                                    AND (
+                                      earlier.sequence,
+                                      earlier.created_at,
+                                      earlier.receipt_id
+                                    ) < (
+                                      current_receipt.sequence,
+                                      current_receipt.created_at,
+                                      current_receipt.receipt_id
+                                    )
+                              )
+                            ORDER BY current_receipt.created_at,
+                                     current_receipt.sequence,
+                                     current_receipt.receipt_id
+                            FOR UPDATE OF current_receipt SKIP LOCKED
                             LIMIT 1
                         )
                         UPDATE prometa_runtime_receipt_outbox AS outbox

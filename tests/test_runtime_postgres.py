@@ -500,9 +500,29 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
     second_outbox = PostgresRuntimeReceiptOutbox(dsn, tenant_id=tenant_id)
     assert first_outbox.enqueue(receipt) is True
     assert second_outbox.enqueue(receipt) is False
+    ordered_receipt = build_runtime_receipt(
+        **{
+            "attestation_id": "attestation-shared",
+            "artifact_digest": activation_values["artifact_digest"],
+            "release_id": activation_values["release_id"],
+            "deployment_id": activation_values["deployment_id"],
+            "target_environment": "prod",
+            "runtime_target": "tenant-runtime",
+            "runtime_id": runtime_id,
+            "runtime_version": "1",
+            "transition": "active",
+            "outcome": "succeeded",
+            "receipt_id": "receipt-ordered-after-admission",
+            "event_at": datetime.now(timezone.utc),
+        }
+    )
+    assert first_outbox.enqueue(ordered_receipt) is True
     first_lease = first_outbox.claim_next(30)
     assert first_lease is not None
+    assert first_lease.receipt_id == "receipt-shared"
     assert first_lease.attempts == 1
+    # A second replica cannot skip the leased admission and deliver the later
+    # active transition out of order for the same deployment.
     assert second_outbox.claim_next(30) is None
     first_outbox.reschedule(
         first_lease,
@@ -517,6 +537,10 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
         first_outbox.mark_delivered(first_lease)
     assert caught.value.code == "receipt_outbox_lease_lost"
     second_outbox.mark_delivered(second_lease)
+    ordered_lease = first_outbox.claim_next(30)
+    assert ordered_lease is not None
+    assert ordered_lease.receipt_id == "receipt-ordered-after-admission"
+    first_outbox.mark_delivered(ordered_lease)
     assert first_outbox.claim_next(30) is None
 
     dead_letter = build_runtime_receipt(

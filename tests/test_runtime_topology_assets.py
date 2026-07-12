@@ -1,0 +1,339 @@
+import importlib.util
+import json
+import stat
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).parent.parent
+DEPLOY = ROOT / "deploy/reference-runtime"
+PROFILE = DEPLOY / "topology-profiles.json"
+FIXTURE_PATH = DEPLOY / "ci/topology_fixture.py"
+PROBE_PATH = DEPLOY / "ci/topology_probe.py"
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile():
+    return json.loads(PROFILE.read_text(encoding="utf-8"))["profiles"][0]
+
+
+def _pod(name: str, ip: str, node: str):
+    return {
+        "metadata": {"name": name},
+        "spec": {"nodeName": node},
+        "status": {
+            "podIP": ip,
+            "conditions": [{"type": "Ready", "status": "True"}],
+        },
+    }
+
+
+def test_topology_profile_is_pinned_and_explicitly_non_production():
+    document = json.loads(PROFILE.read_text(encoding="utf-8"))
+
+    assert document["contractVersion"] == 1
+    assert len(document["profiles"]) == 1
+    assert _profile() == {
+        "name": "k3d-k3s-kube-router-v1",
+        "evidenceStatus": "reference-profile-not-production-certification",
+        "networkPolicyController": "k3s-kube-router",
+        "runtimeVersion": "0.18.0",
+        "chartVersion": "0.3.0",
+        "k3dVersion": "v5.8.3",
+        "k3dChecksums": {
+            "darwin-amd64": (
+                "fd0f8e9e8ea4d8bc3674572ca6ed0833b639bf57c43c708616d937377324cfea"
+            ),
+            "darwin-arm64": (
+                "8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0698"
+            ),
+            "linux-amd64": (
+                "dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e"
+            ),
+            "linux-arm64": (
+                "0b8110f2229631af7402fb828259330985918b08fefd38b7f1b788a1c8687216"
+            ),
+        },
+        "k3sImage": "rancher/k3s:v1.34.8-k3s1",
+        "k3sImageDigest": (
+            "sha256:8f2019c4a443f02fb6aecd4b8e605402535c52be6588ea4b9ee52e1f5851ad72"
+        ),
+        "postgresImage": "postgres:16.13-alpine",
+        "postgresImageDigest": (
+            "sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50"
+        ),
+        "postgresNodeImage": "prometa-topology-postgres:16.13-alpine",
+        "serverNodes": 1,
+        "agentNodes": 1,
+        "tenantCount": 2,
+        "runtimeReplicasPerTenant": 2,
+        "uniqueLoadRequestsPerTenant": 24,
+        "duplicateAttemptsPerTenant": 12,
+    }
+
+
+def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
+    installer = DEPLOY / "ci/install-k3d.sh"
+    harness = DEPLOY / "ci/topology-certification.sh"
+    harness_text = harness.read_text(encoding="utf-8")
+
+    assert installer.stat().st_mode & stat.S_IXUSR
+    assert harness.stat().st_mode & stat.S_IXUSR
+    assert "reference-profile-not-production-certification" in harness_text
+    assert "topology_fixture.py" in harness_text
+    assert "topology_probe.py" in harness_text
+    assert "partition-policy" in harness_text
+    assert "task_store_unavailable" in harness_text
+    assert "prometa_runtime_release_activation" in harness_text
+    assert "controlPlanePull" not in harness_text
+    assert "receiptDelivery" not in harness_text
+
+
+def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
+    pytest.importorskip("cryptography")
+    fixture = _load_module("topology_fixture_prepare", FIXTURE_PATH)
+    output = tmp_path / "fixture"
+
+    fixture.prepare(
+        PROFILE,
+        output,
+        PROBE_PATH,
+        "prometa-runtime-host:topology-test",
+        "0.18.0",
+    )
+
+    config_a = json.loads((output / "tenant-a-config.json").read_text())
+    config_b = json.loads((output / "tenant-b-config.json").read_text())
+    values_a = json.loads((output / "tenant-a-values.json").read_text())
+    resources = json.loads((output / "support-resources.json").read_text())
+
+    assert config_a["tenantId"] == "tenant-topology-a"
+    assert config_b["tenantId"] == "tenant-topology-b"
+    assert config_a["orgId"] != config_b["orgId"]
+    assert config_a["releaseId"] != config_b["releaseId"]
+    assert config_a["deploymentId"] != config_b["deploymentId"]
+    assert config_a["bundle"]["artifactDigest"] != config_b["bundle"]["artifactDigest"]
+    assert config_a["modelGateway"]["baseUrl"].startswith(
+        "http://model-gateway.models-a."
+    )
+    assert "controlPlanePull" not in config_a
+    assert "receiptDelivery" not in config_a
+    assert config_a["taskRecovery"] == {
+        "leaseSeconds": 15,
+        "maxAttempts": 3,
+        "historyLimit": 50,
+    }
+
+    assert values_a["replicaCount"] == 2
+    assert values_a["podDisruptionBudget"] == {
+        "enabled": True,
+        "minAvailable": 1,
+    }
+    assert values_a["topologySpreadConstraints"][0]["whenUnsatisfiable"] == (
+        "DoNotSchedule"
+    )
+    ingress_peer = values_a["networkPolicy"]["ingress"][0]["from"][0]
+    assert ingress_peer["namespaceSelector"]["matchLabels"] == {
+        "kubernetes.io/metadata.name": "gateway-a"
+    }
+    assert ingress_peer["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "tenant-ai-gateway"
+    }
+    egress_namespaces = {
+        peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+        for rule in values_a["networkPolicy"]["egress"]
+        for peer in rule["to"]
+    }
+    assert egress_namespaces == {"data-a", "models-a"}
+
+    namespaces = {
+        item["metadata"]["name"]
+        for item in resources["items"]
+        if item["kind"] == "Namespace"
+    }
+    assert namespaces == {
+        "runtime-a",
+        "gateway-a",
+        "models-a",
+        "data-a",
+        "runtime-b",
+        "gateway-b",
+        "models-b",
+        "data-b",
+    }
+    postgres_images = {
+        item["spec"]["template"]["spec"]["containers"][0]["image"]
+        for item in resources["items"]
+        if item["kind"] == "Deployment" and item["metadata"]["name"] == "postgres"
+    }
+    assert postgres_images == {"prometa-topology-postgres:16.13-alpine"}
+    for name in (
+        "tenant-a-config.json",
+        "tenant-b-config.json",
+        "tenant-a-credentials.env",
+        "tenant-b-credentials.env",
+        "support-resources.json",
+    ):
+        assert stat.S_IMODE((output / name).stat().st_mode) == 0o600
+
+    with pytest.raises(ValueError, match="runtime_version_mismatch"):
+        fixture.prepare(
+            PROFILE,
+            tmp_path / "wrong-version",
+            PROBE_PATH,
+            "prometa-runtime-host:topology-test",
+            "0.19.0",
+        )
+
+
+def test_topology_partition_removes_only_database_egress(tmp_path):
+    fixture = _load_module("topology_fixture_partition", FIXTURE_PATH)
+    source = tmp_path / "policy.json"
+    original = tmp_path / "original.json"
+    partition = tmp_path / "partition.json"
+    source.write_text(
+        json.dumps(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": "runtime",
+                    "namespace": "runtime-a",
+                    "uid": "discarded",
+                    "resourceVersion": "discarded",
+                },
+                "spec": {
+                    "podSelector": {},
+                    "policyTypes": ["Ingress", "Egress"],
+                    "egress": [
+                        {"ports": [{"protocol": "UDP", "port": 53}]},
+                        {"ports": [{"protocol": "TCP", "port": 5432}]},
+                        {"ports": [{"protocol": "TCP", "port": 8000}]},
+                    ],
+                },
+            }
+        )
+    )
+
+    fixture.write_partition_policies(source, original, partition)
+
+    clean = json.loads(original.read_text())
+    denied = json.loads(partition.read_text())
+    assert set(clean["metadata"]) == {"name", "namespace"}
+    assert [rule["ports"][0]["port"] for rule in clean["spec"]["egress"]] == [
+        53,
+        5432,
+        8000,
+    ]
+    assert [rule["ports"][0]["port"] for rule in denied["spec"]["egress"]] == [
+        53,
+        8000,
+    ]
+
+
+def test_topology_inspection_requires_ready_spread_and_replacement(tmp_path):
+    fixture = _load_module("topology_fixture_inspect", FIXTURE_PATH)
+    initial = tmp_path / "initial.json"
+    initial_result = tmp_path / "initial-result.json"
+    replaced = tmp_path / "replaced.json"
+    replaced_result = tmp_path / "replaced-result.json"
+    initial.write_text(
+        json.dumps(
+            {
+                "items": [
+                    _pod("runtime-one", "10.42.0.10", "node-one"),
+                    _pod("runtime-two", "10.42.1.10", "node-two"),
+                ]
+            }
+        )
+    )
+    replaced.write_text(
+        json.dumps(
+            {
+                "items": [
+                    _pod("runtime-three", "10.42.0.11", "node-one"),
+                    _pod("runtime-two", "10.42.1.10", "node-two"),
+                ]
+            }
+        )
+    )
+
+    fixture.inspect_pods(initial, initial_result, 2)
+    fixture.inspect_pods(replaced, replaced_result, 2, initial_result)
+
+    assert json.loads(initial_result.read_text())["nodeCount"] == 2
+    assert json.loads(replaced_result.read_text())["replacementNames"] == [
+        "runtime-three"
+    ]
+
+
+def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
+    fixture = _load_module("topology_fixture_report", FIXTURE_PATH)
+    created = tmp_path / "created.log"
+    joined = tmp_path / "joined.log"
+    log_result = tmp_path / "activations.json"
+    report = tmp_path / "report.json"
+    created.write_text(
+        '{"type":"prometa.runtime.host","status":"ready","activation":"created"}\n'
+    )
+    joined.write_text(
+        '{"type":"prometa.runtime.host","status":"ready","activation":"joined"}\n'
+    )
+
+    fixture.inspect_host_logs([created, joined], log_result, 1, 1)
+    fixture.write_report(PROFILE, report, "v1.34.8+k3s1", 1, 1, 2, 2)
+
+    evidence = json.loads(report.read_text())
+    assert evidence["passed"] is True
+    assert evidence["evidenceStatus"] == (
+        "reference-profile-not-production-certification"
+    )
+    assert evidence["runtimeVersion"] == "0.18.0"
+    assert evidence["chartVersion"] == "0.3.0"
+    assert evidence["duplicateWinnersPerTenant"] == 1
+    assert evidence["activationRowsPerTenant"] == 1
+    assert evidence["synchronousControlPlaneCalls"] == 0
+    assert all(
+        evidence[key] is True
+        for key in (
+            "authorizedIngress",
+            "podLabelIngressIsolation",
+            "crossTenantIngressIsolation",
+            "crossTenantEgressIsolation",
+            "databasePartitionDeniedBeforeModel",
+            "databasePartitionRecovery",
+            "podReplacementJoinedActivation",
+            "taskStatusSurvivedPodReplacement",
+        )
+    )
+    lowered = report.read_text(encoding="utf-8").lower()
+    for forbidden in (
+        '"question"',
+        '"answer"',
+        '"token"',
+        '"password"',
+        '"signedpayload"',
+        '"signature"',
+    ):
+        assert forbidden not in lowered
+
+
+def test_topology_probe_rejects_ambiguous_json_and_invalid_urls():
+    probe = _load_module("topology_probe_contract", PROBE_PATH)
+
+    with pytest.raises(ValueError):
+        probe._strict_json(b'{"duplicate":1,"duplicate":2}')
+    with pytest.raises(probe.ProbeError, match="probe_urls_invalid"):
+        probe._urls("https://runtime.example.test")
+    assert probe._urls("http://10.42.0.1:8080,http://10.42.1.1:8080") == (
+        "http://10.42.0.1:8080",
+        "http://10.42.1.1:8080",
+    )

@@ -218,7 +218,9 @@ and emergency stop are tenant-owned. The first reference host is model-only and
 tenant-deployed. The shipped increment does not include a production MCP
 transport adapter, stored-payload or automatic task replay, resumable HITL
 checkpoints, memory, compression, A2A, rollout automation, topology-specific
-load/chaos proof, or production certification.
+production certification, or managed-CNI/database proof. A pinned two-node
+K3s/kube-router reference profile now supplies narrow multi-tenant isolation,
+load, database-partition, duplicate-claim, and pod-replacement evidence.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -409,7 +411,9 @@ tenant-selected immutable config revisions explicit. The CI drill uses a real
 schema-v2 source baseline, upgrades to schema v5 and bundle B, then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
-published-version or tenant-cluster certification claim.
+published-version certification claim. A separate pinned K3s/kube-router
+profile now proves the chart in one two-node, two-tenant reference topology;
+it does not generalize to OpenShift, managed CNIs/databases, or production.
 
 #### Runtime conformance
 
@@ -489,10 +493,12 @@ check outcomes, error codes, model-call counts, and evidence event names; they
 exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
 runtime can implement `RuntimeConformanceDriver` and select a factory with
 `--driver package.module:create_driver`. This is an adapter-level test contract,
-not certification by the Prometa control plane. A green deployment profile is
-retained evidence; production certification still requires topology-specific
-network/process/database chaos, isolation, load, and recovery proof around the
-reference host.
+not certification by the Prometa control plane. The separate
+`deploy/reference-runtime/ci/topology-certification.sh` profile adds retained
+K3s kube-router evidence for two-tenant isolation, load, a database-egress
+partition, and pod replacement. Production acceptance still requires the same
+proof against the tenant's actual CNI, ingress, database, storage, and recovery
+topology.
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 

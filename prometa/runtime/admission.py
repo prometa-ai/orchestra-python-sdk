@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import (
     Any,
     FrozenSet,
@@ -155,6 +155,7 @@ class RuntimeActivationResult:
     """Durable rollout activation result for a tenant runtime replica."""
 
     created: bool
+    activated_at: Optional[datetime] = None
 
 
 class AdmissionReplayStore(Protocol):
@@ -230,18 +231,22 @@ class InMemoryRuntimeActivationStore:
         with self._lock:
             existing = self._activations.get(activation_key)
             if existing is not None:
-                if existing != identity:
+                existing_identity, activated_at = existing
+                if existing_identity != identity:
                     raise BundleVerificationError("runtime_activation_conflict")
-                return RuntimeActivationResult(created=False)
+                return RuntimeActivationResult(
+                    created=False, activated_at=activated_at
+                )
             known_digest = self._bundle_jtis.get(bundle_jti)
             if known_digest is not None and known_digest != artifact_digest:
                 raise BundleVerificationError("runtime_activation_conflict")
             if promotion_jti in self._promotion_jtis:
                 raise BundleVerificationError("runtime_activation_conflict")
-            self._activations[activation_key] = identity
+            activated_at = datetime.now(timezone.utc)
+            self._activations[activation_key] = (identity, activated_at)
             self._bundle_jtis[bundle_jti] = artifact_digest
             self._promotion_jtis[promotion_jti] = activation_key
-            return RuntimeActivationResult(created=True)
+            return RuntimeActivationResult(created=True, activated_at=activated_at)
 
 
 def _mapping(value: Any, code: str) -> Mapping[str, Any]:

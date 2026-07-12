@@ -20,7 +20,10 @@ from .trust import (
 )
 from .receipts import (
     RuntimeReceiptClient,
+    RuntimeReceiptDispatcher,
     RuntimeReceiptError,
+    RuntimeReceiptOutbox,
+    RuntimeReceiptOutboxItem,
     RuntimeReceiptSubmissionError,
     build_runtime_receipt,
 )
@@ -86,6 +89,7 @@ from .postgres import (
     install_postgres_runtime_schema,
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
+    PostgresRuntimeReceiptOutbox,
     PostgresRuntimeStateStore,
 )
 from .conformance import (
@@ -128,7 +132,10 @@ __all__ = [
     "verify_bundle_envelope",
     "verify_promotion_attestation",
     "RuntimeReceiptClient",
+    "RuntimeReceiptDispatcher",
     "RuntimeReceiptError",
+    "RuntimeReceiptOutbox",
+    "RuntimeReceiptOutboxItem",
     "RuntimeReceiptSubmissionError",
     "build_runtime_receipt",
     "RUNTIME_CONTRACT_VERSION",
@@ -188,6 +195,7 @@ __all__ = [
     "install_postgres_runtime_schema",
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
+    "PostgresRuntimeReceiptOutbox",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
     "CONFORMANCE_COMMAND_PROTOCOL_VERSION",

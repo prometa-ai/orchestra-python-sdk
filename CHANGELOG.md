@@ -26,6 +26,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   migration-before-serve hooks, workload identity annotations, restricted pod
   security, probes, resources, optional HPA/PDB, and fail-closed runtime and
   migration NetworkPolicies.
+- Optional host-managed lifecycle delivery: deterministic `admitted` and
+  `active` receipts, a PostgreSQL outbox with cross-replica leases, asynchronous
+  retry/backoff, permanent-rejection dead letters, and payload-free status
+  evidence without a synchronous control-plane dependency.
 - A reference-host conformance driver that exercises execution cases through
   the authenticated host boundary and can run in a fresh container per case.
 
@@ -39,6 +43,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Kubernetes defaults allow no runtime ingress and refuse to render enabled
   policies until the operator explicitly scopes database/model destinations;
   migration egress is validated separately.
+- Receipt acknowledgements are bounded and identity-checked; secrets and remote
+  error bodies are never persisted in retry or dead-letter metadata.
 
 ## [0.17.0] - 2026-07-12
 

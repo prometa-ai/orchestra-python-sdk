@@ -12,16 +12,30 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .admission import RuntimeActivationResult
+from .receipts import RuntimeReceiptOutboxItem
 
 
 _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
+_MAX_RECEIPT_BYTES = 64 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_RECEIPT_SEQUENCE = {
+    "admitted": 10,
+    "rollout_started": 20,
+    "active": 30,
+    "paused": 40,
+    "rollback_started": 50,
+    "rolled_back": 60,
+    "failed": 70,
+    "stopped": 80,
+}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS prometa_runtime_schema_migrations (
@@ -80,12 +94,39 @@ CREATE TABLE IF NOT EXISTS prometa_runtime_bundle_identity (
 CREATE INDEX IF NOT EXISTS prometa_runtime_release_activation_release_idx
     ON prometa_runtime_release_activation (tenant_id, release_id);
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_receipt_outbox (
+    tenant_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    payload JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    leased_until TIMESTAMPTZ,
+    lease_token TEXT,
+    last_error_code TEXT,
+    delivered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_receipt_outbox_pending_idx
+    ON prometa_runtime_receipt_outbox (
+        tenant_id, status, available_at, created_at, sequence
+    );
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (2)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (3)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -108,16 +149,18 @@ class RuntimeStateRecord:
     updated_at: datetime
 
 
-def _validate_identifier(name: str, value: str) -> str:
+def _validate_identifier(
+    name: str, value: str, max_length: int = _MAX_IDENTIFIER_LENGTH
+) -> str:
     if (
         not isinstance(value, str)
         or not value.strip()
         or value != value.strip()
-        or len(value) > _MAX_IDENTIFIER_LENGTH
+        or len(value) > max_length
     ):
         raise ValueError(
             "%s must be a trimmed string of 1-%d characters"
-            % (name, _MAX_IDENTIFIER_LENGTH)
+            % (name, max_length)
         )
     return value
 
@@ -152,6 +195,30 @@ def _serialize_state(state: Mapping[str, Any]) -> str:
     if len(encoded.encode("utf-8")) > _MAX_STATE_BYTES:
         raise ValueError("state exceeds the 1 MiB limit")
     return encoded
+
+
+def _serialize_receipt(receipt: Mapping[str, Any]) -> tuple[str, str, int]:
+    if not isinstance(receipt, Mapping):
+        raise ValueError("receipt must be a mapping")
+    receipt_id = _validate_identifier(
+        "receipt_id", receipt.get("receiptId"), max_length=200
+    )
+    transition = receipt.get("transition")
+    if not isinstance(transition, str) or transition not in _RECEIPT_SEQUENCE:
+        raise ValueError("receipt transition is unsupported")
+    try:
+        encoded = json.dumps(
+            dict(receipt),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("receipt must be finite JSON data") from exc
+    if len(encoded.encode("utf-8")) > _MAX_RECEIPT_BYTES:
+        raise ValueError("receipt exceeds the 64 KiB limit")
+    return receipt_id, encoded, _RECEIPT_SEQUENCE[transition]
 
 
 def install_postgres_runtime_schema(
@@ -266,7 +333,7 @@ class PostgresRuntimeActivationStore(_PostgresTenantStore):
                             artifact_digest, bundle_jti, promotion_jti
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT DO NOTHING
-                        RETURNING runtime_id
+                        RETURNING activated_at
                         """,
                         (
                             self.tenant_id,
@@ -278,11 +345,15 @@ class PostgresRuntimeActivationStore(_PostgresTenantStore):
                             promotion,
                         ),
                     )
-                    if cursor.fetchone() is not None:
-                        return RuntimeActivationResult(created=True)
+                    inserted = cursor.fetchone()
+                    if inserted is not None:
+                        return RuntimeActivationResult(
+                            created=True, activated_at=inserted[0]
+                        )
                     cursor.execute(
                         """
-                        SELECT release_id, artifact_digest, bundle_jti, promotion_jti
+                        SELECT release_id, artifact_digest, bundle_jti,
+                               promotion_jti, activated_at
                         FROM prometa_runtime_release_activation
                         WHERE tenant_id = %s AND runtime_id = %s AND deployment_id = %s
                         FOR UPDATE
@@ -290,7 +361,7 @@ class PostgresRuntimeActivationStore(_PostgresTenantStore):
                         (self.tenant_id, runtime, deployment),
                     )
                     existing = cursor.fetchone()
-                    if existing is None or tuple(existing) != identity:
+                    if existing is None or tuple(existing[:4]) != identity:
                         raise RuntimePersistenceError("runtime_activation_conflict")
                     cursor.execute(
                         """
@@ -300,11 +371,219 @@ class PostgresRuntimeActivationStore(_PostgresTenantStore):
                         """,
                         (self.tenant_id, runtime, deployment),
                     )
-                    return RuntimeActivationResult(created=False)
+                    return RuntimeActivationResult(
+                        created=False, activated_at=existing[4]
+                    )
         except RuntimePersistenceError:
             raise
         except Exception:
             raise RuntimePersistenceError("activation_store_unavailable") from None
+
+
+class PostgresRuntimeReceiptOutbox(_PostgresTenantStore):
+    """Durable leased receipt queue shared by all runtime replicas."""
+
+    def enqueue(self, receipt: Mapping[str, Any]) -> bool:
+        receipt_id, encoded, sequence = _serialize_receipt(receipt)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_receipt_outbox (
+                            tenant_id, receipt_id, sequence, payload
+                        ) VALUES (%s, %s, %s, %s::jsonb)
+                        ON CONFLICT (tenant_id, receipt_id) DO NOTHING
+                        RETURNING receipt_id
+                        """,
+                        (self.tenant_id, receipt_id, sequence, encoded),
+                    )
+                    return cursor.fetchone() is not None
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("receipt_outbox_unavailable") from None
+
+    def claim_next(self, lease_seconds: float) -> Optional[RuntimeReceiptOutboxItem]:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or lease_seconds <= 0
+            or lease_seconds > 3600
+        ):
+            raise ValueError("lease_seconds must be between 0 and 3600")
+        lease_token = str(uuid.uuid4())
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        WITH candidate AS (
+                            SELECT receipt_id
+                            FROM prometa_runtime_receipt_outbox
+                            WHERE tenant_id = %s
+                              AND status = 'pending'
+                              AND available_at <= CURRENT_TIMESTAMP
+                              AND (
+                                  leased_until IS NULL
+                                  OR leased_until <= CURRENT_TIMESTAMP
+                              )
+                            ORDER BY created_at, sequence, receipt_id
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 1
+                        )
+                        UPDATE prometa_runtime_receipt_outbox AS outbox
+                        SET leased_until = CURRENT_TIMESTAMP
+                                + (%s * INTERVAL '1 second'),
+                            lease_token = %s,
+                            attempts = outbox.attempts + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        FROM candidate
+                        WHERE outbox.tenant_id = %s
+                          AND outbox.receipt_id = candidate.receipt_id
+                        RETURNING outbox.receipt_id, outbox.payload,
+                                  outbox.attempts
+                        """,
+                        (
+                            self.tenant_id,
+                            float(lease_seconds),
+                            lease_token,
+                            self.tenant_id,
+                        ),
+                    )
+                    row = cursor.fetchone()
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("receipt_outbox_unavailable") from None
+        if row is None:
+            return None
+        try:
+            receipt_id = _validate_identifier(
+                "receipt_id", row[0], max_length=200
+            )
+            receipt = row[1]
+            if isinstance(receipt, str):
+                receipt = json.loads(receipt)
+            attempts = int(row[2])
+        except (TypeError, ValueError, json.JSONDecodeError, IndexError):
+            raise RuntimePersistenceError("receipt_outbox_record_invalid") from None
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("receiptId") != receipt_id
+            or attempts < 1
+        ):
+            raise RuntimePersistenceError("receipt_outbox_record_invalid")
+        return RuntimeReceiptOutboxItem(
+            receipt_id=receipt_id,
+            receipt=dict(receipt),
+            attempts=attempts,
+            lease_token=lease_token,
+        )
+
+    @staticmethod
+    def _validate_item(item: RuntimeReceiptOutboxItem) -> tuple[str, str]:
+        if not isinstance(item, RuntimeReceiptOutboxItem):
+            raise ValueError("item must be a RuntimeReceiptOutboxItem")
+        return (
+            _validate_identifier("receipt_id", item.receipt_id, max_length=200),
+            _validate_identifier("lease_token", item.lease_token, max_length=200),
+        )
+
+    @staticmethod
+    def _validate_error_code(error_code: str) -> str:
+        if not isinstance(error_code, str) or _ERROR_CODE.fullmatch(error_code) is None:
+            raise ValueError("error_code must be a bounded machine code")
+        return error_code
+
+    def _complete_lease(
+        self,
+        item: RuntimeReceiptOutboxItem,
+        *,
+        status: str,
+        error_code: Optional[str] = None,
+        delay_seconds: float = 0,
+    ) -> None:
+        receipt_id, lease_token = self._validate_item(item)
+        if status not in {"pending", "delivered", "dead_letter"}:
+            raise ValueError("unsupported receipt outbox status")
+        if error_code is not None:
+            error_code = self._validate_error_code(error_code)
+        if (
+            isinstance(delay_seconds, bool)
+            or not isinstance(delay_seconds, (int, float))
+            or delay_seconds < 0
+            or delay_seconds > 86_400
+        ):
+            raise ValueError("delay_seconds must be between 0 and 86400")
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_receipt_outbox
+                        SET status = %s,
+                            available_at = CASE
+                                WHEN %s = 'pending' THEN CURRENT_TIMESTAMP
+                                    + (%s * INTERVAL '1 second')
+                                ELSE available_at
+                            END,
+                            leased_until = NULL,
+                            lease_token = NULL,
+                            last_error_code = %s,
+                            delivered_at = CASE
+                                WHEN %s = 'delivered' THEN CURRENT_TIMESTAMP
+                                ELSE delivered_at
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s
+                          AND receipt_id = %s
+                          AND status = 'pending'
+                          AND lease_token = %s
+                        """,
+                        (
+                            status,
+                            status,
+                            float(delay_seconds),
+                            error_code,
+                            status,
+                            self.tenant_id,
+                            receipt_id,
+                            lease_token,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimePersistenceError("receipt_outbox_lease_lost")
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("receipt_outbox_unavailable") from None
+
+    def mark_delivered(self, item: RuntimeReceiptOutboxItem) -> None:
+        self._complete_lease(item, status="delivered")
+
+    def reschedule(
+        self,
+        item: RuntimeReceiptOutboxItem,
+        *,
+        delay_seconds: float,
+        error_code: str,
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="pending",
+            delay_seconds=delay_seconds,
+            error_code=error_code,
+        )
+
+    def mark_dead_letter(
+        self, item: RuntimeReceiptOutboxItem, *, error_code: str
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="dead_letter",
+            error_code=error_code,
+        )
 
 
 class PostgresRuntimeStateStore(_PostgresTenantStore):
@@ -450,6 +729,7 @@ __all__ = [
     "install_postgres_runtime_schema",
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
+    "PostgresRuntimeReceiptOutbox",
     "PostgresRuntimeStateStore",
     "main",
 ]

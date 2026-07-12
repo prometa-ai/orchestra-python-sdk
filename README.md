@@ -261,7 +261,17 @@ Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
 prometa-runtime-postgres-init
+prometa-runtime-postgres-verify
 ```
+
+`prometa-runtime-postgres-verify` is a payload-free pre-cutover check for a
+newly restored database. It requires exact migrations through schema v5,
+required task/event columns, valid lease and terminal projections, and complete
+ordered event history. Its JSON output contains only schema versions and table
+counts. Logical backup/restore scripts and the optional encrypted-PVC Helm
+backup CronJob live under
+[`deploy/reference-runtime/`](deploy/reference-runtime/README.md); restore is
+refused unless the target database is fresh and the archive checksum matches.
 
 ```python
 import os
@@ -384,8 +394,8 @@ Model invocation is at-least-once, and a completed task reports conflict rather
 than replaying its response body. Automatic replay, encrypted result retention,
 side-effecting tools, and resumable HITL checkpoints require later contracts.
 
-The non-root container, Compose example, tenant-owned Helm chart, strict
-configuration shape, and operator commands live in
+The non-root container, Compose example, tenant-owned Helm chart, logical
+backup/restore assets, strict configuration shape, and operator commands live in
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
 
 #### Runtime conformance

@@ -81,3 +81,29 @@ migration:
         ports:
           - protocol: TCP
             port: 5432
+
+# The referenced PVC must use tenant-approved encryption, retention, replication,
+# and access controls. The Secret contains dedicated least-privilege backup
+# connection fields, not the runtime DSN.
+backup:
+  enabled: true
+  acknowledgeSensitiveData: true
+  image:
+    repository: registry.example.com/mirrors/postgres
+    tag: 16.13-alpine
+  existingClaim: tenant-runtime-encrypted-backups
+  existingSecret: tenant-runtime-backup-database
+  schedule: "0 2 * * *"
+  retentionDays: 14
+  networkPolicy:
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: tenant-data
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: postgresql
+        ports:
+          - protocol: TCP
+            port: 5432

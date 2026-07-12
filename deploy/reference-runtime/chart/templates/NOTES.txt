@@ -6,8 +6,13 @@ Health:  /healthz
 Ready:   /readyz
 Execute: /v1/runtime/execute
 Tasks:   /v1/runtime/tasks/{requestId} (when taskRecovery is configured)
+{{ if .Values.backup.enabled }}
+Backup:  {{ include "prometa-runtime.fullname" . }}-backup CronJob -> external encrypted PVC
+{{ end }}
 
 The chart references, but never creates, the runtime config and credential
 objects. NetworkPolicy is fail-closed by default. Verify that your values allow
 only the intended gateway ingress plus PostgreSQL, model, DNS, and telemetry
 egress before promotion.
+Run prometa-runtime-postgres-verify against a fresh restored database before
+tenant CI/CD performs a recovery cutover.

@@ -118,6 +118,59 @@ migration:
     # Rendering fails until the operator adds an explicit database rule.
     egress: []
 
+# Optional logical backups to an operator-provisioned encrypted PVC. The chart
+# creates neither backup storage nor credentials. Restore remains an explicit
+# fresh-database operation using deploy/reference-runtime/operations.
+backup:
+  enabled: false
+  acknowledgeSensitiveData: false
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  activeDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  retentionDays: 14
+  filenamePrefix: runtime
+  existingClaim: ""
+  existingSecret: ""
+  hostKey: host
+  portKey: port
+  databaseKey: database
+  usernameKey: username
+  passwordKey: password
+  image:
+    repository: postgres
+    tag: 16-alpine
+    pullPolicy: IfNotPresent
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 70
+    runAsGroup: 70
+    fsGroup: 70
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  networkPolicy:
+    enabled: true
+    allowDNS: true
+    dnsNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    # Rendering fails until the operator adds an explicit database rule.
+    egress: []
+
 # Enabled and fail-closed by default: no ingress, and rendering requires an
 # explicit destination list. Add only the tenant gateway, PostgreSQL, model
 # gateway, and telemetry destinations the signed runtime actually needs.

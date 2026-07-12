@@ -6,9 +6,11 @@ call while serving requests.
 
 The host supports signed, promoted, model-only `single-react` bundles through a
 generic OpenAI-compatible model gateway. Optional payload-free task recovery
-coordinates retries across replicas. Concrete MCP, resumable HITL, stored
-payload replay, memory, A2A, rollout automation, and production certification
-remain later work.
+coordinates retries across replicas. Logical backup, fresh-database restore,
+and payload-free integrity verification are available as tenant-operated
+deployment tools. Concrete MCP, resumable HITL, stored payload replay, memory,
+A2A, rollout automation, standby failover, and production certification remain
+later work.
 
 ## Build and conformance
 
@@ -121,12 +123,57 @@ port only to the tenant gateway or private network in production. This first
 host does not terminate TLS, implement a distributed rate limit, or prove
 overload fairness; the tenant gateway and deployment topology own those controls.
 
+## Backup, restore, and recovery verification
+
+`operations/backup-postgres.sh` creates an atomic custom-format `pg_dump`
+archive and SHA-256 manifest. It uses standard libpq `PGHOST`, `PGPORT`,
+`PGDATABASE`, `PGUSER`, and `PGPASSWORD`/`PGPASSFILE` inputs, so credentials are
+not placed in command arguments or archive names. The Compose `operations`
+profile runs the same script with PostgreSQL 16 client tools:
+
+```bash
+PROMETA_RUNTIME_BACKUP_FILE=/backups/runtime-20260712T020000Z.dump \
+  docker compose -f deploy/reference-runtime/compose.yaml \
+  --profile operations run --rm backup
+```
+
+A full runtime database backup is sensitive even though the task ledger is
+payload-free: release-cache documents, request-state snapshots, and receipt
+outbox records may contain tenant configuration or evidence. Store archives
+only on tenant-approved encrypted storage with restricted backup credentials,
+retention, replication, deletion, and audit controls. The optional Helm backup
+CronJob requires an explicit sensitive-data acknowledgement, a separately
+provisioned PVC and database Secret, and explicit database egress.
+
+Restore is deliberately fresh-database-only:
+
+1. Fence the old deployment and database so two runtimes cannot write the same
+   restored identity.
+2. Create an empty PostgreSQL database and set standard libpq variables for it.
+3. Set `PROMETA_RUNTIME_RESTORE_FILE` and
+   `PROMETA_RUNTIME_RESTORE_CONFIRM=restore-tenant-runtime`, then run
+   `operations/restore-postgres.sh` with matching PostgreSQL client tools.
+4. Point `PROMETA_RUNTIME_DATABASE_URL` at the restored database and run
+   `prometa-runtime-postgres-verify`. The verifier checks schema v5, required
+   payload-free task columns, migration continuity, lease/status projections,
+   and complete ordered task history while returning only table counts.
+5. Start an isolated runtime, exercise health and one controlled request, then
+   let tenant CI/CD perform cutover or rollback.
+
+An expired `running` model-only task remains caller-recoverable after restore;
+the host still does not retain or replay request/output bodies. The automated
+tests prove process-kill reclaim, database-path denial/reconnect, and logical
+restore into a fresh database. They do not prove PostgreSQL replication,
+managed-service promotion, point-in-time recovery, storage durability, or a
+tenant-specific RPO/RTO.
+
 ## Kubernetes / OpenShift
 
 The tenant-owned chart lives at `deploy/reference-runtime/chart`. It creates
-the host Deployment, internal Service, optional migration hook, ServiceAccount,
-and optional HPA/PDB. It does **not** create runtime configuration, credentials,
-PostgreSQL, a model gateway, an ingress, or any Prometa control-plane service.
+the host Deployment, internal Service, optional migration hook, optional backup
+CronJob, ServiceAccount, and optional HPA/PDB. It does **not** create runtime
+configuration, credentials, backup storage, PostgreSQL, a model gateway, an
+ingress, or any Prometa control-plane service.
 
 Start from `values.production.example.yaml`. The chart refuses to render until
 `credentials.existingSecret` and exactly one of
@@ -155,6 +202,9 @@ Security defaults are deliberately fail-closed:
 - no runtime ingress is allowed, and an enabled runtime or migration
   NetworkPolicy refuses to render without explicit destination egress rules;
 - the migration hook has its own temporary DNS-plus-explicit-egress policy;
+- an enabled backup CronJob has a separate identity and NetworkPolicy, and
+  refuses to render without external storage, credentials, sensitive-data
+  acknowledgement, retention, and explicit database egress;
 - the runtime uses a restricted, read-only, non-root container with no Linux
   capabilities and no mounted Kubernetes API token;
 - the chart-created ServiceAccount accepts cloud workload-identity annotations;

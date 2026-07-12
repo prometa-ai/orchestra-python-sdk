@@ -64,6 +64,12 @@ jobs:
       - name: Install runtime extra + dev tools
         run: pip install ".[dev,runtime-postgres]"
 
+      - name: Install matching PostgreSQL client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16
+          pg_dump --version
+
       - name: Ruff
         run: >-
           ruff check prometa/runtime
@@ -107,7 +113,7 @@ jobs:
           set -euo pipefail
           test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
           docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
-            -c "import prometa; from prometa.runtime import RUNTIME_TASK_LIFECYCLE_VERSION, PostgresRuntimeTaskStore, ReferenceRuntimeHost; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresRuntimeTaskStore, ReferenceRuntimeHost, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 5; assert callable(verify_postgres_runtime_integrity)"
 
       - name: Run deployment profile through fresh host containers
         run: >-
@@ -162,8 +168,15 @@ jobs:
             exit 1
           fi
 
+          if helm template unacknowledged-backup "$chart" -f "$example" \
+            --set backup.acknowledgeSensitiveData=false >/dev/null 2>&1; then
+            echo "chart enabled sensitive backups without acknowledgement" >&2
+            exit 1
+          fi
+
           helm template production "$chart" -f "$example" >runtime-chart.yaml
-          test "$(grep -c '^kind: NetworkPolicy$' runtime-chart.yaml)" = "2"
+          test "$(grep -c '^kind: NetworkPolicy$' runtime-chart.yaml)" = "3"
+          test "$(grep -c '^kind: CronJob$' runtime-chart.yaml)" = "1"
           grep -q '^kind: HorizontalPodAutoscaler$' runtime-chart.yaml
           grep -q '^kind: PodDisruptionBudget$' runtime-chart.yaml
           grep -q 'automountServiceAccountToken: false' runtime-chart.yaml
@@ -173,6 +186,8 @@ jobs:
           grep -q 'control-plane-api-key' runtime-chart.yaml
           grep -q 'name: ORCHESTRA_RUNTIME_RECEIPT_API_KEY' runtime-chart.yaml
           grep -q 'receipt-api-key' runtime-chart.yaml
+          grep -q 'tenant-runtime-encrypted-backups' runtime-chart.yaml
+          grep -q 'tenant-runtime-backup-database' runtime-chart.yaml
           if grep -q '^kind: Secret$' runtime-chart.yaml; then
             echo "chart must reference, not create, credentials" >&2
             exit 1

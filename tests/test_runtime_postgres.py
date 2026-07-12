@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from prometa.runtime import (
+    RUNTIME_POSTGRES_SCHEMA_VERSION,
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
@@ -24,8 +26,12 @@ from prometa.runtime import (
     build_runtime_receipt,
     canonical_payload_digest,
     install_postgres_runtime_schema,
+    verify_postgres_runtime_integrity,
 )
-from prometa.runtime.postgres import main as postgres_init_main
+from prometa.runtime.postgres import (
+    main as postgres_init_main,
+    verify_main as postgres_verify_main,
+)
 
 
 def _unavailable(dsn):
@@ -203,6 +209,14 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
             lease_seconds=30,
         )
     assert caught.value.code == "task_store_unavailable"
+    assert "password" not in str(caught.value)
+
+    with pytest.raises(RuntimePersistenceError) as caught:
+        verify_postgres_runtime_integrity(
+            "postgresql://secret:password@db.example/runtime",
+            connect=_unavailable,
+        )
+    assert caught.value.code == "runtime_schema_verification_failed"
     assert "password" not in str(caught.value)
 
 
@@ -642,3 +656,80 @@ def test_postgres_task_leases_recover_and_replay_ordered_history() -> None:
         "claimed",
         "recovered",
     ]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
+    monkeypatch, capsys
+) -> None:
+    import psycopg
+
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    tenant_id = "verify-%s" % uuid.uuid4().hex
+    runtime_id = "runtime-verify"
+    request_id = "request-verify"
+    store = PostgresRuntimeTaskStore(
+        dsn,
+        tenant_id=tenant_id,
+        runtime_id=runtime_id,
+    )
+    claim = store.claim(
+        request_id,
+        input_digest=canonical_payload_digest({"question": "private input"}),
+        artifact_digest="sha256:" + "d" * 64,
+        release_id="release-verify",
+        deployment_id="deployment-verify",
+        recoverable=True,
+        max_attempts=3,
+        lease_seconds=30,
+    )
+    store.complete(
+        claim,
+        output_digest=canonical_payload_digest({"answer": "private output"}),
+        model_name="tenant/model",
+        model_attempts=1,
+        tool_calls=0,
+        used_fallback=False,
+    )
+
+    try:
+        report = verify_postgres_runtime_integrity(dsn)
+        assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
+        assert report.migration_versions == (1, 2, 3, 4, 5)
+        assert report.table_counts["prometa_runtime_task"] >= 1
+        assert report.table_counts["prometa_runtime_task_event"] >= 2
+        assert "private input" not in repr(report)
+        assert "private output" not in repr(report)
+
+        monkeypatch.setenv("RUNTIME_VERIFY_DSN", dsn)
+        assert postgres_verify_main(["--dsn-env", "RUNTIME_VERIFY_DSN"]) == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["integrity"] == "verified"
+        assert output["schemaVersion"] == 5
+        assert "private" not in repr(output)
+
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                """
+                UPDATE prometa_runtime_task
+                SET sequence = sequence + 1
+                WHERE tenant_id = %s AND runtime_id = %s AND request_id = %s
+                """,
+                (tenant_id, runtime_id, request_id),
+            )
+        with pytest.raises(RuntimePersistenceError) as caught:
+            verify_postgres_runtime_integrity(dsn)
+        assert caught.value.code == "runtime_schema_integrity_failed"
+    finally:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                """
+                DELETE FROM prometa_runtime_task
+                WHERE tenant_id = %s AND runtime_id = %s AND request_id = %s
+                """,
+                (tenant_id, runtime_id, request_id),
+            )

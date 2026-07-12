@@ -23,6 +23,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - PostgreSQL v5 task and event tables plus an optional reference-host
   `taskRecovery` mode for cross-replica coordination and authenticated
   `GET /v1/runtime/tasks/{requestId}` lifecycle projection.
+- A payload-free PostgreSQL schema/restore integrity verifier, atomic logical
+  backup and fresh-database restore scripts, a Compose operations profile, and
+  an optional encrypted-PVC Helm backup CronJob with dedicated credentials and
+  NetworkPolicy.
+- Reference runtime chart `0.2.0`, adding the optional backup operations
+  contract without changing application version `0.18.0`.
+- Deployment recovery tests that kill a real host during inference, cut and
+  restore its database path, and restore a logical archive into a fresh
+  PostgreSQL database before replaying task history.
 
 ### Security
 
@@ -33,6 +42,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   or release identity, stale ownership, exhausted attempts, and unsupported
   side-effecting tools. Task storage, status responses, and claim evidence omit
   request bodies, response bodies, prompts, outputs, keys, and credentials.
+- Restore requires an explicit confirmation, matching SHA-256 manifest, empty
+  target database, compatible schema, and post-restore integrity verification;
+  backup enablement requires explicit sensitive-data acknowledgement and
+  operator-managed credentials, storage, retention, and egress.
 
 ## [0.18.0] - 2026-07-12
 

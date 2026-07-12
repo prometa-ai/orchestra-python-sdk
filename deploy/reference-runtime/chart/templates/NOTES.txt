@@ -14,5 +14,10 @@ The chart references, but never creates, the runtime config and credential
 objects. NetworkPolicy is fail-closed by default. Verify that your values allow
 only the intended gateway ingress plus PostgreSQL, model, DNS, and telemetry
 egress before promotion.
+The migration hook is followed by a target-image compatibility check. Future
+chart rollback runs that check before replacing runtime pods.
+The database-maintenance NetworkPolicy remains for the complete hook sequence;
+include it in tenant cleanup after uninstall because Helm does not manage hook
+resources as release resources.
 Run prometa-runtime-postgres-verify against a fresh restored database before
 tenant CI/CD performs a recovery cutover.

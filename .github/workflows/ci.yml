@@ -82,6 +82,47 @@ jobs:
           tests/test_runtime_*.py
           tests/test_promotion_attestation.py
 
+  runtime-upgrade-rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: runtime_test
+          POSTGRES_PASSWORD: runtime_test
+          POSTGRES_DB: runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U runtime_test -d runtime_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PROMETA_RUNTIME_TEST_POSTGRES_DSN: >-
+        postgresql://runtime_test:runtime_test@localhost:5432/runtime_test
+      PROMETA_RUNTIME_UPGRADE_REPORT: runtime-upgrade-rollback.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install current runtime host and test tools
+        run: pip install ".[dev,runtime-host]"
+
+      - name: Exercise source baseline upgrade and prior-bundle rollback
+        run: deploy/reference-runtime/ci/upgrade-rollback-drill.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-upgrade-rollback
+          path: runtime-upgrade-rollback.json
+
   runtime-host-image:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -113,7 +154,7 @@ jobs:
           set -euo pipefail
           test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
           docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
-            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresRuntimeTaskStore, ReferenceRuntimeHost, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 5; assert callable(verify_postgres_runtime_integrity)"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 5; assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
 
       - name: Run deployment profile through fresh host containers
         run: >-
@@ -176,12 +217,16 @@ jobs:
 
           helm template production "$chart" -f "$example" >runtime-chart.yaml
           test "$(grep -c '^kind: NetworkPolicy$' runtime-chart.yaml)" = "3"
+          test "$(grep -c '^kind: Job$' runtime-chart.yaml)" = "2"
           test "$(grep -c '^kind: CronJob$' runtime-chart.yaml)" = "1"
           grep -q '^kind: HorizontalPodAutoscaler$' runtime-chart.yaml
           grep -q '^kind: PodDisruptionBudget$' runtime-chart.yaml
           grep -q 'automountServiceAccountToken: false' runtime-chart.yaml
           grep -q 'readOnlyRootFilesystem: true' runtime-chart.yaml
           grep -q 'helm.sh/hook: pre-install,pre-upgrade' runtime-chart.yaml
+          grep -q 'helm.sh/hook: pre-install,pre-upgrade,pre-rollback' runtime-chart.yaml
+          grep -q 'prometa-runtime-postgres-compatibility' runtime-chart.yaml
+          grep -q 'prometa.io/runtime-config-rollout-id: "deployment-prod-v1"' runtime-chart.yaml
           grep -q 'name: ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY' runtime-chart.yaml
           grep -q 'control-plane-api-key' runtime-chart.yaml
           grep -q 'name: ORCHESTRA_RUNTIME_RECEIPT_API_KEY' runtime-chart.yaml
@@ -197,10 +242,20 @@ jobs:
             --set runtimeConfig.existingConfigMap=runtime-config \
             --set credentials.existingSecret=runtime-credentials \
             --set migration.enabled=false \
+            --set migration.compatibilityCheck=false \
             --set networkPolicy.enabled=false >runtime-chart-configmap.yaml
           grep -q 'configMap:' runtime-chart-configmap.yaml
           if grep -q '^kind: Job$' runtime-chart-configmap.yaml; then
-            echo "disabled migration unexpectedly rendered a Job" >&2
+            echo "disabled database maintenance unexpectedly rendered a Job" >&2
+            exit 1
+          fi
+
+          helm template external-migration "$chart" -f "$example" \
+            --set migration.enabled=false >runtime-chart-external-migration.yaml
+          test "$(grep -c '^kind: Job$' runtime-chart-external-migration.yaml)" = "1"
+          grep -q 'prometa-runtime-postgres-compatibility' runtime-chart-external-migration.yaml
+          if grep -q 'prometa-runtime-postgres-init' runtime-chart-external-migration.yaml; then
+            echo "externally managed migration unexpectedly rendered the mutating job" >&2
             exit 1
           fi
 

@@ -170,8 +170,8 @@ tenant-specific RPO/RTO.
 ## Kubernetes / OpenShift
 
 The tenant-owned chart lives at `deploy/reference-runtime/chart`. It creates
-the host Deployment, internal Service, optional migration hook, optional backup
-CronJob, ServiceAccount, and optional HPA/PDB. It does **not** create runtime
+the host Deployment, internal Service, migration and compatibility hooks,
+optional backup CronJob, ServiceAccount, and optional HPA/PDB. It does **not** create runtime
 configuration, credentials, backup storage, PostgreSQL, a model gateway, an
 ingress, or any Prometa control-plane service.
 
@@ -193,15 +193,21 @@ token, optional model/control-plane/receipt API keys, and migration database
 keys. Use an external secret manager or sealed-secret workflow; do not commit
 the rendered Secret. Embedded mode stores the exact signed pair in the runtime
 config; pull mode stores only the selected attestation ID and non-secret trust
-configuration. Updating either source does not automatically restart pods, so
-tenant CI/CD must update the object and roll the Deployment as one promotion
-operation.
+configuration. Use one immutable, versioned config object per deployment and set
+`runtimeConfig.rolloutId` to that deployment ID. Changing either the object
+reference or rollout ID updates the pod template; mutating an object in place is
+not a supported release operation.
 
 Security defaults are deliberately fail-closed:
 
 - no runtime ingress is allowed, and an enabled runtime or migration
   NetworkPolicy refuses to render without explicit destination egress rules;
-- the migration hook has its own temporary DNS-plus-explicit-egress policy;
+- the migration and compatibility hooks share a dedicated
+  DNS-plus-explicit-egress policy that remains present for the complete hook
+  sequence;
+- the target runtime image runs a read-only schema compatibility hook after
+  migration and before future chart rollback, using the same database-maintenance
+  identity and egress policy;
 - an enabled backup CronJob has a separate identity and NetworkPolicy, and
   refuses to render without external storage, credentials, sensitive-data
   acknowledgement, retention, and explicit database egress;
@@ -224,6 +230,49 @@ caller-driven; the host does not persist request/output bodies or resume an
 HITL/tool checkpoint. Test install, upgrade, rollback, database outage, and
 termination behavior in the tenant's actual CNI and ingress topology before
 production certification.
+
+## Upgrade and prior-bundle rollback
+
+Database migration and compatibility are separate gates. The migration hook may
+advance the fixed schema; `prometa-runtime-postgres-compatibility` then proves
+that the target image accepts the installed version and required tables. The
+compatibility hook remains available when chart-managed migration is disabled.
+The host repeats that read-only check before resolving release material. A newer
+unknown schema, a migration gap, or an older schema fails before activation.
+
+A bundle rollback is a new forward deployment, not reuse of stale authorization:
+
+1. Select the previously persisted bundle artifact and obtain a current gate
+   decision, required approvals, and a **fresh** promotion attestation.
+2. Assign a new release ID, deployment ID, attestation ID, and promotion JTI.
+   The exact prior bundle digest and bundle JTI remain unchanged.
+3. Create a new immutable config Secret or ConfigMap and set
+   `runtimeConfig.rolloutId` to the new deployment ID.
+4. Run `helm upgrade`, wait for the compatibility hook and Deployment readiness,
+   then retain the resulting admission/active receipts as rollout evidence.
+
+Do not use a blind `helm rollback` to revive an expired or revoked attestation.
+Helm rollback is appropriate for chart/image state only when the target revision
+contains a valid freshly authorized config and its pre-rollback compatibility
+hook accepts the current database. Tenant CI/CD remains the deployment authority.
+Helm hook resources are not release-managed: the maintenance NetworkPolicy is
+replaced before each hook operation and must be removed by the tenant's uninstall
+cleanup after the release is deleted.
+
+The repository runs a repeatable source-baseline drill in CI:
+
+```bash
+export PROMETA_RUNTIME_TEST_POSTGRES_DSN='postgresql://...'
+deploy/reference-runtime/ci/upgrade-rollback-drill.sh
+```
+
+`compatibility-baselines.json` pins chart `0.1.0` commit `51e2faa` at schema v2.
+The drill starts release A on that source, migrates to v5 and starts release B on
+current code, then starts the baseline host against v5 with release A's exact
+bundle bytes and a fresh rollback promotion/deployment. It verifies three
+immutable activation rows and zero synchronous control-plane calls. Because the
+baseline was not a separately published artifact, this is not release-channel,
+Kubernetes CNI, managed-database, or production certification.
 
 ## Request API
 

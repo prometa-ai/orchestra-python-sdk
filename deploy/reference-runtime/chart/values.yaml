@@ -40,6 +40,9 @@ runtimeConfig:
   existingConfigMap: ""
   key: config.json
   targetFile: config.json
+  # A non-secret tenant CI/CD deployment identifier. Changing it updates the
+  # pod template even when an external object name remains unchanged.
+  rolloutId: ""
 
 # The chart never creates this Secret. Use separate runtime and migration
 # database identities in production; modelGatewayApiKeyKey may be absent.
@@ -94,6 +97,9 @@ gracefulShutdown:
 # may live in a different Secret from the lower-privilege runtime credentials.
 migration:
   enabled: true
+  # Uses the target runtime image after migration and before a chart rollback.
+  # Keep this enabled when schema migration is managed outside this chart.
+  compatibilityCheck: true
   # Pre-install hooks run before this chart can create its runtime account.
   # Name a pre-provisioned workload identity account here when required.
   serviceAccountName: default

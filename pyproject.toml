@@ -66,6 +66,7 @@ dev = ["pytest>=7", "ruff>=0.5"]
 [project.scripts]
 prometa-runtime-conformance = "prometa.runtime.conformance:main"
 prometa-runtime-postgres-init = "prometa.runtime.postgres:main"
+prometa-runtime-postgres-compatibility = "prometa.runtime.postgres:compatibility_main"
 prometa-runtime-postgres-verify = "prometa.runtime.postgres:verify_main"
 prometa-runtime-host = "prometa.runtime.host:main"
 prometa-runtime-host-conformance-driver = "prometa.runtime.host_conformance:main"

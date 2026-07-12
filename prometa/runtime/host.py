@@ -53,6 +53,7 @@ from .postgres import (
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
     RuntimePersistenceError,
+    check_postgres_runtime_compatibility,
 )
 from .receipts import (
     RuntimeReceiptClient,
@@ -1161,6 +1162,10 @@ def build_reference_runtime_host(
         raise RuntimeHostError("runtime_api_token_missing")
     if len(api_token.encode("utf-8")) < 32:
         raise RuntimeHostError("api_token_too_short")
+    try:
+        check_postgres_runtime_compatibility(dsn)
+    except RuntimePersistenceError as exc:
+        raise RuntimeHostError(exc.code) from None
     receipt_api_key = None
     if config.receipt_base_url is not None:
         if config.receipt_api_key_env is None:

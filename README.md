@@ -261,8 +261,14 @@ Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
 prometa-runtime-postgres-init
+prometa-runtime-postgres-compatibility
 prometa-runtime-postgres-verify
 ```
+
+`prometa-runtime-postgres-compatibility` is the serving-image gate. It reads
+only migration and table metadata and rejects an uninitialized, gapped, older,
+newer, or structurally incompatible schema before the host activates a release.
+The installer remains the separate mutating step.
 
 `prometa-runtime-postgres-verify` is a payload-free pre-cutover check for a
 newly restored database. It requires exact migrations through schema v5,
@@ -397,6 +403,13 @@ side-effecting tools, and resumable HITL checkpoints require later contracts.
 The non-root container, Compose example, tenant-owned Helm chart, logical
 backup/restore assets, strict configuration shape, and operator commands live in
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
+Chart `0.3.0` runs the target image's compatibility check after migration and
+before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
+tenant-selected immutable config revisions explicit. The CI drill uses a real
+schema-v2 source baseline, upgrades to schema v5 and bundle B, then starts the
+baseline host again with bundle A's exact bytes under a fresh promotion and
+deployment identity. This is source-level compatibility evidence, not a
+published-version or tenant-cluster certification claim.
 
 #### Runtime conformance
 

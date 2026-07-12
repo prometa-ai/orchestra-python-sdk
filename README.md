@@ -11,8 +11,10 @@ automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
 and joinable on the platform. Version 0.18.0 adds a first tenant-deployed
 reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. It adds no dependency or runtime
-behavior to the default observability install.
+container around the optional Phase 2A kernel. The host can also bootstrap from
+an outbound, read-only release handoff with bounded tenant-side cache fallback.
+None of this adds a dependency or runtime behavior to the default observability
+install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -251,6 +253,8 @@ resolve to the same database schema/search path. The serving role needs
 `SELECT, INSERT` on `prometa_runtime_bundle_identity`. When lifecycle receipt
 delivery is configured, it also needs `SELECT, INSERT, UPDATE` on
 `prometa_runtime_receipt_outbox`; it does not need DDL privileges.
+Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
+`prometa_runtime_release_cache`.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -296,8 +300,9 @@ Install the host extra only in the tenant runtime image:
 pip install "prometa-sdk[runtime-host]"
 ```
 
-`prometa-runtime-host` loads one strict mounted configuration, verifies both
-signed artifacts, and atomically creates or joins an immutable release
+`prometa-runtime-host` loads one strict mounted configuration, resolves either
+an embedded release pair or a tenant-selected outbound handoff, verifies both
+signed artifacts locally, and atomically creates or joins an immutable release
 activation in tenant PostgreSQL. Exact replicas and restarts may join. A fresh
 promotion can authorize the same signed bundle bytes for a new deployment;
 changed activation identity, promotion-JTI reuse, or a bundle JTI bound to a
@@ -320,6 +325,18 @@ outbox before a background dispatcher contacts Orchestra, so platform outage
 does not change readiness or request behavior. Replica leases prevent duplicate
 workers, deterministic receipt IDs preserve idempotency across restarts, and
 permanent rejections are dead-lettered with sanitized evidence.
+
+Optional `controlPlanePull` configuration replaces the embedded `bundle` and
+`promotionAttestation` fields with an attestation ID selected by tenant CI/CD.
+The host calls the API only during bootstrap with a narrow `runtime:read` key,
+refuses redirects and non-HTTPS endpoints by default, requires the platform's
+`checkedAt` to fall inside the configured clock-skew window, then performs the
+normal local signature, binding, expiry, capability, and activation checks. A verified
+pair is cached in tenant PostgreSQL. Only transport, 408/425/429, or 5xx failures
+may use that cache, and only within `maxCacheAgeSeconds` and the signed offline
+lease. Revocation, authorization, binding, or signature failures never fall
+back. Changing the attestation ID still requires tenant CI/CD to update the
+mounted config and roll the workload; this is not a hot-reload controller.
 
 The non-root container, Compose example, tenant-owned Helm chart, strict
 configuration shape, and operator commands live in

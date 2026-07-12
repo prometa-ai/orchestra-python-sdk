@@ -14,18 +14,21 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .admission import RuntimeActivationResult
+from .control_plane import RuntimeReleaseHandoff
 from .receipts import RuntimeReceiptOutboxItem
 
 
 _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
 _MAX_RECEIPT_BYTES = 64 * 1024
+_MAX_RELEASE_DOCUMENT_BYTES = 12 * 1024 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_RUNTIME_ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
 _RECEIPT_SEQUENCE = {
     "admitted": 10,
     "rollout_started": 20,
@@ -117,6 +120,28 @@ CREATE INDEX IF NOT EXISTS prometa_runtime_receipt_outbox_pending_idx
         tenant_id, status, available_at, created_at, sequence
     );
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_release_cache (
+    tenant_id TEXT NOT NULL,
+    attestation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    release_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    target_environment TEXT NOT NULL,
+    runtime_target TEXT NOT NULL,
+    bundle JSONB NOT NULL,
+    promotion_attestation JSONB NOT NULL,
+    checked_at TIMESTAMPTZ NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL,
+    verified_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, attestation_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_release_cache_deployment_idx
+    ON prometa_runtime_release_cache (
+        tenant_id, deployment_id, verified_at
+    );
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
@@ -127,6 +152,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (3)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (4)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -219,6 +248,35 @@ def _serialize_receipt(receipt: Mapping[str, Any]) -> tuple[str, str, int]:
     if len(encoded.encode("utf-8")) > _MAX_RECEIPT_BYTES:
         raise ValueError("receipt exceeds the 64 KiB limit")
     return receipt_id, encoded, _RECEIPT_SEQUENCE[transition]
+
+
+def _serialize_release_document(name: str, value: Mapping[str, Any]) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError("%s must be a mapping" % name)
+    try:
+        encoded = json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s must be finite JSON data" % name) from exc
+    if len(encoded.encode("utf-8")) > _MAX_RELEASE_DOCUMENT_BYTES:
+        raise ValueError("%s exceeds the 12 MiB limit" % name)
+    return encoded
+
+
+def _release_document(value: Any) -> Mapping[str, Any]:
+    try:
+        if isinstance(value, str):
+            value = json.loads(value)
+    except json.JSONDecodeError:
+        raise RuntimePersistenceError("release_cache_record_invalid") from None
+    if not isinstance(value, Mapping):
+        raise RuntimePersistenceError("release_cache_record_invalid")
+    return dict(value)
 
 
 def install_postgres_runtime_schema(
@@ -586,6 +644,218 @@ class PostgresRuntimeReceiptOutbox(_PostgresTenantStore):
         )
 
 
+class PostgresRuntimeReleaseCache(_PostgresTenantStore):
+    """Persist caller-verified release material for bounded offline restart."""
+
+    def save(self, handoff: RuntimeReleaseHandoff) -> None:
+        if not isinstance(handoff, RuntimeReleaseHandoff):
+            raise ValueError("handoff must be a RuntimeReleaseHandoff")
+        attestation_id = _validate_identifier(
+            "attestation_id", handoff.attestation_id, max_length=200
+        )
+        artifact_id = _validate_identifier(
+            "artifact_id", handoff.artifact_id, max_length=200
+        )
+        digest = _validate_digest(handoff.artifact_digest)
+        release_id = _validate_identifier(
+            "release_id", handoff.release_id, max_length=200
+        )
+        deployment_id = _validate_identifier(
+            "deployment_id", handoff.deployment_id, max_length=200
+        )
+        environment = _validate_identifier(
+            "target_environment", handoff.target_environment
+        )
+        runtime_target = _validate_identifier(
+            "runtime_target", handoff.runtime_target
+        )
+        bundle = _serialize_release_document("bundle", handoff.bundle)
+        promotion = _serialize_release_document(
+            "promotion_attestation", handoff.promotion_attestation
+        )
+        if (
+            environment not in _RUNTIME_ENVIRONMENTS
+            or handoff.bundle.get("artifactDigest") != digest
+            or handoff.promotion_attestation.get("attestationId")
+            != attestation_id
+        ):
+            raise ValueError("handoff release bindings are inconsistent")
+        if handoff.checked_at.tzinfo is None or handoff.fetched_at.tzinfo is None:
+            raise ValueError("handoff timestamps must be timezone-aware")
+        identity = (
+            artifact_id,
+            digest,
+            release_id,
+            deployment_id,
+            environment,
+            runtime_target,
+            bundle,
+            promotion,
+        )
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_release_cache (
+                            tenant_id, attestation_id, artifact_id,
+                            artifact_digest, release_id, deployment_id,
+                            target_environment, runtime_target, bundle,
+                            promotion_attestation, checked_at, fetched_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, %s, %s
+                        )
+                        ON CONFLICT (tenant_id, attestation_id) DO NOTHING
+                        RETURNING attestation_id
+                        """,
+                        (
+                            self.tenant_id,
+                            attestation_id,
+                            artifact_id,
+                            digest,
+                            release_id,
+                            deployment_id,
+                            environment,
+                            runtime_target,
+                            bundle,
+                            promotion,
+                            handoff.checked_at,
+                            handoff.fetched_at,
+                        ),
+                    )
+                    if cursor.fetchone() is not None:
+                        return
+                    cursor.execute(
+                        """
+                        SELECT artifact_id, artifact_digest, release_id,
+                               deployment_id, target_environment,
+                               runtime_target, bundle, promotion_attestation
+                        FROM prometa_runtime_release_cache
+                        WHERE tenant_id = %s AND attestation_id = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, attestation_id),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        raise RuntimePersistenceError("release_cache_conflict")
+                    stored_identity = (
+                        *tuple(existing[:6]),
+                        _serialize_release_document(
+                            "bundle", _release_document(existing[6])
+                        ),
+                        _serialize_release_document(
+                            "promotion_attestation",
+                            _release_document(existing[7]),
+                        ),
+                    )
+                    if stored_identity != identity:
+                        raise RuntimePersistenceError("release_cache_conflict")
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_release_cache
+                        SET checked_at = %s,
+                            fetched_at = %s,
+                            verified_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s AND attestation_id = %s
+                        """,
+                        (
+                            handoff.checked_at,
+                            handoff.fetched_at,
+                            self.tenant_id,
+                            attestation_id,
+                        ),
+                    )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("release_cache_unavailable") from None
+
+    def load(
+        self,
+        attestation_id: str,
+        *,
+        max_age_seconds: float,
+        now: Optional[datetime] = None,
+    ) -> Optional[RuntimeReleaseHandoff]:
+        attestation = _validate_identifier(
+            "attestation_id", attestation_id, max_length=200
+        )
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or max_age_seconds <= 0
+            or max_age_seconds > 7 * 86_400
+        ):
+            raise ValueError("max_age_seconds must be greater than 0 and at most 604800")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        current = current.astimezone(timezone.utc)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT artifact_id, artifact_digest, release_id,
+                               deployment_id, target_environment,
+                               runtime_target, bundle, promotion_attestation,
+                               checked_at, fetched_at
+                        FROM prometa_runtime_release_cache
+                        WHERE tenant_id = %s AND attestation_id = %s
+                        """,
+                        (self.tenant_id, attestation),
+                    )
+                    row = cursor.fetchone()
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("release_cache_unavailable") from None
+        if row is None:
+            return None
+        try:
+            checked_at = row[8]
+            fetched_at = row[9]
+            if (
+                not isinstance(checked_at, datetime)
+                or checked_at.tzinfo is None
+                or not isinstance(fetched_at, datetime)
+                or fetched_at.tzinfo is None
+                or fetched_at.astimezone(timezone.utc)
+                > current + timedelta(seconds=60)
+            ):
+                raise RuntimePersistenceError("release_cache_record_invalid")
+            if (
+                current - fetched_at.astimezone(timezone.utc)
+            ).total_seconds() > float(max_age_seconds):
+                return None
+            environment = _validate_identifier("target_environment", row[4])
+            if environment not in _RUNTIME_ENVIRONMENTS:
+                raise ValueError("unsupported cached target environment")
+            return RuntimeReleaseHandoff(
+                attestation_id=attestation,
+                artifact_id=_validate_identifier(
+                    "artifact_id", row[0], max_length=200
+                ),
+                artifact_digest=_validate_digest(row[1]),
+                release_id=_validate_identifier(
+                    "release_id", row[2], max_length=200
+                ),
+                deployment_id=_validate_identifier(
+                    "deployment_id", row[3], max_length=200
+                ),
+                target_environment=environment,
+                runtime_target=_validate_identifier("runtime_target", row[5]),
+                bundle=_release_document(row[6]),
+                promotion_attestation=_release_document(row[7]),
+                checked_at=checked_at.astimezone(timezone.utc),
+                fetched_at=fetched_at.astimezone(timezone.utc),
+            )
+        except (IndexError, TypeError, ValueError):
+            raise RuntimePersistenceError("release_cache_record_invalid") from None
+
+
 class PostgresRuntimeStateStore(_PostgresTenantStore):
     """Shared JSON request-state store for tenant runtime replicas.
 
@@ -730,6 +1000,7 @@ __all__ = [
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
+    "PostgresRuntimeReleaseCache",
     "PostgresRuntimeStateStore",
     "main",
 ]

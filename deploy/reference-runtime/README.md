@@ -33,9 +33,11 @@ chaos or production certification.
 
 ## Configuration
 
-Mount one strict JSON document at `/etc/prometa-runtime/config.json`; see
-`config.example.json` for the versioned shape. Replace both empty artifact
-objects with the exact signed Builder bundle and promotion attestation.
+Mount one strict JSON document at `/etc/prometa-runtime/config.json`.
+`config.example.json` embeds the exact signed Builder bundle and promotion
+attestation. `config.pull.example.json` instead names one attestation selected
+by tenant CI/CD and retrieves the pair through the outbound bootstrap channel.
+The two release sources are mutually exclusive.
 
 The JSON file contains public trust material and immutable rollout identity,
 not credentials. Supply these through the environment or a workload secret
@@ -44,6 +46,8 @@ provider:
 - `PROMETA_RUNTIME_DATABASE_URL`: tenant PostgreSQL DSN;
 - `PROMETA_RUNTIME_API_TOKEN`: at least 32 bytes, required by the request API;
 - `MODEL_GATEWAY_API_KEY`: required only when `modelGateway.apiKeyEnv` names it.
+- `ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY`: required only when
+  `controlPlanePull.apiKeyEnv` names it; use a narrow `runtime:read` key.
 - `ORCHESTRA_RUNTIME_RECEIPT_API_KEY`: required only when the optional
   `receiptDelivery.apiKeyEnv` names it; use a narrow `runtime:write` key.
 
@@ -71,6 +75,16 @@ The host durably enqueues deterministic deployment-level `admitted` and
 readiness or request execution, while permanent 4xx responses are retained as
 dead letters with payload-free evidence. Pod termination does not emit a
 deployment-level `stopped` receipt.
+
+Pull mode is bootstrap-only. The host refuses redirects, requires HTTPS unless
+local/test configuration explicitly opts into HTTP, and rejects a stale
+`checkedAt` outside `maxClockSkewSeconds`. It retrieves one atomic handoff from
+`/api/runtime-releases/{attestationId}`, performs the normal
+local cryptographic admission, and records verified bytes in
+`prometa_runtime_release_cache`. A retryable transport/server outage may use
+that tenant-side cache only within `maxCacheAgeSeconds` and the signed offline
+lease. Terminal 4xx, revocation, binding, or signature failures fail closed.
+The control plane is never called while a runtime request is being served.
 
 Install the database schema with a migration identity before starting the
 lower-privilege host:
@@ -106,12 +120,13 @@ helm upgrade --install tenant-runtime deploy/reference-runtime/chart \
 ```
 
 The credential Secret must expose the configured runtime database, request API
-token, optional model/receipt API keys, and migration database keys. Use an external
-secret manager or sealed-secret workflow; do not commit the rendered Secret.
-The runtime config object contains the exact signed bundle and promotion
-attestation. Updating either external object does not automatically restart
-pods, so tenant CI/CD must update the object and roll the Deployment as one
-promotion operation.
+token, optional model/control-plane/receipt API keys, and migration database
+keys. Use an external secret manager or sealed-secret workflow; do not commit
+the rendered Secret. Embedded mode stores the exact signed pair in the runtime
+config; pull mode stores only the selected attestation ID and non-secret trust
+configuration. Updating either source does not automatically restart pods, so
+tenant CI/CD must update the object and roll the Deployment as one promotion
+operation.
 
 Security defaults are deliberately fail-closed:
 
@@ -125,10 +140,10 @@ Security defaults are deliberately fail-closed:
   must already exist when it is not the namespace `default` account.
 
 The production example opens only tenant-gateway ingress plus PostgreSQL and
-model-gateway egress. Add telemetry or receipt-endpoint egress only when the
-corresponding delivery path is configured. For external services use a tightly scoped `ipBlock` or a
-CNI-supported FQDN policy; Kubernetes NetworkPolicy does not natively express
-DNS names.
+model-gateway egress. Add control-plane, telemetry, or receipt-endpoint egress
+only when the corresponding path is configured. For external services use a
+tightly scoped `ipBlock` or a CNI-supported FQDN policy; Kubernetes
+NetworkPolicy does not natively express DNS names.
 
 Enabling the HPA or multiple replicas does not add distributed request locking,
 exactly-once execution, or resumable task state. PostgreSQL activation and

@@ -169,6 +169,8 @@ jobs:
           grep -q 'automountServiceAccountToken: false' runtime-chart.yaml
           grep -q 'readOnlyRootFilesystem: true' runtime-chart.yaml
           grep -q 'helm.sh/hook: pre-install,pre-upgrade' runtime-chart.yaml
+          grep -q 'name: ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY' runtime-chart.yaml
+          grep -q 'control-plane-api-key' runtime-chart.yaml
           grep -q 'name: ORCHESTRA_RUNTIME_RECEIPT_API_KEY' runtime-chart.yaml
           grep -q 'receipt-api-key' runtime-chart.yaml
           if grep -q '^kind: Secret$' runtime-chart.yaml; then
@@ -191,6 +193,13 @@ jobs:
             --set 'extraEnv[0].name=ORCHESTRA_RUNTIME_RECEIPT_API_KEY' \
             --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
             echo "chart allowed the reserved receipt API key override" >&2
+            exit 1
+          fi
+
+          if helm template reserved-control-plane-env "$chart" -f "$example" \
+            --set 'extraEnv[0].name=ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY' \
+            --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
+            echo "chart allowed the reserved control-plane API key override" >&2
             exit 1
           fi
 

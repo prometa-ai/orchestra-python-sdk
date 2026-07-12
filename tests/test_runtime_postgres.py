@@ -6,7 +6,7 @@ import asyncio
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -14,7 +14,9 @@ from prometa.runtime import (
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
+    PostgresRuntimeReleaseCache,
     PostgresRuntimeStateStore,
+    RuntimeReleaseHandoff,
     RuntimePersistenceError,
     build_runtime_receipt,
     install_postgres_runtime_schema,
@@ -24,6 +26,31 @@ from prometa.runtime.postgres import main as postgres_init_main
 
 def _unavailable(dsn):
     raise OSError("database unavailable at %s" % dsn)
+
+
+def _handoff(
+    *,
+    attestation_id="attestation-cache",
+    artifact_digest="sha256:" + "c" * 64,
+    fetched_at=None,
+):
+    fetched = fetched_at or datetime.now(timezone.utc)
+    return RuntimeReleaseHandoff(
+        attestation_id=attestation_id,
+        artifact_id="artifact-cache",
+        artifact_digest=artifact_digest,
+        release_id="release-cache",
+        deployment_id="deployment-cache",
+        target_environment="prod",
+        runtime_target="tenant-runtime",
+        bundle={"signed": True, "artifactDigest": artifact_digest},
+        promotion_attestation={
+            "signed": True,
+            "attestationId": attestation_id,
+        },
+        checked_at=fetched,
+        fetched_at=fetched,
+    )
 
 
 class _StaticCursor:
@@ -129,6 +156,31 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert caught.value.code == "receipt_outbox_unavailable"
     assert "password" not in str(caught.value)
 
+    cache = PostgresRuntimeReleaseCache(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        connect=_unavailable,
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        cache.save(_handoff())
+    assert caught.value.code == "release_cache_unavailable"
+    assert "password" not in str(caught.value)
+    with pytest.raises(RuntimePersistenceError) as caught:
+        cache.load("attestation-cache", max_age_seconds=60)
+    assert caught.value.code == "release_cache_unavailable"
+    with pytest.raises(ValueError, match="bindings"):
+        cache.save(
+            RuntimeReleaseHandoff(
+                **{
+                    **_handoff().__dict__,
+                    "bundle": {
+                        "signed": True,
+                        "artifactDigest": "sha256:" + "e" * 64,
+                    },
+                }
+            )
+        )
+
 
 def test_state_validation_is_finite_and_bounded() -> None:
     state = PostgresRuntimeStateStore(
@@ -153,6 +205,30 @@ def test_malformed_state_rows_fail_with_a_stable_code() -> None:
     with pytest.raises(RuntimePersistenceError) as caught:
         asyncio.run(state.load("request-1"))
     assert caught.value.code == "state_record_invalid"
+
+
+def test_malformed_release_cache_rows_fail_with_a_stable_code() -> None:
+    cache = PostgresRuntimeReleaseCache(
+        "postgresql://unused",
+        tenant_id="tenant-1",
+        connect=lambda dsn: _StaticConnection(
+            (
+                "artifact-1",
+                "sha256:" + "a" * 64,
+                "release-1",
+                "deployment-1",
+                "prod",
+                "tenant-runtime",
+                "not-json",
+                {},
+                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),
+            )
+        ),
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        cache.load("attestation-1", max_age_seconds=60)
+    assert caught.value.code == "release_cache_record_invalid"
 
 
 def test_schema_init_cli_reads_named_environment_without_printing_dsn(
@@ -207,6 +283,39 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
         tenant_id=tenant_id + "-other",
     )
     assert isolated.reserve_pair("bundle-shared", "promotion-shared") is True
+
+    release_cache = PostgresRuntimeReleaseCache(dsn, tenant_id=tenant_id)
+    cached_handoff = _handoff()
+    release_cache.save(cached_handoff)
+    release_cache.save(cached_handoff)
+    loaded_handoff = release_cache.load(
+        cached_handoff.attestation_id,
+        max_age_seconds=60,
+    )
+    assert loaded_handoff is not None
+    assert loaded_handoff.artifact_digest == cached_handoff.artifact_digest
+    assert loaded_handoff.bundle == cached_handoff.bundle
+    assert (
+        release_cache.load(
+            cached_handoff.attestation_id,
+            max_age_seconds=1,
+            now=cached_handoff.fetched_at + timedelta(seconds=2),
+        )
+        is None
+    )
+    conflicting_handoff = RuntimeReleaseHandoff(
+        **{
+            **cached_handoff.__dict__,
+            "artifact_digest": "sha256:" + "d" * 64,
+            "bundle": {
+                "signed": True,
+                "artifactDigest": "sha256:" + "d" * 64,
+            },
+        }
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        release_cache.save(conflicting_handoff)
+    assert caught.value.code == "release_cache_conflict"
 
     activations = PostgresRuntimeActivationStore(dsn, tenant_id=tenant_id)
     activation_values = {

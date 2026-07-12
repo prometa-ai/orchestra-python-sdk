@@ -32,8 +32,9 @@ containerSecurityContext:
   capabilities:
     drop: ["ALL"]
 
-# The chart never creates this object. It must contain one immutable, signed
-# runtime-host config document. Set exactly one source.
+# The chart never creates this object. It must contain one immutable runtime-host
+# config document using either embedded signed artifacts or controlPlanePull.
+# Set exactly one Kubernetes object source.
 runtimeConfig:
   existingSecret: ""
   existingConfigMap: ""
@@ -48,6 +49,8 @@ credentials:
   apiTokenKey: api-token
   modelGatewayApiKeyKey: model-gateway-api-key
   modelGatewayApiKeyOptional: true
+  controlPlaneApiKeyKey: control-plane-api-key
+  controlPlaneApiKeyOptional: true
   receiptApiKeyKey: receipt-api-key
   receiptApiKeyOptional: true
 

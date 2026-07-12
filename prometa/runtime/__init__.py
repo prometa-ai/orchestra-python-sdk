@@ -6,7 +6,9 @@ remains dependency-free and telemetry-first, and no execution path calls the
 Orchestra control plane synchronously. Install
 ``prometa-sdk[runtime-postgres]`` only for the optional shared durability
 adapters, or ``prometa-sdk[runtime-host]`` for the first tenant-deployed
-model-only host and its PostgreSQL dependency.
+model-only host and its PostgreSQL dependency. Optional bootstrap pull may read
+one tenant-selected release handoff, but no tenant request execution path calls
+the Orchestra control plane.
 """
 
 from .trust import (
@@ -26,6 +28,12 @@ from .receipts import (
     RuntimeReceiptOutboxItem,
     RuntimeReceiptSubmissionError,
     build_runtime_receipt,
+)
+from .control_plane import (
+    RUNTIME_RELEASE_HANDOFF_VERSION,
+    RuntimeControlPlaneError,
+    RuntimeReleaseHandoff,
+    RuntimeControlPlaneClient,
 )
 from .admission import (
     RUNTIME_CONTRACT_VERSION,
@@ -90,6 +98,7 @@ from .postgres import (
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
+    PostgresRuntimeReleaseCache,
     PostgresRuntimeStateStore,
 )
 from .conformance import (
@@ -138,6 +147,10 @@ __all__ = [
     "RuntimeReceiptOutboxItem",
     "RuntimeReceiptSubmissionError",
     "build_runtime_receipt",
+    "RUNTIME_RELEASE_HANDOFF_VERSION",
+    "RuntimeControlPlaneError",
+    "RuntimeReleaseHandoff",
+    "RuntimeControlPlaneClient",
     "RUNTIME_CONTRACT_VERSION",
     "CAPABILITY_MODEL_INVOKE",
     "CAPABILITY_EVIDENCE_EMIT",
@@ -196,6 +209,7 @@ __all__ = [
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
+    "PostgresRuntimeReleaseCache",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
     "CONFORMANCE_COMMAND_PROTOCOL_VERSION",

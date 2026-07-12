@@ -2,8 +2,9 @@
 
 The host activates one signed release against a tenant PostgreSQL database,
 serves a bounded authenticated request API, and calls tenant-owned model and
-persistence planes. Optional lifecycle receipts use a durable asynchronous
-outbox; the Orchestra control plane is never in the request path.
+persistence planes. Optional bootstrap pull reads one tenant-selected handoff,
+and optional lifecycle receipts use a durable asynchronous outbox; the
+Orchestra control plane is never in the request path.
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ from .admission import (
     RuntimeAdmissionPolicy,
     activate_runtime_release,
 )
+from .control_plane import (
+    RuntimeControlPlaneClient,
+    RuntimeControlPlaneError,
+    RuntimeReleaseHandoff,
+)
 from .kernel import (
     EvidenceEmitter,
     RuntimeEvidenceEvent,
@@ -43,6 +49,7 @@ from .model_gateway import OpenAICompatibleModelAdapter
 from .postgres import (
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
+    PostgresRuntimeReleaseCache,
     PostgresRuntimeStateStore,
     RuntimePersistenceError,
 )
@@ -86,8 +93,8 @@ class RuntimeHostConfig:
     release_id: str
     deployment_id: str
     runtime_target: str
-    bundle: Mapping[str, Any]
-    promotion_attestation: Mapping[str, Any]
+    bundle: Optional[Mapping[str, Any]]
+    promotion_attestation: Optional[Mapping[str, Any]]
     bundle_trust_store: BundleTrustStore
     promotion_trust_store: BundleTrustStore
     model_gateway_base_url: str
@@ -99,6 +106,14 @@ class RuntimeHostConfig:
     api_token_env: str
     request_timeout_seconds: float
     max_request_bytes: int
+    control_plane_base_url: Optional[str] = None
+    control_plane_attestation_id: Optional[str] = None
+    control_plane_api_key_env: Optional[str] = None
+    control_plane_allow_insecure_http: bool = False
+    control_plane_timeout_seconds: float = 5.0
+    control_plane_max_response_bytes: int = 12 * 1024 * 1024
+    control_plane_max_clock_skew_seconds: int = 300
+    control_plane_max_cache_age_seconds: float = 300.0
     receipt_base_url: Optional[str] = None
     receipt_api_key_env: Optional[str] = None
     receipt_timeout_seconds: float = 5.0
@@ -209,8 +224,10 @@ def _boolean(name: str, value: Any) -> bool:
     return value
 
 
-def _receipt_base_url(value: Any, allow_insecure_http: bool) -> str:
-    candidate = _bounded_string("receipt_base_url", value, 2048)
+def _service_base_url(
+    name: str, value: Any, allow_insecure_http: bool
+) -> str:
+    candidate = _bounded_string("%s_base_url" % name, value, 2048)
     parsed = urllib.parse.urlsplit(candidate)
     if (
         parsed.scheme not in {"http", "https"}
@@ -220,9 +237,9 @@ def _receipt_base_url(value: Any, allow_insecure_http: bool) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise RuntimeHostError("invalid_receipt_base_url")
+        raise RuntimeHostError("invalid_%s_base_url" % name)
     if parsed.scheme != "https" and not allow_insecure_http:
-        raise RuntimeHostError("insecure_receipt_base_url")
+        raise RuntimeHostError("insecure_%s_base_url" % name)
     return candidate.rstrip("/")
 
 
@@ -292,8 +309,6 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "releaseId",
             "deploymentId",
             "runtimeTarget",
-            "bundle",
-            "promotionAttestation",
             "bundleTrust",
             "promotionTrust",
             "modelGateway",
@@ -303,12 +318,24 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "apiTokenEnv",
             "requestTimeoutSeconds",
             "maxRequestBytes",
+            "bundle",
+            "promotionAttestation",
+            "controlPlanePull",
             "receiptDelivery",
         ),
         code="host_config_invalid",
     )
     if document["configVersion"] != HOST_CONFIG_VERSION:
         raise RuntimeHostError("host_config_version_unsupported")
+    has_bundle = "bundle" in document
+    has_promotion = "promotionAttestation" in document
+    has_embedded_release = has_bundle and has_promotion
+    has_control_plane_pull = "controlPlanePull" in document
+    if (
+        has_bundle != has_promotion
+        or has_embedded_release == has_control_plane_pull
+    ):
+        raise RuntimeHostError("release_source_invalid")
     model = _mapping(document["modelGateway"], "model_gateway_config_invalid")
     _exact_keys(
         model,
@@ -319,6 +346,67 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
     api_key_env = model.get("apiKeyEnv")
     if api_key_env is not None:
         api_key_env = _environment_name("model_api_key_env", api_key_env)
+    control_plane_base_url = None
+    control_plane_attestation_id = None
+    control_plane_api_key_env = None
+    control_plane_allow_insecure_http = False
+    control_plane_timeout_seconds = 5.0
+    control_plane_max_response_bytes = 12 * 1024 * 1024
+    control_plane_max_clock_skew_seconds = 300
+    control_plane_max_cache_age_seconds = 300.0
+    if has_control_plane_pull:
+        control = _mapping(
+            document["controlPlanePull"], "control_plane_pull_config_invalid"
+        )
+        _exact_keys(
+            control,
+            required=("baseUrl", "attestationId", "apiKeyEnv"),
+            optional=(
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "maxResponseBytes",
+                "maxClockSkewSeconds",
+                "maxCacheAgeSeconds",
+            ),
+            code="control_plane_pull_config_invalid",
+        )
+        control_plane_allow_insecure_http = _boolean(
+            "control_plane_allow_insecure_http",
+            control.get("allowInsecureHttp", False),
+        )
+        control_plane_base_url = _service_base_url(
+            "control_plane",
+            control["baseUrl"],
+            control_plane_allow_insecure_http,
+        )
+        control_plane_attestation_id = _identifier(
+            "control_plane_attestation_id", control["attestationId"], 200
+        )
+        control_plane_api_key_env = _environment_name(
+            "control_plane_api_key_env", control["apiKeyEnv"]
+        )
+        control_plane_timeout_seconds = _positive_number(
+            "control_plane_timeout_seconds",
+            control.get("timeoutSeconds", 5),
+            60,
+        )
+        control_plane_max_response_bytes = _positive_integer(
+            "control_plane_max_response_bytes",
+            control.get("maxResponseBytes", 12 * 1024 * 1024),
+            16 * 1024 * 1024,
+        )
+        if control_plane_max_response_bytes < 1024:
+            raise RuntimeHostError("invalid_control_plane_max_response_bytes")
+        control_plane_max_clock_skew_seconds = _positive_integer(
+            "control_plane_max_clock_skew_seconds",
+            control.get("maxClockSkewSeconds", 300),
+            3600,
+        )
+        control_plane_max_cache_age_seconds = _positive_number(
+            "control_plane_max_cache_age_seconds",
+            control.get("maxCacheAgeSeconds", 300),
+            7 * 86_400,
+        )
     receipt_base_url = None
     receipt_api_key_env = None
     receipt_timeout_seconds = 5.0
@@ -347,8 +435,8 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "receipt_allow_insecure_http",
             receipt.get("allowInsecureHttp", False),
         )
-        receipt_base_url = _receipt_base_url(
-            receipt["baseUrl"], allow_insecure_http
+        receipt_base_url = _service_base_url(
+            "receipt", receipt["baseUrl"], allow_insecure_http
         )
         receipt_api_key_env = _environment_name(
             "receipt_api_key_env", receipt["apiKeyEnv"]
@@ -387,9 +475,17 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         release_id=_identifier("release_id", document["releaseId"]),
         deployment_id=_identifier("deployment_id", document["deploymentId"]),
         runtime_target=_identifier("runtime_target", document["runtimeTarget"]),
-        bundle=_mapping(document["bundle"], "bundle_config_invalid"),
-        promotion_attestation=_mapping(
-            document["promotionAttestation"], "promotion_config_invalid"
+        bundle=(
+            _mapping(document["bundle"], "bundle_config_invalid")
+            if has_embedded_release
+            else None
+        ),
+        promotion_attestation=(
+            _mapping(
+                document["promotionAttestation"], "promotion_config_invalid"
+            )
+            if has_embedded_release
+            else None
         ),
         bundle_trust_store=_parse_trust_store(
             document["bundleTrust"], "bundle_trust_invalid"
@@ -433,6 +529,18 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "max_request_bytes",
             document.get("maxRequestBytes", DEFAULT_MAX_REQUEST_BYTES),
             16 * 1024 * 1024,
+        ),
+        control_plane_base_url=control_plane_base_url,
+        control_plane_attestation_id=control_plane_attestation_id,
+        control_plane_api_key_env=control_plane_api_key_env,
+        control_plane_allow_insecure_http=control_plane_allow_insecure_http,
+        control_plane_timeout_seconds=control_plane_timeout_seconds,
+        control_plane_max_response_bytes=control_plane_max_response_bytes,
+        control_plane_max_clock_skew_seconds=(
+            control_plane_max_clock_skew_seconds
+        ),
+        control_plane_max_cache_age_seconds=(
+            control_plane_max_cache_age_seconds
         ),
         receipt_base_url=receipt_base_url,
         receipt_api_key_env=receipt_api_key_env,
@@ -532,6 +640,7 @@ class ReferenceRuntimeHost:
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         receipt_dispatcher: Optional[RuntimeReceiptDispatcher] = None,
+        release_source: str = "embedded",
     ) -> None:
         if not isinstance(api_token, str) or len(api_token.encode("utf-8")) < 32:
             raise RuntimeHostError("api_token_too_short")
@@ -548,6 +657,9 @@ class ReferenceRuntimeHost:
         self._inflight_condition = threading.Condition()
         self._closing = False
         self._receipt_dispatcher = receipt_dispatcher
+        if release_source not in {"embedded", "control_plane", "cache"}:
+            raise RuntimeHostError("release_source_invalid")
+        self.release_source = release_source
 
     def _authorized(self, headers: Mapping[str, str]) -> bool:
         value = headers.get("authorization", "")
@@ -682,6 +794,94 @@ def _lifecycle_receipt_id(
     return "runtime-%s-%s" % (transition, digest)
 
 
+@dataclass(frozen=True)
+class _ResolvedReleaseMaterial:
+    bundle: Mapping[str, Any]
+    promotion_attestation: Mapping[str, Any]
+    source: str
+    pulled_handoff: Optional[RuntimeReleaseHandoff] = None
+    cache: Optional[PostgresRuntimeReleaseCache] = None
+
+
+def _resolve_release_material(
+    config: RuntimeHostConfig,
+    *,
+    environment: Mapping[str, str],
+    dsn: str,
+    now: datetime,
+) -> _ResolvedReleaseMaterial:
+    if config.bundle is not None and config.promotion_attestation is not None:
+        return _ResolvedReleaseMaterial(
+            bundle=config.bundle,
+            promotion_attestation=config.promotion_attestation,
+            source="embedded",
+        )
+    if (
+        config.control_plane_base_url is None
+        or config.control_plane_attestation_id is None
+        or config.control_plane_api_key_env is None
+    ):
+        raise RuntimeHostError("release_source_invalid")
+    api_key = environment.get(config.control_plane_api_key_env, "")
+    if not api_key:
+        raise RuntimeHostError("control_plane_api_key_missing")
+    if len(api_key.encode("utf-8")) < 16:
+        raise RuntimeHostError("control_plane_api_key_too_short")
+
+    cache = PostgresRuntimeReleaseCache(dsn, tenant_id=config.tenant_id)
+    try:
+        client = RuntimeControlPlaneClient(
+            config.control_plane_base_url,
+            api_key,
+            timeout_seconds=config.control_plane_timeout_seconds,
+            max_response_bytes=config.control_plane_max_response_bytes,
+            max_clock_skew_seconds=(
+                config.control_plane_max_clock_skew_seconds
+            ),
+            allow_insecure_http=config.control_plane_allow_insecure_http,
+        )
+        handoff = client.fetch_release(
+            config.control_plane_attestation_id,
+            expected_release_id=config.release_id,
+            expected_deployment_id=config.deployment_id,
+            expected_environment=config.environment,
+            expected_runtime=config.runtime_target,
+            now=now,
+        )
+    except ValueError:
+        raise RuntimeHostError("control_plane_pull_config_invalid") from None
+    except RuntimeControlPlaneError as exc:
+        if not exc.retryable:
+            raise RuntimeHostError("control_plane_pull_rejected") from None
+        cached = cache.load(
+            config.control_plane_attestation_id,
+            max_age_seconds=config.control_plane_max_cache_age_seconds,
+            now=now,
+        )
+        if cached is None:
+            raise RuntimeHostError("control_plane_pull_unavailable") from None
+        if (
+            cached.release_id != config.release_id
+            or cached.deployment_id != config.deployment_id
+            or cached.target_environment != config.environment
+            or cached.runtime_target != config.runtime_target
+        ):
+            raise RuntimeHostError("control_plane_cache_binding_mismatch")
+        return _ResolvedReleaseMaterial(
+            bundle=cached.bundle,
+            promotion_attestation=cached.promotion_attestation,
+            source="cache",
+            cache=cache,
+        )
+    return _ResolvedReleaseMaterial(
+        bundle=handoff.bundle,
+        promotion_attestation=handoff.promotion_attestation,
+        source="control_plane",
+        pulled_handoff=handoff,
+        cache=cache,
+    )
+
+
 def build_reference_runtime_host(
     config: RuntimeHostConfig,
     *,
@@ -721,6 +921,13 @@ def build_reference_runtime_host(
         timeout_seconds=config.model_gateway_timeout_seconds,
         max_response_bytes=config.model_gateway_max_response_bytes,
     )
+    admission_now = now or datetime.now(timezone.utc)
+    material = _resolve_release_material(
+        config,
+        environment=env,
+        dsn=dsn,
+        now=admission_now,
+    )
     policy = RuntimeAdmissionPolicy(
         expected_org_id=config.org_id,
         expected_environment=config.environment,
@@ -729,10 +936,9 @@ def build_reference_runtime_host(
         expected_runtime=config.runtime_target,
         supported_capabilities=available_runtime_capabilities(),
     )
-    admission_now = now or datetime.now(timezone.utc)
     admitted, activation = activate_runtime_release(
-        config.bundle,
-        config.promotion_attestation,
+        material.bundle,
+        material.promotion_attestation,
         bundle_trust_store=config.bundle_trust_store,
         promotion_trust_store=config.promotion_trust_store,
         activation_store=PostgresRuntimeActivationStore(
@@ -743,6 +949,10 @@ def build_reference_runtime_host(
         policy=policy,
         now=admission_now,
     )
+    if material.pulled_handoff is not None:
+        if material.cache is None:
+            raise RuntimeHostError("control_plane_cache_unavailable")
+        material.cache.save(material.pulled_handoff)
     emitter = evidence_emitter or JsonLineEvidenceEmitter()
     receipt_outbox = None
     receipt_dispatcher = None
@@ -759,6 +969,7 @@ def build_reference_runtime_host(
             "prometa.runtime.target": config.runtime_target,
             "prometa.runtime.id": config.runtime_id,
             "prometa.runtime.version": config.runtime_version,
+            "prometa.release.source": material.source,
         }
 
         def receipt_status(outcome: str, details: Mapping[str, str]) -> None:
@@ -813,12 +1024,32 @@ def build_reference_runtime_host(
             runtime_id=config.runtime_id,
         ),
     )
+    emitter.emit(
+        RuntimeEvidenceEvent(
+            name="runtime.release.material",
+            outcome="verified",
+            occurred_at=datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            attributes={
+                "prometa.bundle.digest": admitted.artifact_digest,
+                "prometa.attestation.id": admitted.promotion.attestation_id,
+                "prometa.release.id": config.release_id,
+                "prometa.deployment.id": config.deployment_id,
+                "prometa.runtime.target": config.runtime_target,
+                "prometa.runtime.id": config.runtime_id,
+                "prometa.runtime.version": config.runtime_version,
+                "prometa.release.source": material.source,
+            },
+        )
+    )
     host = ReferenceRuntimeHost(
         kernel,
         api_token=api_token,
         request_timeout_seconds=config.request_timeout_seconds,
         max_request_bytes=config.max_request_bytes,
         receipt_dispatcher=receipt_dispatcher,
+        release_source=material.source,
     )
     if receipt_outbox is not None and receipt_dispatcher is not None:
         activation_at = activation.activated_at or admission_now
@@ -1016,6 +1247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "runtimeId": config.runtime_id,
                     "releaseId": config.release_id,
                     "deploymentId": config.deployment_id,
+                    "releaseSource": application.release_source,
                 },
                 separators=(",", ":"),
             ),

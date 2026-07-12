@@ -78,6 +78,12 @@ spec:
                   name: {{ .Values.credentials.existingSecret | quote }}
                   key: {{ .Values.credentials.receiptApiKeyKey | quote }}
                   optional: {{ .Values.credentials.receiptApiKeyOptional }}
+            - name: ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret | quote }}
+                  key: {{ .Values.credentials.controlPlaneApiKeyKey | quote }}
+                  optional: {{ .Values.credentials.controlPlaneApiKeyOptional }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -15,7 +15,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from .admission import RuntimeActivationResult
 from .control_plane import RuntimeReleaseHandoff
@@ -52,6 +52,60 @@ _RECEIPT_SEQUENCE = {
     "rolled_back": 60,
     "failed": 70,
     "stopped": 80,
+}
+RUNTIME_POSTGRES_SCHEMA_VERSION = 5
+_RUNTIME_TABLES = (
+    "prometa_runtime_schema_migrations",
+    "prometa_runtime_admission_replay",
+    "prometa_runtime_request_state",
+    "prometa_runtime_release_activation",
+    "prometa_runtime_bundle_identity",
+    "prometa_runtime_receipt_outbox",
+    "prometa_runtime_release_cache",
+    "prometa_runtime_task",
+    "prometa_runtime_task_event",
+)
+_TASK_TABLE_COLUMNS = {
+    "prometa_runtime_task": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "request_id",
+            "input_digest",
+            "artifact_digest",
+            "release_id",
+            "deployment_id",
+            "recoverable",
+            "max_attempts",
+            "status",
+            "attempt",
+            "sequence",
+            "claim_token",
+            "lease_expires_at",
+            "last_error_code",
+            "output_digest",
+            "model_name",
+            "model_attempts",
+            "tool_calls",
+            "used_fallback",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }
+    ),
+    "prometa_runtime_task_event": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "request_id",
+            "sequence",
+            "transition",
+            "status",
+            "attempt",
+            "reason",
+            "occurred_at",
+        }
+    ),
 }
 
 _SCHEMA_SQL = """
@@ -255,6 +309,23 @@ class RuntimeStateRecord:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class RuntimePostgresVerificationReport:
+    """Payload-free result of a tenant runtime restore integrity check."""
+
+    schema_version: int
+    migration_versions: Tuple[int, ...]
+    table_counts: Mapping[str, int]
+
+    def as_dict(self) -> Mapping[str, Any]:
+        return {
+            "integrity": "verified",
+            "schemaVersion": self.schema_version,
+            "migrationVersions": list(self.migration_versions),
+            "tableCounts": dict(self.table_counts),
+        }
+
+
 def _validate_identifier(
     name: str, value: str, max_length: int = _MAX_IDENTIFIER_LENGTH
 ) -> str:
@@ -374,6 +445,163 @@ def install_postgres_runtime_schema(
         raise
     except Exception:
         raise RuntimePersistenceError("runtime_schema_install_failed") from None
+
+
+def verify_postgres_runtime_integrity(
+    dsn: str,
+    *,
+    connect: Optional[Callable[[str], Any]] = None,
+) -> RuntimePostgresVerificationReport:
+    """Verify a restored runtime database without returning tenant data."""
+
+    if not isinstance(dsn, str) or not dsn.strip():
+        raise ValueError("dsn must be a non-empty string")
+    connector = connect or _default_connect
+    try:
+        with connector(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = ANY(%s)
+                    ORDER BY table_name
+                    """,
+                    (list(_RUNTIME_TABLES),),
+                )
+                present_tables = {str(row[0]) for row in cursor.fetchall()}
+                if present_tables != set(_RUNTIME_TABLES):
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = ANY(%s)
+                    ORDER BY table_name, ordinal_position
+                    """,
+                    (list(_TASK_TABLE_COLUMNS),),
+                )
+                columns = {
+                    table_name: set()
+                    for table_name in _TASK_TABLE_COLUMNS
+                }
+                for table_name, column_name in cursor.fetchall():
+                    columns[str(table_name)].add(str(column_name))
+                if any(
+                    columns[table_name] != expected
+                    for table_name, expected in _TASK_TABLE_COLUMNS.items()
+                ):
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT version
+                    FROM prometa_runtime_schema_migrations
+                    ORDER BY version
+                    """
+                )
+                versions = tuple(int(row[0]) for row in cursor.fetchall())
+                expected_versions = tuple(
+                    range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)
+                )
+                if versions != expected_versions:
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_task AS task
+                    LEFT JOIN LATERAL (
+                        SELECT COUNT(*) AS event_count,
+                               MAX(event.sequence) AS max_sequence
+                        FROM prometa_runtime_task_event AS event
+                        WHERE event.tenant_id = task.tenant_id
+                          AND event.runtime_id = task.runtime_id
+                          AND event.request_id = task.request_id
+                    ) AS history ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT event.status, event.attempt
+                        FROM prometa_runtime_task_event AS event
+                        WHERE event.tenant_id = task.tenant_id
+                          AND event.runtime_id = task.runtime_id
+                          AND event.request_id = task.request_id
+                        ORDER BY event.sequence DESC
+                        LIMIT 1
+                    ) AS latest ON TRUE
+                    WHERE history.event_count <> task.sequence
+                       OR history.max_sequence IS DISTINCT FROM task.sequence
+                       OR latest.status IS DISTINCT FROM task.status
+                       OR latest.attempt IS DISTINCT FROM task.attempt
+                       OR task.attempt > task.max_attempts
+                       OR task.input_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR task.artifact_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR (task.output_digest IS NOT NULL AND
+                           task.output_digest !~ '^sha256:[0-9a-f]{64}$')
+                       OR ((task.status = 'running') IS DISTINCT FROM
+                           (task.claim_token IS NOT NULL AND
+                            task.lease_expires_at IS NOT NULL))
+                       OR ((task.status = 'completed') IS DISTINCT FROM
+                           (task.output_digest IS NOT NULL AND
+                            task.model_name IS NOT NULL AND
+                            task.model_attempts IS NOT NULL AND
+                            task.tool_calls IS NOT NULL AND
+                            task.used_fallback IS NOT NULL))
+                       OR ((task.status IN ('completed', 'failed')) IS DISTINCT FROM
+                           (task.completed_at IS NOT NULL))
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM prometa_runtime_schema_migrations),
+                        (SELECT COUNT(*) FROM prometa_runtime_admission_replay),
+                        (SELECT COUNT(*) FROM prometa_runtime_request_state),
+                        (SELECT COUNT(*) FROM prometa_runtime_release_activation),
+                        (SELECT COUNT(*) FROM prometa_runtime_bundle_identity),
+                        (SELECT COUNT(*) FROM prometa_runtime_receipt_outbox),
+                        (SELECT COUNT(*) FROM prometa_runtime_release_cache),
+                        (SELECT COUNT(*) FROM prometa_runtime_task),
+                        (SELECT COUNT(*) FROM prometa_runtime_task_event)
+                    """
+                )
+                count_row = cursor.fetchone()
+                if count_row is None or len(count_row) != len(_RUNTIME_TABLES):
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+                counts = {
+                    table_name: int(count)
+                    for table_name, count in zip(_RUNTIME_TABLES, count_row)
+                }
+    except RuntimePersistenceError:
+        raise
+    except Exception:
+        raise RuntimePersistenceError(
+            "runtime_schema_verification_failed"
+        ) from None
+    return RuntimePostgresVerificationReport(
+        schema_version=RUNTIME_POSTGRES_SCHEMA_VERSION,
+        migration_versions=versions,
+        table_counts=counts,
+    )
 
 
 class _PostgresTenantStore:
@@ -1741,14 +1969,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+def verify_main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="prometa-runtime-postgres-verify",
+        description="Verify restored tenant-runtime PostgreSQL integrity.",
+    )
+    parser.add_argument(
+        "--dsn-env",
+        default="PROMETA_RUNTIME_DATABASE_URL",
+        help="Environment variable containing a libpq PostgreSQL DSN",
+    )
+    args = parser.parse_args(argv)
+    dsn = os.environ.get(args.dsn_env)
+    if not dsn:
+        parser.error("%s is not set" % args.dsn_env)
+    try:
+        report = verify_postgres_runtime_integrity(dsn)
+    except RuntimePersistenceError as exc:
+        parser.error(exc.code)
+    print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
 __all__ = [
+    "RUNTIME_POSTGRES_SCHEMA_VERSION",
     "RuntimePersistenceError",
+    "RuntimePostgresVerificationReport",
     "RuntimeStateRecord",
     "install_postgres_runtime_schema",
+    "verify_postgres_runtime_integrity",
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
@@ -1756,4 +2009,5 @@ __all__ = [
     "PostgresRuntimeTaskStore",
     "PostgresRuntimeStateStore",
     "main",
+    "verify_main",
 ]

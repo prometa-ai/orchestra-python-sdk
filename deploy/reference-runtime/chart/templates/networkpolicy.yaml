@@ -30,6 +30,34 @@ spec:
     {{- if and (not .Values.networkPolicy.allowDNS) (empty .Values.networkPolicy.egress) }} []
     {{- end }}
 {{- end }}
+{{- if and .Values.backup.enabled .Values.backup.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}-backup
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometa-runtime.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backup
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    {{- if .Values.backup.networkPolicy.allowDNS }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.backup.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- end }}
+    {{- with .Values.backup.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and (not .Values.backup.networkPolicy.allowDNS) (empty .Values.backup.networkPolicy.egress) }} []
+    {{- end }}
+{{- end }}
 {{- if and .Values.migration.enabled .Values.migration.networkPolicy.enabled }}
 ---
 # This temporary hook policy exists before the migration Job and is removed

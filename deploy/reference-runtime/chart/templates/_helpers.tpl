@@ -71,6 +71,26 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if and .Values.migration.enabled .Values.migration.networkPolicy.enabled (empty .Values.migration.networkPolicy.egress) -}}
 {{- fail "migration.networkPolicy.egress is required while its fail-closed policy is enabled" -}}
 {{- end -}}
+{{- if .Values.backup.enabled -}}
+{{- if not .Values.backup.acknowledgeSensitiveData -}}
+{{- fail "backup.acknowledgeSensitiveData must be true because runtime backups contain sensitive release and receipt data" -}}
+{{- end -}}
+{{- if or (empty .Values.backup.existingClaim) (empty .Values.backup.existingSecret) (empty .Values.backup.schedule) -}}
+{{- fail "enabled backup requires existingClaim, existingSecret, and schedule" -}}
+{{- end -}}
+{{- if or (empty .Values.backup.hostKey) (empty .Values.backup.portKey) (empty .Values.backup.databaseKey) (empty .Values.backup.usernameKey) (empty .Values.backup.passwordKey) -}}
+{{- fail "all backup database credential key names must be non-empty" -}}
+{{- end -}}
+{{- if or (lt (int .Values.backup.retentionDays) 1) (gt (int .Values.backup.retentionDays) 3650) -}}
+{{- fail "backup.retentionDays must be between 1 and 3650" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" .Values.backup.filenamePrefix) -}}
+{{- fail "backup.filenamePrefix must be a safe 1-64 character basename prefix" -}}
+{{- end -}}
+{{- if and .Values.backup.networkPolicy.enabled (empty .Values.backup.networkPolicy.egress) -}}
+{{- fail "backup.networkPolicy.egress is required while its fail-closed policy is enabled" -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.networkPolicy.enabled (empty .Values.networkPolicy.egress) -}}
 {{- fail "networkPolicy.egress must explicitly allow the runtime database and model gateway" -}}
 {{- end -}}

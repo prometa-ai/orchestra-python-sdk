@@ -24,6 +24,25 @@ services:
         condition: service_healthy
     restart: "no"
 
+  backup:
+    profiles: ["operations"]
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "/operations/backup-postgres.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: runtime
+      PGPASSWORD: ${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}
+      PGDATABASE: runtime
+      PROMETA_RUNTIME_BACKUP_FILE: ${PROMETA_RUNTIME_BACKUP_FILE:-/backups/runtime.dump}
+    volumes:
+      - ./operations:/operations:ro
+      - runtime-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   runtime:
     image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.0}
     restart: unless-stopped
@@ -44,3 +63,4 @@ services:
 
 volumes:
   runtime-postgres:
+  runtime-backups:

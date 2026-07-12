@@ -1,0 +1,109 @@
+{{- include "prometa-runtime.validateValues" . }}
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}-backup
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: {{ .Values.backup.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "prometa-runtime.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          serviceAccountName: {{ include "prometa-runtime.serviceAccountName" . }}
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
+          containers:
+            - name: postgres-backup
+              image: {{ printf "%s:%s" .Values.backup.image.repository .Values.backup.image.tag | quote }}
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.backup.containerSecurityContext | nindent 16 }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  umask 077
+                  archive="/backups/{{ .Values.backup.filenamePrefix }}-$(date -u +%Y%m%dT%H%M%SZ).dump"
+                  temporary="${archive}.partial"
+                  checksum_temporary="${archive}.sha256.partial"
+                  cleanup() { rm -f "$temporary" "$checksum_temporary"; }
+                  trap cleanup EXIT HUP INT TERM
+                  test ! -e "$archive"
+                  test ! -e "${archive}.sha256"
+                  pg_dump --format=custom --no-owner --no-privileges --file "$temporary"
+                  pg_restore --list "$temporary" >/dev/null
+                  digest=$(sha256sum "$temporary" | awk '{print $1}')
+                  printf '%s  %s\n' "$digest" "$(basename "$archive")" >"$checksum_temporary"
+                  chmod 600 "$temporary" "$checksum_temporary"
+                  mv "$temporary" "$archive"
+                  temporary=
+                  mv "$checksum_temporary" "${archive}.sha256"
+                  checksum_temporary=
+                  find /backups -maxdepth 1 -type f \
+                    -name '{{ .Values.backup.filenamePrefix }}-*.dump' \
+                    -mtime +{{ .Values.backup.retentionDays }} -print | \
+                    while IFS= read -r expired; do
+                      rm -f "$expired" "${expired}.sha256"
+                    done
+                  trap - EXIT HUP INT TERM
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: PGCONNECT_TIMEOUT
+                  value: "10"
+                - name: PGHOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.existingSecret | quote }}
+                      key: {{ .Values.backup.hostKey | quote }}
+                - name: PGPORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.existingSecret | quote }}
+                      key: {{ .Values.backup.portKey | quote }}
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.existingSecret | quote }}
+                      key: {{ .Values.backup.databaseKey | quote }}
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.existingSecret | quote }}
+                      key: {{ .Values.backup.usernameKey | quote }}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.existingSecret | quote }}
+                      key: {{ .Values.backup.passwordKey | quote }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.existingClaim | quote }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+{{- end }}

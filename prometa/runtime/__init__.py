@@ -103,9 +103,12 @@ from .kernel import (
 )
 from .model_gateway import OpenAICompatibleModelAdapter
 from .postgres import (
+    RUNTIME_POSTGRES_SCHEMA_VERSION,
     RuntimePersistenceError,
+    RuntimePostgresVerificationReport,
     RuntimeStateRecord,
     install_postgres_runtime_schema,
+    verify_postgres_runtime_integrity,
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
@@ -224,9 +227,12 @@ __all__ = [
     "available_runtime_capabilities",
     "RuntimeKernel",
     "OpenAICompatibleModelAdapter",
+    "RUNTIME_POSTGRES_SCHEMA_VERSION",
     "RuntimePersistenceError",
+    "RuntimePostgresVerificationReport",
     "RuntimeStateRecord",
     "install_postgres_runtime_schema",
+    "verify_postgres_runtime_integrity",
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",

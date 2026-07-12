@@ -1,4 +1,6 @@
 import re
+import stat
+import subprocess
 from pathlib import Path
 
 
@@ -56,3 +58,58 @@ def test_runtime_examples_enable_bounded_payload_free_task_recovery():
         assert '"leaseSeconds": 90' in document
         assert '"maxAttempts": 3' in document
         assert '"historyLimit": 50' in document
+
+
+def test_runtime_backup_restore_assets_are_fail_closed_and_secret_safe():
+    root = ROOT / "deploy/reference-runtime"
+    backup_path = root / "operations/backup-postgres.sh"
+    restore_path = root / "operations/restore-postgres.sh"
+    backup = backup_path.read_text(encoding="utf-8")
+    restore = restore_path.read_text(encoding="utf-8")
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+
+    assert backup_path.stat().st_mode & stat.S_IXUSR
+    assert restore_path.stat().st_mode & stat.S_IXUSR
+    assert "PROMETA_RUNTIME_DATABASE_URL" not in backup + restore
+    assert "PGPASSWORD" not in backup + restore
+    assert "umask 077" in backup
+    assert "pg_restore --list" in backup
+    assert "backup basename contains unsupported characters" in backup
+    assert "restore-tenant-runtime" in restore
+    assert "target database is not empty" in restore
+    assert "restore checksum mismatch" in restore
+    assert "restore basename contains unsupported characters" in restore
+    assert 'profiles: ["operations"]' in compose
+    assert "runtime-backups:/backups" in compose
+
+    denied = subprocess.run(
+        [str(restore_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={},
+    )
+    assert denied.returncode == 2
+    assert "PROMETA_RUNTIME_RESTORE_FILE is required" in denied.stderr
+
+
+def test_runtime_chart_backup_is_optional_external_and_fail_closed():
+    chart = ROOT / "deploy/reference-runtime/chart"
+    values = (chart / "values.yaml").read_text(encoding="utf-8")
+    helpers = (chart / "templates/_helpers.tpl").read_text(encoding="utf-8")
+    cronjob = (chart / "templates/backup-cronjob.yaml").read_text(
+        encoding="utf-8"
+    )
+    policy = (chart / "templates/networkpolicy.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "backup:\n  enabled: false" in values
+    assert "acknowledgeSensitiveData: false" in values
+    assert "backup.acknowledgeSensitiveData must be true" in helpers
+    assert "backup.networkPolicy.egress is required" in helpers
+    assert "kind: CronJob" in cronjob
+    assert "persistentVolumeClaim:" in cronjob
+    assert ".Values.backup.existingSecret" in cronjob
+    assert "kind: Secret" not in cronjob
+    assert "app.kubernetes.io/component: backup" in policy

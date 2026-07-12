@@ -4,10 +4,11 @@ This image is an optional tenant-plane host for the Phase 2A kernel. It is not
 part of the Prometa control plane and does not make a synchronous control-plane
 call while serving requests.
 
-The first host slice supports signed, promoted, model-only `single-react`
-bundles through a generic OpenAI-compatible model gateway. Concrete MCP, HITL,
-memory, A2A, rollout automation, and production certification remain later
-work.
+The host supports signed, promoted, model-only `single-react` bundles through a
+generic OpenAI-compatible model gateway. Optional payload-free task recovery
+coordinates retries across replicas. Concrete MCP, resumable HITL, stored
+payload replay, memory, A2A, rollout automation, and production certification
+remain later work.
 
 ## Build and conformance
 
@@ -86,6 +87,27 @@ that tenant-side cache only within `maxCacheAgeSeconds` and the signed offline
 lease. Terminal 4xx, revocation, binding, or signature failures fail closed.
 The control plane is never called while a runtime request is being served.
 
+To enable lifecycle contract v1, add this optional block. The lease must be
+strictly longer than `requestTimeoutSeconds`:
+
+```json
+{
+  "taskRecovery": {
+    "leaseSeconds": 90,
+    "maxAttempts": 3,
+    "historyLimit": 50
+  }
+}
+```
+
+The host then uses `prometa_runtime_task` for atomic cross-replica claims and
+`prometa_runtime_task_event` for ordered transitions. Both are payload-free:
+only canonical input/output digests, immutable release identity, model
+metadata, stable error codes, attempts, leases, and timestamps are retained.
+PostgreSQL's transaction clock is authoritative for production lease expiry.
+The serving role needs `SELECT, INSERT, UPDATE` on the task table and
+`SELECT, INSERT` on the event table.
+
 Install the database schema with a migration identity before starting the
 lower-privilege host:
 
@@ -145,16 +167,20 @@ only when the corresponding path is configured. For external services use a
 tightly scoped `ipBlock` or a CNI-supported FQDN policy; Kubernetes
 NetworkPolicy does not natively express DNS names.
 
-Enabling the HPA or multiple replicas does not add distributed request locking,
-exactly-once execution, or resumable task state. PostgreSQL activation and
-state sharing remain the implemented durability boundary. Test install,
-upgrade, rollback, database outage, and termination behavior in the tenant's
-actual CNI and ingress topology before production certification.
+Enabling the HPA or multiple replicas does not by itself add distributed
+request locking. Configure `taskRecovery` to enable the shipped lease and
+lifecycle ledger. Even then, model invocation is at-least-once and recovery is
+caller-driven; the host does not persist request/output bodies or resume an
+HITL/tool checkpoint. Test install, upgrade, rollback, database outage, and
+termination behavior in the tenant's actual CNI and ingress topology before
+production certification.
 
 ## Request API
 
 - `GET /healthz`: process liveness;
 - `GET /readyz`: payload-free readiness;
+- `GET /v1/runtime/tasks/{requestId}`: authenticated payload-free lifecycle
+  projection when task recovery is configured;
 - `POST /v1/runtime/execute`: bearer-authenticated execution.
 
 ```json
@@ -165,9 +191,19 @@ actual CNI and ingress topology before production certification.
 ```
 
 Requests are strict JSON, bounded by `maxRequestBytes`, schema-validated before
-model invocation, and subject to a host timeout. Duplicate request IDs are
-rejected while one replica is processing them. This slice does not claim
-cross-replica exactly-once execution or resumable task/HITL state.
+model invocation, and subject to a host timeout. Without `taskRecovery`,
+duplicate request IDs are rejected only inside one replica. With it, one active
+lease wins across replicas; retryable failures can be retried immediately and
+orphaned work can be reclaimed after lease expiry. The caller must resubmit the
+same request ID and exact input digest. Completed tasks return
+`task_already_completed`; the lifecycle endpoint reports completion metadata
+but never replays the response body.
+
+This is cross-replica coordination and lifecycle replay, not exactly-once
+inference. A process can fail after a model call and before the completion
+commit, so a recovered attempt may call the model again. Side-effecting tools,
+automatic background replay, encrypted payload/result retention, and resumable
+HITL checkpoints are not part of lifecycle v1.
 
 ## Activation semantics
 

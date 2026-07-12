@@ -17,12 +17,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   control-plane outages.
 - Optional `controlPlanePull` host configuration plus Helm/Compose secret wiring
   for tenant CI/CD-selected attestation IDs.
+- Runtime task lifecycle contract v1 with canonical payload digests, bounded
+  exclusive leases, retry/expired-orphan reclaim, immutable task identity,
+  monotonic transition history, and an in-memory contract implementation.
+- PostgreSQL v5 task and event tables plus an optional reference-host
+  `taskRecovery` mode for cross-replica coordination and authenticated
+  `GET /v1/runtime/tasks/{requestId}` lifecycle projection.
 
 ### Security
 
 - Pull mode requires HTTPS by default, never sends its API key through a
   redirect, never falls back after terminal authorization or binding failures,
   and never contacts the control plane while serving tenant requests.
+- Task recovery fails closed on datastore outage, active lease, changed input
+  or release identity, stale ownership, exhausted attempts, and unsupported
+  side-effecting tools. Task storage, status responses, and claim evidence omit
+  request bodies, response bodies, prompts, outputs, keys, and credentials.
 
 ## [0.18.0] - 2026-07-12
 

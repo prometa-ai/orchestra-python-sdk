@@ -35,6 +35,17 @@ from .control_plane import (
     RuntimeReleaseHandoff,
     RuntimeControlPlaneClient,
 )
+from .tasks import (
+    RUNTIME_TASK_LIFECYCLE_VERSION,
+    RuntimeTaskError,
+    RuntimeTaskClaim,
+    RuntimeTaskEvent,
+    RuntimeTaskRecord,
+    RuntimeTaskSnapshot,
+    RuntimeTaskStore,
+    InMemoryRuntimeTaskStore,
+    canonical_payload_digest,
+)
 from .admission import (
     RUNTIME_CONTRACT_VERSION,
     CAPABILITY_MODEL_INVOKE,
@@ -99,6 +110,7 @@ from .postgres import (
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
+    PostgresRuntimeTaskStore,
     PostgresRuntimeStateStore,
 )
 from .conformance import (
@@ -151,6 +163,15 @@ __all__ = [
     "RuntimeControlPlaneError",
     "RuntimeReleaseHandoff",
     "RuntimeControlPlaneClient",
+    "RUNTIME_TASK_LIFECYCLE_VERSION",
+    "RuntimeTaskError",
+    "RuntimeTaskClaim",
+    "RuntimeTaskEvent",
+    "RuntimeTaskRecord",
+    "RuntimeTaskSnapshot",
+    "RuntimeTaskStore",
+    "InMemoryRuntimeTaskStore",
+    "canonical_payload_digest",
     "RUNTIME_CONTRACT_VERSION",
     "CAPABILITY_MODEL_INVOKE",
     "CAPABILITY_EVIDENCE_EMIT",
@@ -210,6 +231,7 @@ __all__ = [
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
     "PostgresRuntimeReleaseCache",
+    "PostgresRuntimeTaskStore",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
     "CONFORMANCE_COMMAND_PROTOCOL_VERSION",

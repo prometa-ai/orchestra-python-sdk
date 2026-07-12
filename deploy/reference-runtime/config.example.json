@@ -40,5 +40,10 @@
   "databaseDsnEnv": "PROMETA_RUNTIME_DATABASE_URL",
   "apiTokenEnv": "PROMETA_RUNTIME_API_TOKEN",
   "requestTimeoutSeconds": 60,
-  "maxRequestBytes": 1048576
+  "maxRequestBytes": 1048576,
+  "taskRecovery": {
+    "leaseSeconds": 90,
+    "maxAttempts": 3,
+    "historyLimit": 50
+  }
 }

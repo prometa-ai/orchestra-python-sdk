@@ -5,6 +5,7 @@ Service: {{ include "prometa-runtime.fullname" . }}:{{ .Values.service.port }}
 Health:  /healthz
 Ready:   /readyz
 Execute: /v1/runtime/execute
+Tasks:   /v1/runtime/tasks/{requestId} (when taskRecovery is configured)
 
 The chart references, but never creates, the runtime config and credential
 objects. NetworkPolicy is fail-closed by default. Verify that your values allow

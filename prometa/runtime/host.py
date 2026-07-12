@@ -51,12 +51,21 @@ from .postgres import (
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
     PostgresRuntimeStateStore,
+    PostgresRuntimeTaskStore,
     RuntimePersistenceError,
 )
 from .receipts import (
     RuntimeReceiptClient,
     RuntimeReceiptDispatcher,
     build_runtime_receipt,
+)
+from .tasks import (
+    RUNTIME_TASK_LIFECYCLE_VERSION,
+    RuntimeTaskClaim,
+    RuntimeTaskError,
+    RuntimeTaskSnapshot,
+    RuntimeTaskStore,
+    canonical_payload_digest,
 )
 from .trust import BundleTrustEntry, BundleTrustStore, BundleVerificationError
 
@@ -121,6 +130,10 @@ class RuntimeHostConfig:
     receipt_lease_seconds: float = 30.0
     receipt_initial_backoff_seconds: float = 1.0
     receipt_max_backoff_seconds: float = 300.0
+    task_recovery_enabled: bool = False
+    task_recovery_lease_seconds: float = 90.0
+    task_recovery_max_attempts: int = 3
+    task_recovery_history_limit: int = 50
 
 
 @dataclass(frozen=True)
@@ -322,6 +335,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "promotionAttestation",
             "controlPlanePull",
             "receiptDelivery",
+            "taskRecovery",
         ),
         code="host_config_invalid",
     )
@@ -346,6 +360,16 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
     api_key_env = model.get("apiKeyEnv")
     if api_key_env is not None:
         api_key_env = _environment_name("model_api_key_env", api_key_env)
+    request_timeout_seconds = _positive_number(
+        "request_timeout_seconds",
+        document.get("requestTimeoutSeconds", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+        600,
+    )
+    max_request_bytes = _positive_integer(
+        "max_request_bytes",
+        document.get("maxRequestBytes", DEFAULT_MAX_REQUEST_BYTES),
+        16 * 1024 * 1024,
+    )
     control_plane_base_url = None
     control_plane_attestation_id = None
     control_plane_api_key_env = None
@@ -407,6 +431,37 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             control.get("maxCacheAgeSeconds", 300),
             7 * 86_400,
         )
+    task_recovery_enabled = "taskRecovery" in document
+    task_recovery_lease_seconds = max(60.0, request_timeout_seconds + 30.0)
+    task_recovery_max_attempts = 3
+    task_recovery_history_limit = 50
+    if task_recovery_enabled:
+        task_recovery = _mapping(
+            document["taskRecovery"], "task_recovery_config_invalid"
+        )
+        _exact_keys(
+            task_recovery,
+            required=(),
+            optional=("leaseSeconds", "maxAttempts", "historyLimit"),
+            code="task_recovery_config_invalid",
+        )
+        task_recovery_lease_seconds = _positive_number(
+            "task_recovery_lease_seconds",
+            task_recovery.get("leaseSeconds", task_recovery_lease_seconds),
+            3600,
+        )
+        task_recovery_max_attempts = _positive_integer(
+            "task_recovery_max_attempts",
+            task_recovery.get("maxAttempts", 3),
+            20,
+        )
+        task_recovery_history_limit = _positive_integer(
+            "task_recovery_history_limit",
+            task_recovery.get("historyLimit", 50),
+            100,
+        )
+        if task_recovery_lease_seconds <= request_timeout_seconds:
+            raise RuntimeHostError("task_recovery_lease_too_short")
     receipt_base_url = None
     receipt_api_key_env = None
     receipt_timeout_seconds = 5.0
@@ -520,16 +575,8 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "api_token_env",
             document.get("apiTokenEnv", "PROMETA_RUNTIME_API_TOKEN"),
         ),
-        request_timeout_seconds=_positive_number(
-            "request_timeout_seconds",
-            document.get("requestTimeoutSeconds", DEFAULT_REQUEST_TIMEOUT_SECONDS),
-            600,
-        ),
-        max_request_bytes=_positive_integer(
-            "max_request_bytes",
-            document.get("maxRequestBytes", DEFAULT_MAX_REQUEST_BYTES),
-            16 * 1024 * 1024,
-        ),
+        request_timeout_seconds=request_timeout_seconds,
+        max_request_bytes=max_request_bytes,
         control_plane_base_url=control_plane_base_url,
         control_plane_attestation_id=control_plane_attestation_id,
         control_plane_api_key_env=control_plane_api_key_env,
@@ -549,6 +596,10 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         receipt_lease_seconds=receipt_lease_seconds,
         receipt_initial_backoff_seconds=receipt_initial_backoff_seconds,
         receipt_max_backoff_seconds=receipt_max_backoff_seconds,
+        task_recovery_enabled=task_recovery_enabled,
+        task_recovery_lease_seconds=task_recovery_lease_seconds,
+        task_recovery_max_attempts=task_recovery_max_attempts,
+        task_recovery_history_limit=task_recovery_history_limit,
     )
 
 
@@ -641,6 +692,10 @@ class ReferenceRuntimeHost:
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         receipt_dispatcher: Optional[RuntimeReceiptDispatcher] = None,
         release_source: str = "embedded",
+        task_store: Optional[RuntimeTaskStore] = None,
+        task_lease_seconds: float = 90.0,
+        task_max_attempts: int = 3,
+        task_history_limit: int = 50,
     ) -> None:
         if not isinstance(api_token, str) or len(api_token.encode("utf-8")) < 32:
             raise RuntimeHostError("api_token_too_short")
@@ -652,7 +707,6 @@ class ReferenceRuntimeHost:
         self.max_request_bytes = _positive_integer(
             "max_request_bytes", max_request_bytes, 16 * 1024 * 1024
         )
-        self._runner = _KernelLoop(kernel)
         self._inflight = set()
         self._inflight_condition = threading.Condition()
         self._closing = False
@@ -660,6 +714,23 @@ class ReferenceRuntimeHost:
         if release_source not in {"embedded", "control_plane", "cache"}:
             raise RuntimeHostError("release_source_invalid")
         self.release_source = release_source
+        self._task_store = task_store
+        self.task_recovery_enabled = task_store is not None
+        self.task_lease_seconds = _positive_number(
+            "task_lease_seconds", task_lease_seconds, 3600
+        )
+        self.task_max_attempts = _positive_integer(
+            "task_max_attempts", task_max_attempts, 20
+        )
+        self.task_history_limit = _positive_integer(
+            "task_history_limit", task_history_limit, 100
+        )
+        if self.task_recovery_enabled:
+            if kernel.admission.config.tools:
+                raise RuntimeHostError("task_recovery_side_effects_unsupported")
+            if self.task_lease_seconds <= self.request_timeout_seconds:
+                raise RuntimeHostError("task_recovery_lease_too_short")
+        self._runner = _KernelLoop(kernel)
 
     def _authorized(self, headers: Mapping[str, str]) -> bool:
         value = headers.get("authorization", "")
@@ -676,6 +747,136 @@ class ReferenceRuntimeHost:
     def _readiness(self) -> RuntimeHostResponse:
         return RuntimeHostResponse(status=200, body={"status": "ready"})
 
+    @staticmethod
+    def _iso(value: Optional[datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        return (
+            value.astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    @classmethod
+    def _task_error(cls, error: Exception) -> RuntimeHostResponse:
+        code = getattr(error, "code", "task_store_unavailable")
+        if code == "task_payload_too_large":
+            return cls._error(413, code)
+        if code == "task_payload_not_json":
+            return cls._error(422, code)
+        conflicts = {
+            "task_identity_conflict",
+            "task_in_progress",
+            "task_already_completed",
+            "task_terminal",
+            "task_recovery_blocked",
+            "task_attempts_exhausted",
+            "task_lease_lost",
+        }
+        return cls._error(409 if code in conflicts else 503, code)
+
+    @classmethod
+    def _task_snapshot(cls, snapshot: RuntimeTaskSnapshot) -> RuntimeHostResponse:
+        record = snapshot.record
+        lifecycle = []
+        for event in snapshot.events:
+            item = {
+                "sequence": event.sequence,
+                "transition": event.transition,
+                "status": event.status,
+                "attempt": event.attempt,
+                "occurredAt": cls._iso(event.occurred_at),
+            }
+            if event.reason is not None:
+                item["reason"] = event.reason
+            lifecycle.append(item)
+        return RuntimeHostResponse(
+            status=200,
+            body={
+                "taskLifecycleVersion": RUNTIME_TASK_LIFECYCLE_VERSION,
+                "requestId": record.request_id,
+                "artifactDigest": record.artifact_digest,
+                "releaseId": record.release_id,
+                "deploymentId": record.deployment_id,
+                "status": record.status,
+                "attempt": record.attempt,
+                "maxAttempts": record.max_attempts,
+                "recoverable": record.recoverable,
+                "sequence": record.sequence,
+                "leaseExpiresAt": cls._iso(record.lease_expires_at),
+                "lastErrorCode": record.last_error_code,
+                "outputDigest": record.output_digest,
+                "modelName": record.model_name,
+                "modelAttempts": record.model_attempts,
+                "toolCalls": record.tool_calls,
+                "usedFallback": record.used_fallback,
+                "createdAt": cls._iso(record.created_at),
+                "updatedAt": cls._iso(record.updated_at),
+                "completedAt": cls._iso(record.completed_at),
+                "historyTruncated": snapshot.history_truncated,
+                "lifecycle": lifecycle,
+            },
+        )
+
+    def _task_status(self, encoded_request_id: str) -> RuntimeHostResponse:
+        if self._task_store is None:
+            return self._error(404, "not_found")
+        try:
+            request_id = _identifier(
+                "request_id",
+                urllib.parse.unquote(encoded_request_id, errors="strict"),
+                256,
+            )
+        except (RuntimeHostError, UnicodeError):
+            return self._error(400, "invalid_request_id")
+        try:
+            snapshot = self._task_store.get(
+                request_id, history_limit=self.task_history_limit
+            )
+        except (RuntimePersistenceError, RuntimeTaskError) as exc:
+            return self._task_error(exc)
+        except Exception:
+            return self._error(503, "task_store_unavailable")
+        if snapshot is None:
+            return self._error(404, "task_not_found")
+        return self._task_snapshot(snapshot)
+
+    def _claim_task(self, request_id: str, payload: Any) -> Optional[RuntimeTaskClaim]:
+        if self._task_store is None:
+            return None
+        promotion = self.kernel.admission.promotion.claims
+        return self._task_store.claim(
+            request_id,
+            input_digest=canonical_payload_digest(payload),
+            artifact_digest=self.kernel.admission.artifact_digest,
+            release_id=promotion["releaseId"],
+            deployment_id=promotion["deploymentId"],
+            recoverable=True,
+            max_attempts=self.task_max_attempts,
+            lease_seconds=self.task_lease_seconds,
+        )
+
+    def _record_task_failure(
+        self,
+        claim: Optional[RuntimeTaskClaim],
+        *,
+        reason: str,
+        retryable: bool,
+    ) -> Optional[RuntimeHostResponse]:
+        if claim is None or self._task_store is None:
+            return None
+        try:
+            self._task_store.fail(
+                claim,
+                reason=reason,
+                retryable=retryable,
+            )
+        except (RuntimePersistenceError, RuntimeTaskError) as exc:
+            return self._task_error(exc)
+        except Exception:
+            return self._error(503, "task_store_unavailable")
+        return None
+
     def handle(
         self,
         method: str,
@@ -690,6 +891,13 @@ class ReferenceRuntimeHost:
             return RuntimeHostResponse(status=200, body={"status": "ok"})
         if method == "GET" and path == "/readyz":
             return self._readiness()
+        task_prefix = "/v1/runtime/tasks/"
+        if path.startswith(task_prefix):
+            if method != "GET":
+                return self._error(405, "method_not_allowed")
+            if not self._authorized(normalized_headers):
+                return self._error(401, "unauthorized")
+            return self._task_status(path[len(task_prefix) :])
         if path != "/v1/runtime/execute":
             return self._error(404, "not_found")
         if method != "POST":
@@ -719,18 +927,32 @@ class ReferenceRuntimeHost:
             if request_id in self._inflight:
                 return self._error(409, "request_in_progress")
             self._inflight.add(request_id)
+        claim: Optional[RuntimeTaskClaim] = None
+        result: Optional[RuntimeExecutionResult] = None
+        failure: Optional[RuntimeHostResponse] = None
+        failure_code: Optional[str] = None
+        failure_retryable = False
         try:
+            claim = self._claim_task(request_id, request["input"])
+            if claim is not None:
+                self.kernel.emit_task_claim(claim)
             result = self._runner.execute(
                 request["input"], request_id, self.request_timeout_seconds
             )
+        except (RuntimePersistenceError, RuntimeTaskError) as exc:
+            failure = self._task_error(exc)
+            failure_code = exc.code
         except RuntimeHostError as exc:
             status = 504 if exc.code == "runtime_request_timeout" else 503
-            return self._error(status, exc.code)
+            failure = self._error(status, exc.code)
+            failure_code = exc.code
+            failure_retryable = True
         except RuntimeExecutionError as exc:
             if exc.code in {"input_schema_invalid", "request_payload_not_json"}:
                 status = 422
             elif exc.retryable or exc.code in {
                 "state_store_failed",
+                "evidence_emit_failed",
                 "gateway_unavailable",
                 "model_transport_failed",
                 "circuit_open",
@@ -738,13 +960,52 @@ class ReferenceRuntimeHost:
                 status = 503
             else:
                 status = 500
-            return self._error(status, exc.code)
+            failure = self._error(status, exc.code)
+            failure_code = exc.code
+            failure_retryable = status == 503
         except Exception:
-            return self._error(500, "runtime_internal_error")
+            failure = self._error(500, "runtime_internal_error")
+            failure_code = "runtime_internal_error"
+            failure_retryable = True
         finally:
             with self._inflight_condition:
                 self._inflight.discard(request_id)
                 self._inflight_condition.notify_all()
+        if failure is not None:
+            if claim is not None and failure_code is not None:
+                task_failure = self._record_task_failure(
+                    claim,
+                    reason=failure_code,
+                    retryable=failure_retryable,
+                )
+                if task_failure is not None:
+                    return task_failure
+            return failure
+        if result is None:
+            return self._error(500, "runtime_internal_error")
+        if claim is not None and self._task_store is not None:
+            try:
+                output_digest = canonical_payload_digest(result.output)
+            except RuntimeTaskError as exc:
+                task_failure = self._record_task_failure(
+                    claim,
+                    reason=exc.code,
+                    retryable=False,
+                )
+                return task_failure or self._error(500, exc.code)
+            try:
+                self._task_store.complete(
+                    claim,
+                    output_digest=output_digest,
+                    model_name=result.model_name,
+                    model_attempts=result.attempts,
+                    tool_calls=result.tool_calls,
+                    used_fallback=result.used_fallback,
+                )
+            except (RuntimePersistenceError, RuntimeTaskError) as exc:
+                return self._task_error(exc)
+            except Exception:
+                return self._error(503, "task_store_unavailable")
         return RuntimeHostResponse(
             status=200,
             body={
@@ -1050,6 +1311,18 @@ def build_reference_runtime_host(
         max_request_bytes=config.max_request_bytes,
         receipt_dispatcher=receipt_dispatcher,
         release_source=material.source,
+        task_store=(
+            PostgresRuntimeTaskStore(
+                dsn,
+                tenant_id=config.tenant_id,
+                runtime_id=config.runtime_id,
+            )
+            if config.task_recovery_enabled
+            else None
+        ),
+        task_lease_seconds=config.task_recovery_lease_seconds,
+        task_max_attempts=config.task_recovery_max_attempts,
+        task_history_limit=config.task_recovery_history_limit,
     )
     if receipt_outbox is not None and receipt_dispatcher is not None:
         activation_at = activation.activated_at or admission_now
@@ -1140,13 +1413,19 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         headers = dict(self.headers.items())
         body = b""
         response = None
-        if self.command == "POST" and path == "/v1/runtime/execute":
+        protected_request = (
+            self.command == "POST" and path == "/v1/runtime/execute"
+        ) or (
+            self.command == "GET"
+            and path.startswith("/v1/runtime/tasks/")
+        )
+        if protected_request:
             authorizations = self.headers.get_all("authorization", [])
             if len(authorizations) != 1 or not self.server.application._authorized(
                 {"authorization": authorizations[0] if authorizations else ""}
             ):
                 response = ReferenceRuntimeHost._error(401, "unauthorized")
-            else:
+            elif self.command == "POST":
                 body, response = self._body()
         if response is None:
             response = self.server.application.handle(
@@ -1248,6 +1527,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "releaseId": config.release_id,
                     "deploymentId": config.deployment_id,
                     "releaseSource": application.release_source,
+                    "taskRecovery": application.task_recovery_enabled,
                 },
                 separators=(",", ":"),
             ),

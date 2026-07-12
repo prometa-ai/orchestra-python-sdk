@@ -216,9 +216,9 @@ separate. The platform stays outside the synchronous request path; the model
 gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
 and emergency stop are tenant-owned. The first reference host is model-only and
 tenant-deployed. The shipped increment does not include a production MCP
-transport adapter, durable HITL task workflow, memory, compression, A2A,
-rollout automation, topology-specific load/chaos proof, or production
-certification.
+transport adapter, stored-payload or automatic task replay, resumable HITL
+checkpoints, memory, compression, A2A, rollout automation, topology-specific
+load/chaos proof, or production certification.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -254,7 +254,9 @@ resolve to the same database schema/search path. The serving role needs
 delivery is configured, it also needs `SELECT, INSERT, UPDATE` on
 `prometa_runtime_receipt_outbox`; it does not need DDL privileges.
 Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
-`prometa_runtime_release_cache`.
+`prometa_runtime_release_cache`. Hosts with `taskRecovery` also need
+`SELECT, INSERT, UPDATE` on `prometa_runtime_task` and `SELECT, INSERT` on
+`prometa_runtime_task_event`.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -267,6 +269,7 @@ import os
 from prometa.runtime import (
     PostgresAdmissionReplayStore,
     PostgresRuntimeStateStore,
+    PostgresRuntimeTaskStore,
     install_postgres_runtime_schema,
 )
 
@@ -281,6 +284,11 @@ state_store = PostgresRuntimeStateStore(
     tenant_id="org_example",
     runtime_id="tenant-runtime-01",
 )
+task_store = PostgresRuntimeTaskStore(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+    runtime_id="tenant-runtime-01",
+)
 ```
 
 Pass `replay_store` to `admit_runtime_release()` and `state_store` to
@@ -290,7 +298,10 @@ runtime IDs cannot make the same authorization reusable. Request state is
 tenant/runtime scoped and versioned, with `load()` and `delete()` available for
 replica handoff and retention. State writes are atomic last-write-wins
 snapshots; they are not an exactly-once request lock or a resumable HITL
-workflow.
+workflow. `PostgresRuntimeTaskStore` is a separate lifecycle v1 contract: it
+atomically leases one request attempt across replicas, binds retries to the
+same input/release/deployment identity, appends ordered payload-free events,
+and permits bounded reclaim after an expired safe lease.
 
 #### Reference tenant runtime host
 
@@ -310,14 +321,17 @@ different artifact digest fails closed. The host then serves:
 
 - `GET /healthz` for liveness;
 - `GET /readyz` for payload-free readiness;
+- `GET /v1/runtime/tasks/{requestId}` for authenticated payload-free lifecycle
+  replay when `taskRecovery` is configured;
 - `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
 
 The request endpoint calls only the tenant model gateway and tenant state
 store. It validates schemas before model invocation, rejects duplicate
 in-flight IDs within a replica, returns stable payload-free errors, and shuts
-down its persistent kernel event loop gracefully. It does not claim
-cross-replica exactly-once request execution, TLS termination, distributed rate
-limiting, or overload fairness.
+down its persistent kernel event loop gracefully. Optional `taskRecovery`
+extends duplicate rejection across replicas and records ordered lifecycle
+metadata. It does not claim exactly-once model invocation, TLS termination,
+distributed rate limiting, or overload fairness.
 
 Optional `receiptDelivery` configuration adds durable asynchronous `admitted`
 and `active` lifecycle evidence. The host commits receipts to its PostgreSQL
@@ -337,6 +351,38 @@ may use that cache, and only within `maxCacheAgeSeconds` and the signed offline
 lease. Revocation, authorization, binding, or signature failures never fall
 back. Changing the attestation ID still requires tenant CI/CD to update the
 mounted config and roll the workload; this is not a hot-reload controller.
+
+Optional `taskRecovery` configuration enables lifecycle contract v1 for the
+model-only host:
+
+```json
+{
+  "taskRecovery": {
+    "leaseSeconds": 90,
+    "maxAttempts": 3,
+    "historyLimit": 50
+  }
+}
+```
+
+The lease must be longer than `requestTimeoutSeconds`. Before model invocation,
+the host atomically claims `(tenant, runtime, requestId)` and binds it to the
+canonical input digest plus artifact, release, deployment, recovery policy, and
+attempt ceiling. An active claim returns `task_in_progress`; changed input or
+release identity returns `task_identity_conflict`. Retryable failures become
+immediately reclaimable, while a process-killed `running` attempt becomes
+reclaimable only after its lease expires. PostgreSQL's transaction clock, not a
+replica clock, governs production lease decisions. Every reclaim increments the
+host attempt and every transition gets a monotonic sequence.
+
+The task tables and status API contain digests, model metadata, stable error
+codes, timestamps, and transitions only. They do not store request or response
+bodies, credentials, prompts, or model output. Recovery is therefore
+client-driven: the caller resubmits semantically identical finite JSON input
+with the same request ID.
+Model invocation is at-least-once, and a completed task reports conflict rather
+than replaying its response body. Automatic replay, encrypted result retention,
+side-effecting tools, and resumable HITL checkpoints require later contracts.
 
 The non-root container, Compose example, tenant-owned Helm chart, strict
 configuration shape, and operator commands live in

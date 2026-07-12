@@ -39,6 +39,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Deployment recovery tests that kill a real host during inference, cut and
   restore its database path, and restore a logical archive into a fresh
   PostgreSQL database before replaying task history.
+- A checksum-pinned K3d/K3s kube-router topology profile and CI gate with two
+  tenants, two replicas per tenant on distinct nodes, real Helm hooks,
+  concurrent load, one-winner duplicate claims, database-egress partition and
+  recovery, pod replacement, activation joins, and payload-free task survival.
 
 ### Security
 
@@ -57,6 +61,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   require a fresh attestation, release/deployment identity, and immutable config
   revision. The target image rejects a database schema outside its declared
   compatibility range before activation.
+- The topology gate proves exact gateway-label ingress, same-namespace rogue
+  denial, cross-tenant ingress and dependency-egress denial, and pre-model
+  failure during database partition. Its report omits fixture payloads,
+  signatures, tokens, passwords, and model output and remains explicitly
+  reference-profile evidence rather than production certification.
 
 ## [0.18.0] - 2026-07-12
 

@@ -1,0 +1,30 @@
+{
+  "contractVersion": 1,
+  "profiles": [
+    {
+      "name": "k3d-k3s-kube-router-v1",
+      "evidenceStatus": "reference-profile-not-production-certification",
+      "networkPolicyController": "k3s-kube-router",
+      "runtimeVersion": "0.18.0",
+      "chartVersion": "0.3.0",
+      "k3dVersion": "v5.8.3",
+      "k3dChecksums": {
+        "darwin-amd64": "fd0f8e9e8ea4d8bc3674572ca6ed0833b639bf57c43c708616d937377324cfea",
+        "darwin-arm64": "8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0698",
+        "linux-amd64": "dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e",
+        "linux-arm64": "0b8110f2229631af7402fb828259330985918b08fefd38b7f1b788a1c8687216"
+      },
+      "k3sImage": "rancher/k3s:v1.34.8-k3s1",
+      "k3sImageDigest": "sha256:8f2019c4a443f02fb6aecd4b8e605402535c52be6588ea4b9ee52e1f5851ad72",
+      "postgresImage": "postgres:16.13-alpine",
+      "postgresImageDigest": "sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50",
+      "postgresNodeImage": "prometa-topology-postgres:16.13-alpine",
+      "serverNodes": 1,
+      "agentNodes": 1,
+      "tenantCount": 2,
+      "runtimeReplicasPerTenant": 2,
+      "uniqueLoadRequestsPerTenant": 24,
+      "duplicateAttemptsPerTenant": 12
+    }
+  ]
+}

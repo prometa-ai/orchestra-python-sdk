@@ -274,6 +274,51 @@ immutable activation rows and zero synchronous control-plane calls. Because the
 baseline was not a separately published artifact, this is not release-channel,
 Kubernetes CNI, managed-database, or production certification.
 
+## K3s kube-router topology certification profile
+
+The repository also runs one pinned, repeatable tenant-cluster reference
+profile. It is intentionally narrower than production certification:
+
+- K3d `v5.8.3` with K3s `v1.34.8+k3s1` and its embedded kube-router
+  NetworkPolicy controller;
+- one server plus one agent node;
+- two isolated tenant topologies with two runtime replicas each;
+- the real chart migration and target-image compatibility hooks;
+- restricted pod security for runtime, gateway, and model fixtures;
+- authorized gateway ingress, same-namespace pod-label denial, cross-tenant
+  ingress denial, and own-dependency versus cross-tenant egress checks;
+- 24 unique concurrent requests per tenant and 12 simultaneous duplicate
+  attempts, with exactly one winner and one model invocation;
+- a live database-egress partition that fails before model invocation, leaves
+  the other tenant healthy, and recovers after policy restoration; and
+- a runtime-pod replacement that joins the existing activation, serves load,
+  preserves two-node spread, and retains prior payload-free task status.
+
+Run it from the repository root with Docker, Helm, kubectl, and Python already
+available:
+
+```bash
+deploy/reference-runtime/ci/install-k3d.sh .tmp/k3d
+K3D="$PWD/.tmp/k3d" \
+  PROMETA_RUNTIME_TOPOLOGY_REPORT=runtime-topology-certification.json \
+  deploy/reference-runtime/ci/topology-certification.sh
+```
+
+[`topology-profiles.json`](topology-profiles.json) pins the K3d binary
+checksums, runtime/chart versions, and upstream K3s/PostgreSQL image digests.
+The harness refuses version drift, verifies the upstream PostgreSQL digest,
+then normalizes it to a single-platform local image so Docker Desktop and Linux
+runners import the same OCI content into every K3s node. It verifies both
+imported images on every node before applying any workload.
+
+The resulting report contains profile/version identifiers, counts, and boolean
+checks only. Ephemeral bundle signatures, API tokens, database credentials,
+request bodies, and model outputs are never retained in the report. The
+profile makes no claim about OpenShift, managed Kubernetes CNIs, managed
+PostgreSQL failover/PITR, production ingress/TLS, autoscaling, overload
+fairness, storage durability, air-gap installation, or a tenant-specific
+RPO/RTO. Those environments still require their own certification evidence.
+
 ## Request API
 
 - `GET /healthz`: process liveness;

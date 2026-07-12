@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- A bootstrap-only outbound runtime release handoff client using the new
+  `runtime:read` platform scope, strict bounded responses, redirect refusal,
+  complete release binding checks, and unchanged local cryptographic admission.
+- A tenant-scoped PostgreSQL last-known-good release cache with immutable
+  attestation identity, bounded freshness, and host fallback only for retryable
+  control-plane outages.
+- Optional `controlPlanePull` host configuration plus Helm/Compose secret wiring
+  for tenant CI/CD-selected attestation IDs.
+
+### Security
+
+- Pull mode requires HTTPS by default, never sends its API key through a
+  redirect, never falls back after terminal authorization or binding failures,
+  and never contacts the control plane while serving tenant requests.
+
 ## [0.18.0] - 2026-07-12
 
 ### Added

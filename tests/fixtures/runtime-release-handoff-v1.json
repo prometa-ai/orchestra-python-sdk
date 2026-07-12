@@ -1,0 +1,27 @@
+{
+  "handoffVersion": 1,
+  "attestationId": "attestation-1",
+  "artifactId": "artifact-1",
+  "artifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "releaseId": "release-1",
+  "deploymentId": "deployment-1",
+  "targetEnvironment": "prod",
+  "runtimeTarget": "tenant-runtime",
+  "checkedAt": "2026-07-12T08:00:00.000Z",
+  "bundle": {
+    "signed": true,
+    "artifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "signedPayload": "{}"
+  },
+  "promotionAttestation": {
+    "signed": true,
+    "attestationId": "attestation-1",
+    "attestationVersion": 1,
+    "algorithm": "ed25519",
+    "canonicalization": "signed-payload-json-v1",
+    "issuer": "prometa-platform/promotion",
+    "keyId": "promotion-key-1",
+    "signedPayload": "{}",
+    "signature": "signature"
+  }
+}

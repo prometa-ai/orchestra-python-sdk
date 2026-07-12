@@ -413,6 +413,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert config.database_dsn_env == "PROMETA_RUNTIME_DATABASE_URL"
     assert config.api_token_env == "PROMETA_RUNTIME_API_TOKEN"
     assert config.receipt_base_url is None
+    assert config.control_plane_base_url is None
 
     invalid = _config_document()
     invalid["unknown"] = True
@@ -447,6 +448,43 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     )
     assert receipt_config.receipt_timeout_seconds == 3
     assert receipt_config.receipt_lease_seconds == 10
+
+    pulled = _config_document()
+    pulled.pop("bundle")
+    pulled.pop("promotionAttestation")
+    pulled["controlPlanePull"] = {
+        "baseUrl": "https://orchestra.example.test",
+        "attestationId": "runtime-kernel-attestation-v1",
+        "apiKeyEnv": "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY",
+        "timeoutSeconds": 4,
+        "maxResponseBytes": 2 * 1024 * 1024,
+        "maxClockSkewSeconds": 120,
+        "maxCacheAgeSeconds": 600,
+    }
+    path.write_text(json.dumps(pulled), encoding="utf-8")
+    pull_config = load_runtime_host_config(path)
+    assert pull_config.bundle is None
+    assert pull_config.promotion_attestation is None
+    assert pull_config.control_plane_base_url == "https://orchestra.example.test"
+    assert (
+        pull_config.control_plane_api_key_env
+        == "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY"
+    )
+    assert pull_config.control_plane_max_cache_age_seconds == 600
+    assert pull_config.control_plane_max_clock_skew_seconds == 120
+
+    invalid_source = _config_document()
+    invalid_source["controlPlanePull"] = pulled["controlPlanePull"]
+    path.write_text(json.dumps(invalid_source), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "release_source_invalid"
+
+    pulled["controlPlanePull"]["baseUrl"] = "http://orchestra.example.test"
+    path.write_text(json.dumps(pulled), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "insecure_control_plane_base_url"
 
     configured["receiptDelivery"]["baseUrl"] = "http://orchestra.example.test"
     path.write_text(json.dumps(configured), encoding="utf-8")
@@ -680,6 +718,215 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
         receipt_server.shutdown()
         receipt_server.server_close()
         receipt_thread.join(timeout=2)
+        gateway.shutdown()
+        gateway.server_close()
+        gateway_thread.join(timeout=2)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_reference_host_pulls_and_uses_bounded_cache_when_platform_is_down() -> None:
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    vector = _vector()
+    verification = vector["verification"]
+    promotion_claims = json.loads(vector["attestation"]["signedPayload"])
+
+    class GatewayHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return None
+
+        def do_POST(self):
+            length = int(self.headers["content-length"])
+            self.rfile.read(length)
+            response = json.dumps(
+                {
+                    "model": "golden-model",
+                    "choices": [
+                        {
+                            "message": {"content": vector["sampleOutput"]},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    gateway = ThreadingHTTPServer(("127.0.0.1", 0), GatewayHandler)
+    gateway_thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+    gateway_thread.start()
+    pulls = []
+    control_status = {"value": 200}
+
+    class ControlPlaneHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return None
+
+        def do_GET(self):
+            pulls.append((self.path, self.headers.get("x-api-key")))
+            if control_status["value"] != 200:
+                response = json.dumps(
+                    {
+                        "error": "Promotion attestation has been revoked",
+                        "code": "release_revoked",
+                    }
+                ).encode("utf-8")
+                self.send_response(control_status["value"])
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+                return
+            handoff = {
+                "handoffVersion": 1,
+                "attestationId": vector["attestation"]["attestationId"],
+                "artifactId": promotion_claims["artifactId"],
+                "artifactDigest": vector["bundle"]["artifactDigest"],
+                "releaseId": verification["expectedReleaseId"],
+                "deploymentId": verification["expectedDeploymentId"],
+                "targetEnvironment": verification["expectedEnvironment"],
+                "runtimeTarget": verification["expectedRuntime"],
+                "checkedAt": verification["now"],
+                "bundle": vector["bundle"],
+                "promotionAttestation": vector["attestation"],
+            }
+            response = json.dumps(handoff).encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    control = ThreadingHTTPServer(("127.0.0.1", 0), ControlPlaneHandler)
+    control_thread = threading.Thread(target=control.serve_forever, daemon=True)
+    control_thread.start()
+    control_closed = False
+    config = RuntimeHostConfig(
+        tenant_id="host-pull-%s" % uuid.uuid4().hex,
+        runtime_id="runtime-host-pull",
+        runtime_version="0.18.0",
+        org_id=verification["expectedOrgId"],
+        environment=verification["expectedEnvironment"],
+        release_id=verification["expectedReleaseId"],
+        deployment_id=verification["expectedDeploymentId"],
+        runtime_target=verification["expectedRuntime"],
+        bundle=None,
+        promotion_attestation=None,
+        bundle_trust_store=_trust(vector["bundleTrust"]),
+        promotion_trust_store=_trust(vector["promotionTrust"]),
+        model_gateway_base_url="http://127.0.0.1:%d" % gateway.server_address[1],
+        model_gateway_api_key_env=None,
+        model_gateway_endpoint_path="/v1/chat/completions",
+        model_gateway_timeout_seconds=2,
+        model_gateway_max_response_bytes=1024 * 1024,
+        database_dsn_env="RUNTIME_DSN",
+        api_token_env="RUNTIME_TOKEN",
+        request_timeout_seconds=3,
+        max_request_bytes=1024,
+        control_plane_base_url="http://127.0.0.1:%d"
+        % control.server_address[1],
+        control_plane_attestation_id=vector["attestation"]["attestationId"],
+        control_plane_api_key_env="CONTROL_PLANE_KEY",
+        control_plane_allow_insecure_http=True,
+        control_plane_timeout_seconds=0.2,
+        control_plane_max_response_bytes=1024 * 1024,
+        control_plane_max_clock_skew_seconds=60,
+        control_plane_max_cache_age_seconds=60,
+    )
+    environment = {
+        "RUNTIME_DSN": dsn,
+        "RUNTIME_TOKEN": API_TOKEN,
+        "CONTROL_PLANE_KEY": "runtime-read-key-0123456789abcdef",
+    }
+    first = second = None
+    try:
+        with pytest.raises(RuntimeHostError) as caught:
+            build_reference_runtime_host(
+                config,
+                environment={
+                    "RUNTIME_DSN": dsn,
+                    "RUNTIME_TOKEN": API_TOKEN,
+                },
+                now=_instant(verification["now"]),
+            )
+        assert caught.value.code == "control_plane_api_key_missing"
+
+        first_evidence = InMemoryEvidenceEmitter()
+        first, created = build_reference_runtime_host(
+            config,
+            environment=environment,
+            evidence_emitter=first_evidence,
+            now=_instant(verification["now"]),
+        )
+        assert created is True
+        assert first.release_source == "control_plane"
+        assert pulls == [
+            (
+                "/api/runtime-releases/%s"
+                % vector["attestation"]["attestationId"],
+                "runtime-read-key-0123456789abcdef",
+            )
+        ]
+        assert _execute(
+            first,
+            {"requestId": "request-pulled", "input": vector["sampleInput"]},
+        ).status == 200
+        assert any(
+            event.attributes["prometa.release.source"] == "control_plane"
+            for event in first_evidence.events
+            if event.name == "runtime.release.material"
+        )
+        first.close()
+        first = None
+
+        control_status["value"] = 409
+        with pytest.raises(RuntimeHostError) as caught:
+            build_reference_runtime_host(
+                config,
+                environment=environment,
+                evidence_emitter=InMemoryEvidenceEmitter(),
+                now=_instant(verification["now"]),
+            )
+        assert caught.value.code == "control_plane_pull_rejected"
+
+        control.shutdown()
+        control.server_close()
+        control_thread.join(timeout=2)
+        control_closed = True
+
+        second_evidence = InMemoryEvidenceEmitter()
+        second, joined = build_reference_runtime_host(
+            config,
+            environment=environment,
+            evidence_emitter=second_evidence,
+            now=_instant(verification["now"]),
+        )
+        assert joined is False
+        assert second.release_source == "cache"
+        assert _execute(
+            second,
+            {"requestId": "request-cached", "input": vector["sampleInput"]},
+        ).status == 200
+        assert any(
+            event.attributes["prometa.release.source"] == "cache"
+            for event in second_evidence.events
+            if event.name == "runtime.release.material"
+        )
+    finally:
+        if first is not None:
+            first.close()
+        if second is not None:
+            second.close()
+        if not control_closed:
+            control.shutdown()
+            control.server_close()
+            control_thread.join(timeout=2)
         gateway.shutdown()
         gateway.server_close()
         gateway_thread.join(timeout=2)

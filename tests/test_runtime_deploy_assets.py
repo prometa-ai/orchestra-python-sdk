@@ -43,3 +43,5 @@ def test_runtime_chart_references_external_sensitive_objects():
     assert "credentials.existingSecret" in rendered_sources
     assert "readOnlyRootFilesystem: true" in values
     assert "automountServiceAccountToken: false" in values
+    assert "controlPlaneApiKeyKey: control-plane-api-key" in values
+    assert "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" in rendered_sources

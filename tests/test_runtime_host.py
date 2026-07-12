@@ -7,6 +7,7 @@ import io
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -411,6 +412,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert config.model_gateway_api_key_env == "MODEL_GATEWAY_API_KEY"
     assert config.database_dsn_env == "PROMETA_RUNTIME_DATABASE_URL"
     assert config.api_token_env == "PROMETA_RUNTIME_API_TOKEN"
+    assert config.receipt_base_url is None
 
     invalid = _config_document()
     invalid["unknown"] = True
@@ -425,6 +427,39 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     with pytest.raises(RuntimeHostError) as caught:
         load_runtime_host_config(path)
     assert caught.value.code == "invalid_api_token_env"
+
+    configured = _config_document()
+    configured["receiptDelivery"] = {
+        "baseUrl": "https://orchestra.example.test/control",
+        "apiKeyEnv": "ORCHESTRA_RUNTIME_RECEIPT_API_KEY",
+        "timeoutSeconds": 3,
+        "pollIntervalSeconds": 1,
+        "leaseSeconds": 10,
+        "initialBackoffSeconds": 2,
+        "maxBackoffSeconds": 20,
+    }
+    path.write_text(json.dumps(configured), encoding="utf-8")
+    receipt_config = load_runtime_host_config(path)
+    assert receipt_config.receipt_base_url == "https://orchestra.example.test/control"
+    assert (
+        receipt_config.receipt_api_key_env
+        == "ORCHESTRA_RUNTIME_RECEIPT_API_KEY"
+    )
+    assert receipt_config.receipt_timeout_seconds == 3
+    assert receipt_config.receipt_lease_seconds == 10
+
+    configured["receiptDelivery"]["baseUrl"] = "http://orchestra.example.test"
+    path.write_text(json.dumps(configured), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "insecure_receipt_base_url"
+
+    configured["receiptDelivery"]["allowInsecureHttp"] = True
+    configured["receiptDelivery"]["leaseSeconds"] = 2
+    path.write_text(json.dumps(configured), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "receipt_lease_too_short"
 
     path.write_text('{"configVersion":1,"configVersion":1}', encoding="utf-8")
     with pytest.raises(RuntimeHostError) as caught:
@@ -510,6 +545,36 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
     gateway = ThreadingHTTPServer(("127.0.0.1", 0), GatewayHandler)
     gateway_thread = threading.Thread(target=gateway.serve_forever, daemon=True)
     gateway_thread.start()
+    received_receipts = []
+    receipt_entered = threading.Event()
+    release_receipts = threading.Event()
+
+    class ReceiptHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return None
+
+        def do_POST(self):
+            assert self.path == "/api/runtime-receipts"
+            assert self.headers["x-api-key"] == "runtime-receipt-key"
+            length = int(self.headers["content-length"])
+            receipt = json.loads(self.rfile.read(length))
+            received_receipts.append(receipt)
+            receipt_entered.set()
+            assert release_receipts.wait(timeout=3)
+            response = json.dumps(
+                {"receiptId": receipt["receiptId"], "status": "recorded"}
+            ).encode("utf-8")
+            self.send_response(201)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    receipt_server = ThreadingHTTPServer(("127.0.0.1", 0), ReceiptHandler)
+    receipt_thread = threading.Thread(
+        target=receipt_server.serve_forever, daemon=True
+    )
+    receipt_thread.start()
     verification = vector["verification"]
     config = RuntimeHostConfig(
         tenant_id="host-test-%s" % uuid.uuid4().hex,
@@ -533,40 +598,88 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
         api_token_env="RUNTIME_TOKEN",
         request_timeout_seconds=3,
         max_request_bytes=1024,
+        receipt_base_url="http://127.0.0.1:%d" % receipt_server.server_address[1],
+        receipt_api_key_env="RUNTIME_RECEIPT_KEY",
+        receipt_timeout_seconds=2,
+        receipt_poll_interval_seconds=0.01,
+        receipt_lease_seconds=5,
+        receipt_initial_backoff_seconds=0.01,
+        receipt_max_backoff_seconds=0.1,
     )
-    environment = {"RUNTIME_DSN": dsn, "RUNTIME_TOKEN": API_TOKEN}
+    environment = {
+        "RUNTIME_DSN": dsn,
+        "RUNTIME_TOKEN": API_TOKEN,
+        "RUNTIME_RECEIPT_KEY": "runtime-receipt-key",
+    }
     first = second = None
+    first_evidence = InMemoryEvidenceEmitter()
     try:
+        with pytest.raises(RuntimeHostError) as caught:
+            build_reference_runtime_host(
+                config,
+                environment={
+                    "RUNTIME_DSN": dsn,
+                    "RUNTIME_TOKEN": API_TOKEN,
+                },
+                evidence_emitter=InMemoryEvidenceEmitter(),
+                now=_instant(verification["now"]),
+            )
+        assert caught.value.code == "receipt_api_key_missing"
+
         first, created = build_reference_runtime_host(
             config,
             environment=environment,
-            evidence_emitter=InMemoryEvidenceEmitter(),
+            evidence_emitter=first_evidence,
             now=_instant(verification["now"]),
         )
+        assert created is True
+        assert receipt_entered.wait(timeout=2)
+        first_response = _execute(
+            first,
+            {"requestId": "request-first", "input": vector["sampleInput"]},
+        )
+        assert first_response.status == 200
+        release_receipts.set()
+        deadline = time.monotonic() + 3
+        while len(received_receipts) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [item["transition"] for item in received_receipts] == [
+            "admitted",
+            "active",
+        ]
+        assert len({item["receiptId"] for item in received_receipts}) == 2
+
         second, joined_created = build_reference_runtime_host(
             config,
             environment=environment,
             evidence_emitter=InMemoryEvidenceEmitter(),
             now=_instant(verification["now"]),
         )
-        assert created is True
         assert joined_created is False
-        first_response = _execute(
-            first,
-            {"requestId": "request-first", "input": vector["sampleInput"]},
-        )
         second_response = _execute(
             second,
             {"requestId": "request-second", "input": vector["sampleInput"]},
         )
-        assert first_response.status == 200
         assert second_response.status == 200
         assert first_response.body["output"] == vector["sampleOutput"]
+        time.sleep(0.1)
+        assert len(received_receipts) == 2
+        delivery_events = [
+            event
+            for event in first_evidence.events
+            if event.name == "runtime.receipt.delivery"
+        ]
+        assert {event.outcome for event in delivery_events} == {"delivered"}
+        assert "runtime-receipt-key" not in repr(delivery_events)
     finally:
+        release_receipts.set()
         if first is not None:
             first.close()
         if second is not None:
             second.close()
+        receipt_server.shutdown()
+        receipt_server.server_close()
+        receipt_thread.join(timeout=2)
         gateway.shutdown()
         gateway.server_close()
         gateway_thread.join(timeout=2)

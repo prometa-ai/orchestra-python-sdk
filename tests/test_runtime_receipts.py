@@ -10,7 +10,9 @@ import pytest
 
 from prometa.runtime import (
     RuntimeReceiptClient,
+    RuntimeReceiptDispatcher,
     RuntimeReceiptError,
+    RuntimeReceiptOutboxItem,
     RuntimeReceiptSubmissionError,
     build_runtime_receipt,
 )
@@ -84,7 +86,9 @@ class _Response:
     def __exit__(self, *_args):
         return None
 
-    def read(self):
+    def read(self, *_args):
+        if isinstance(self._value, bytes):
+            return self._value
         return json.dumps(self._value).encode("utf-8")
 
     def close(self):
@@ -128,3 +132,107 @@ def test_client_surfaces_http_status_without_exposing_the_key(monkeypatch) -> No
         client.submit(_receipt())
     assert caught.value.status == 403
     assert "secret-key" not in str(caught.value)
+
+
+def test_client_rejects_invalid_or_oversized_acknowledgements(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(
+            {"receiptId": "different", "status": "recorded"}
+        ),
+    )
+    client = RuntimeReceiptClient("https://orchestra.example.test", "secret-key")
+    with pytest.raises(RuntimeReceiptSubmissionError, match="acknowledgement"):
+        client.submit(_receipt())
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(b"x" * (64 * 1024 + 1)),
+    )
+    with pytest.raises(RuntimeReceiptSubmissionError, match="too large"):
+        client.submit(_receipt())
+
+
+class _Outbox:
+    def __init__(self):
+        self.item = RuntimeReceiptOutboxItem(
+            receipt_id="receipt-1",
+            receipt=_receipt(),
+            attempts=1,
+            lease_token="lease-1",
+        )
+        self.delivered = []
+        self.rescheduled = []
+        self.dead_letters = []
+
+    def claim_next(self, lease_seconds):
+        assert lease_seconds == 30
+        item, self.item = self.item, None
+        return item
+
+    def mark_delivered(self, item):
+        self.delivered.append(item)
+
+    def reschedule(self, item, *, delay_seconds, error_code):
+        self.rescheduled.append((item, delay_seconds, error_code))
+
+    def mark_dead_letter(self, item, *, error_code):
+        self.dead_letters.append((item, error_code))
+
+
+class _Client:
+    def __init__(self, error=None):
+        self.error = error
+        self.receipts = []
+
+    def submit(self, receipt):
+        self.receipts.append(receipt)
+        if self.error is not None:
+            raise self.error
+        return {"receiptId": receipt["receiptId"], "status": "recorded"}
+
+
+def test_dispatcher_delivers_and_reports_sanitized_status() -> None:
+    outbox = _Outbox()
+    statuses = []
+    dispatcher = RuntimeReceiptDispatcher(
+        outbox,
+        _Client(),
+        on_status=lambda outcome, details: statuses.append((outcome, details)),
+    )
+    assert dispatcher.dispatch_once() is True
+    assert len(outbox.delivered) == 1
+    assert statuses == [
+        (
+            "delivered",
+            {"receiptId": "receipt-1", "transition": "admitted"},
+        )
+    ]
+    assert dispatcher.dispatch_once() is False
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(None, "retry"), (429, "retry"), (503, "retry"), (403, "dead_letter")],
+)
+def test_dispatcher_classifies_failures_without_persisting_error_bodies(
+    status, expected
+) -> None:
+    outbox = _Outbox()
+    error = RuntimeReceiptSubmissionError(
+        status, "remote body contains secret-key and tenant payload"
+    )
+    dispatcher = RuntimeReceiptDispatcher(outbox, _Client(error))
+    assert dispatcher.dispatch_once() is True
+    if expected == "retry":
+        assert outbox.rescheduled[0][1:] == (
+            1.0,
+            "transport" if status is None else "http_%d" % status,
+        )
+        assert outbox.dead_letters == []
+    else:
+        assert outbox.dead_letters[0][1] == "http_403"
+        assert outbox.rescheduled == []
+    persisted = repr((outbox.rescheduled, outbox.dead_letters))
+    assert "secret-key" not in persisted
+    assert "tenant payload" not in persisted

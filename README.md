@@ -248,8 +248,9 @@ resolve to the same database schema/search path. The serving role needs
 `SELECT, INSERT` on `prometa_runtime_admission_replay`,
 `SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_request_state`, and
 `SELECT, INSERT, UPDATE` on `prometa_runtime_release_activation`, plus
-`SELECT, INSERT` on `prometa_runtime_bundle_identity`; it does not need DDL
-privileges.
+`SELECT, INSERT` on `prometa_runtime_bundle_identity`. When lifecycle receipt
+delivery is configured, it also needs `SELECT, INSERT, UPDATE` on
+`prometa_runtime_receipt_outbox`; it does not need DDL privileges.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -312,6 +313,13 @@ in-flight IDs within a replica, returns stable payload-free errors, and shuts
 down its persistent kernel event loop gracefully. It does not claim
 cross-replica exactly-once request execution, TLS termination, distributed rate
 limiting, or overload fairness.
+
+Optional `receiptDelivery` configuration adds durable asynchronous `admitted`
+and `active` lifecycle evidence. The host commits receipts to its PostgreSQL
+outbox before a background dispatcher contacts Orchestra, so platform outage
+does not change readiness or request behavior. Replica leases prevent duplicate
+workers, deterministic receipt IDs preserve idempotency across restarts, and
+permanent rejections are dead-lettered with sanitized evidence.
 
 The non-root container, Compose example, tenant-owned Helm chart, strict
 configuration shape, and operator commands live in

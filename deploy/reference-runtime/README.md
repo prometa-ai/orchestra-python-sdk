@@ -44,6 +44,33 @@ provider:
 - `PROMETA_RUNTIME_DATABASE_URL`: tenant PostgreSQL DSN;
 - `PROMETA_RUNTIME_API_TOKEN`: at least 32 bytes, required by the request API;
 - `MODEL_GATEWAY_API_KEY`: required only when `modelGateway.apiKeyEnv` names it.
+- `ORCHESTRA_RUNTIME_RECEIPT_API_KEY`: required only when the optional
+  `receiptDelivery.apiKeyEnv` names it; use a narrow `runtime:write` key.
+
+To enable asynchronous lifecycle receipts, add this optional block to the
+mounted configuration. HTTPS is required unless `allowInsecureHttp` is set
+explicitly for a local/test endpoint:
+
+```json
+{
+  "receiptDelivery": {
+    "baseUrl": "https://orchestra.example.com",
+    "apiKeyEnv": "ORCHESTRA_RUNTIME_RECEIPT_API_KEY",
+    "timeoutSeconds": 5,
+    "pollIntervalSeconds": 2,
+    "leaseSeconds": 30,
+    "initialBackoffSeconds": 1,
+    "maxBackoffSeconds": 300
+  }
+}
+```
+
+The host durably enqueues deterministic deployment-level `admitted` and
+`active` receipts in tenant PostgreSQL. Replicas lease delivery with
+`SKIP LOCKED`; transport, 429, and 5xx failures back off without affecting
+readiness or request execution, while permanent 4xx responses are retained as
+dead letters with payload-free evidence. Pod termination does not emit a
+deployment-level `stopped` receipt.
 
 Install the database schema with a migration identity before starting the
 lower-privilege host:
@@ -79,7 +106,7 @@ helm upgrade --install tenant-runtime deploy/reference-runtime/chart \
 ```
 
 The credential Secret must expose the configured runtime database, request API
-token, optional model API key, and migration database keys. Use an external
+token, optional model/receipt API keys, and migration database keys. Use an external
 secret manager or sealed-secret workflow; do not commit the rendered Secret.
 The runtime config object contains the exact signed bundle and promotion
 attestation. Updating either external object does not automatically restart
@@ -98,8 +125,8 @@ Security defaults are deliberately fail-closed:
   must already exist when it is not the namespace `default` account.
 
 The production example opens only tenant-gateway ingress plus PostgreSQL and
-model-gateway egress. Add telemetry egress only when a configured evidence
-emitter needs it. For external services use a tightly scoped `ipBlock` or a
+model-gateway egress. Add telemetry or receipt-endpoint egress only when the
+corresponding delivery path is configured. For external services use a tightly scoped `ipBlock` or a
 CNI-supported FQDN policy; Kubernetes NetworkPolicy does not natively express
 DNS names.
 

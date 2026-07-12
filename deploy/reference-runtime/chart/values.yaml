@@ -48,6 +48,8 @@ credentials:
   apiTokenKey: api-token
   modelGatewayApiKeyKey: model-gateway-api-key
   modelGatewayApiKeyOptional: true
+  receiptApiKeyKey: receipt-api-key
+  receiptApiKeyOptional: true
 
 service:
   type: ClusterIP

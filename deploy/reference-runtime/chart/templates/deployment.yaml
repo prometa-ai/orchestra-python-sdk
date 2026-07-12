@@ -72,6 +72,12 @@ spec:
                   name: {{ .Values.credentials.existingSecret | quote }}
                   key: {{ .Values.credentials.modelGatewayApiKeyKey | quote }}
                   optional: {{ .Values.credentials.modelGatewayApiKeyOptional }}
+            - name: ORCHESTRA_RUNTIME_RECEIPT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret | quote }}
+                  key: {{ .Values.credentials.receiptApiKeyKey | quote }}
+                  optional: {{ .Values.credentials.receiptApiKeyOptional }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

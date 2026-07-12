@@ -62,7 +62,7 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if or (empty .Values.runtimeConfig.key) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.runtimeConfig.targetFile)) -}}
 {{- fail "runtimeConfig.key and a basename-only runtimeConfig.targetFile are required" -}}
 {{- end -}}
-{{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) -}}
+{{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) -}}
 {{- fail "all credentials key names must be non-empty" -}}
 {{- end -}}
 {{- if and .Values.migration.enabled (empty .Values.migration.serviceAccountName) -}}
@@ -87,7 +87,7 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds" -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "MODEL_GATEWAY_API_KEY") -}}
+{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
 {{- fail (printf "extraEnv cannot override reserved variable %s" .name) -}}
 {{- end -}}
 {{- end -}}

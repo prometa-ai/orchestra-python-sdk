@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
+_MAX_RESPONSE_BYTES = 64 * 1024
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429})
 _OUTCOME_BY_TRANSITION = {
     "admitted": frozenset({"accepted"}),
     "rollout_started": frozenset({"accepted"}),
@@ -41,6 +45,43 @@ class RuntimeReceiptSubmissionError(RuntimeError):
     def __init__(self, status: Optional[int], message: str) -> None:
         self.status = status
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class RuntimeReceiptOutboxItem:
+    """One leased receipt awaiting asynchronous delivery."""
+
+    receipt_id: str
+    receipt: Mapping[str, Any]
+    attempts: int
+    lease_token: str
+
+
+class RuntimeReceiptOutbox(Protocol):
+    """Durable multi-replica queue used by the reference runtime host."""
+
+    def enqueue(self, receipt: Mapping[str, Any]) -> bool:
+        """Persist a receipt once; return true only for a new row."""
+
+    def claim_next(self, lease_seconds: float) -> Optional[RuntimeReceiptOutboxItem]:
+        """Lease one currently deliverable item or return none."""
+
+    def mark_delivered(self, item: RuntimeReceiptOutboxItem) -> None:
+        """Complete a currently held lease."""
+
+    def reschedule(
+        self,
+        item: RuntimeReceiptOutboxItem,
+        *,
+        delay_seconds: float,
+        error_code: str,
+    ) -> None:
+        """Release a lease and make it available after a bounded delay."""
+
+    def mark_dead_letter(
+        self, item: RuntimeReceiptOutboxItem, *, error_code: str
+    ) -> None:
+        """Retain a permanently rejected receipt without retrying it."""
 
 
 def _identifier(name: str, value: str, max_length: int = 200) -> str:
@@ -139,12 +180,19 @@ class RuntimeReceiptClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                decoded = json.loads(response.read().decode("utf-8"))
+                response_body = response.read(_MAX_RESPONSE_BYTES + 1)
+                if len(response_body) > _MAX_RESPONSE_BYTES:
+                    raise RuntimeReceiptSubmissionError(
+                        None, "Runtime receipt endpoint response was too large"
+                    )
+                decoded = json.loads(response_body.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            detail = exc.read(1000).decode("utf-8", errors="replace")
             raise RuntimeReceiptSubmissionError(
                 exc.code, "Runtime receipt rejected: HTTP %s: %s" % (exc.code, detail)
             ) from exc
+        except RuntimeReceiptSubmissionError:
+            raise
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise RuntimeReceiptSubmissionError(
                 None, "Runtime receipt transport failed: %s" % type(exc).__name__
@@ -157,12 +205,174 @@ class RuntimeReceiptClient:
             raise RuntimeReceiptSubmissionError(
                 None, "Runtime receipt endpoint returned a non-object response"
             )
+        if (
+            decoded.get("receiptId") != receipt.get("receiptId")
+            or decoded.get("status") != "recorded"
+        ):
+            raise RuntimeReceiptSubmissionError(
+                None, "Runtime receipt endpoint returned an invalid acknowledgement"
+            )
         return decoded
+
+
+def _positive_number(name: str, value: Any, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeReceiptError("%s must be a positive number" % name)
+    result = float(value)
+    if result <= 0 or result > maximum:
+        raise RuntimeReceiptError("%s must be a positive number" % name)
+    return result
+
+
+class RuntimeReceiptDispatcher:
+    """Background outbox dispatcher that never gates runtime request serving."""
+
+    def __init__(
+        self,
+        outbox: RuntimeReceiptOutbox,
+        client: RuntimeReceiptClient,
+        *,
+        poll_interval_seconds: float = 2.0,
+        lease_seconds: float = 30.0,
+        initial_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 300.0,
+        shutdown_timeout_seconds: float = 10.0,
+        on_status: Optional[Callable[[str, Mapping[str, str]], None]] = None,
+    ) -> None:
+        self._outbox = outbox
+        self._client = client
+        self._poll_interval_seconds = _positive_number(
+            "poll_interval_seconds", poll_interval_seconds, 300
+        )
+        self._lease_seconds = _positive_number("lease_seconds", lease_seconds, 3600)
+        self._initial_backoff_seconds = _positive_number(
+            "initial_backoff_seconds", initial_backoff_seconds, 3600
+        )
+        self._max_backoff_seconds = _positive_number(
+            "max_backoff_seconds", max_backoff_seconds, 86_400
+        )
+        self._shutdown_timeout_seconds = _positive_number(
+            "shutdown_timeout_seconds", shutdown_timeout_seconds, 300
+        )
+        if self._max_backoff_seconds < self._initial_backoff_seconds:
+            raise RuntimeReceiptError(
+                "max_backoff_seconds must be at least initial_backoff_seconds"
+            )
+        self._on_status = on_status
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="prometa-runtime-receipts",
+            daemon=True,
+        )
+        self._started = False
+        self._start_lock = threading.Lock()
+
+    def _status(
+        self,
+        outcome: str,
+        item: Optional[RuntimeReceiptOutboxItem],
+        error_code: Optional[str] = None,
+    ) -> None:
+        if self._on_status is None:
+            return
+        details = {
+            "receiptId": item.receipt_id if item is not None else "unavailable",
+            "transition": (
+                str(item.receipt.get("transition", "unknown"))
+                if item is not None
+                else "unknown"
+            ),
+        }
+        if error_code is not None:
+            details["errorCode"] = error_code
+        try:
+            self._on_status(outcome, details)
+        except Exception:
+            # Delivery status evidence must not kill the durable dispatcher.
+            return
+
+    def _retry_delay(self, attempts: int) -> float:
+        exponent = min(max(attempts - 1, 0), 16)
+        return min(
+            self._max_backoff_seconds,
+            self._initial_backoff_seconds * (2**exponent),
+        )
+
+    @staticmethod
+    def _retryable(status: Optional[int]) -> bool:
+        return (
+            status is None
+            or status in _RETRYABLE_HTTP_STATUSES
+            or (status is not None and status >= 500)
+        )
+
+    def dispatch_once(self) -> bool:
+        """Attempt one leased delivery; return false when no item was ready."""
+
+        item = self._outbox.claim_next(self._lease_seconds)
+        if item is None:
+            return False
+        try:
+            self._client.submit(item.receipt)
+        except RuntimeReceiptSubmissionError as exc:
+            error_code = "transport" if exc.status is None else "http_%d" % exc.status
+            if self._retryable(exc.status):
+                self._outbox.reschedule(
+                    item,
+                    delay_seconds=self._retry_delay(item.attempts),
+                    error_code=error_code,
+                )
+                self._status("retry_scheduled", item, error_code)
+            else:
+                self._outbox.mark_dead_letter(item, error_code=error_code)
+                self._status("dead_letter", item, error_code)
+        except Exception:
+            self._outbox.reschedule(
+                item,
+                delay_seconds=self._retry_delay(item.attempts),
+                error_code="delivery_error",
+            )
+            self._status("retry_scheduled", item, "delivery_error")
+        else:
+            self._outbox.mark_delivered(item)
+            self._status("delivered", item)
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.dispatch_once():
+                    continue
+            except Exception:
+                self._status("outbox_unavailable", None, "outbox_unavailable")
+            self._wake.wait(self._poll_interval_seconds)
+            self._wake.clear()
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread.start()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._started:
+            self._thread.join(timeout=self._shutdown_timeout_seconds)
 
 
 __all__ = [
     "RuntimeReceiptClient",
+    "RuntimeReceiptDispatcher",
     "RuntimeReceiptError",
+    "RuntimeReceiptOutbox",
+    "RuntimeReceiptOutboxItem",
     "RuntimeReceiptSubmissionError",
     "build_runtime_receipt",
 ]

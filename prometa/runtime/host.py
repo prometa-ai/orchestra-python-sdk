@@ -1,9 +1,9 @@
 """Tenant-deployed reference HTTP host for the optional runtime kernel.
 
 The host activates one signed release against a tenant PostgreSQL database,
-serves a bounded authenticated request API, and calls only tenant-owned model
-and persistence planes. The Orchestra control plane is never in the request
-path.
+serves a bounded authenticated request API, and calls tenant-owned model and
+persistence planes. Optional lifecycle receipts use a durable asynchronous
+outbox; the Orchestra control plane is never in the request path.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,8 +42,14 @@ from .kernel import (
 from .model_gateway import OpenAICompatibleModelAdapter
 from .postgres import (
     PostgresRuntimeActivationStore,
+    PostgresRuntimeReceiptOutbox,
     PostgresRuntimeStateStore,
     RuntimePersistenceError,
+)
+from .receipts import (
+    RuntimeReceiptClient,
+    RuntimeReceiptDispatcher,
+    build_runtime_receipt,
 )
 from .trust import BundleTrustEntry, BundleTrustStore, BundleVerificationError
 
@@ -92,6 +99,13 @@ class RuntimeHostConfig:
     api_token_env: str
     request_timeout_seconds: float
     max_request_bytes: int
+    receipt_base_url: Optional[str] = None
+    receipt_api_key_env: Optional[str] = None
+    receipt_timeout_seconds: float = 5.0
+    receipt_poll_interval_seconds: float = 2.0
+    receipt_lease_seconds: float = 30.0
+    receipt_initial_backoff_seconds: float = 1.0
+    receipt_max_backoff_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -189,6 +203,29 @@ def _positive_integer(name: str, value: Any, maximum: int) -> int:
     return value
 
 
+def _boolean(name: str, value: Any) -> bool:
+    if type(value) is not bool:
+        raise RuntimeHostError("invalid_%s" % name)
+    return value
+
+
+def _receipt_base_url(value: Any, allow_insecure_http: bool) -> str:
+    candidate = _bounded_string("receipt_base_url", value, 2048)
+    parsed = urllib.parse.urlsplit(candidate)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeHostError("invalid_receipt_base_url")
+    if parsed.scheme != "https" and not allow_insecure_http:
+        raise RuntimeHostError("insecure_receipt_base_url")
+    return candidate.rstrip("/")
+
+
 def _string_set(name: str, value: Any) -> Optional[frozenset]:
     if value is None:
         return None
@@ -266,6 +303,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "apiTokenEnv",
             "requestTimeoutSeconds",
             "maxRequestBytes",
+            "receiptDelivery",
         ),
         code="host_config_invalid",
     )
@@ -281,6 +319,65 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
     api_key_env = model.get("apiKeyEnv")
     if api_key_env is not None:
         api_key_env = _environment_name("model_api_key_env", api_key_env)
+    receipt_base_url = None
+    receipt_api_key_env = None
+    receipt_timeout_seconds = 5.0
+    receipt_poll_interval_seconds = 2.0
+    receipt_lease_seconds = 30.0
+    receipt_initial_backoff_seconds = 1.0
+    receipt_max_backoff_seconds = 300.0
+    if document.get("receiptDelivery") is not None:
+        receipt = _mapping(
+            document["receiptDelivery"], "receipt_delivery_config_invalid"
+        )
+        _exact_keys(
+            receipt,
+            required=("baseUrl", "apiKeyEnv"),
+            optional=(
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "pollIntervalSeconds",
+                "leaseSeconds",
+                "initialBackoffSeconds",
+                "maxBackoffSeconds",
+            ),
+            code="receipt_delivery_config_invalid",
+        )
+        allow_insecure_http = _boolean(
+            "receipt_allow_insecure_http",
+            receipt.get("allowInsecureHttp", False),
+        )
+        receipt_base_url = _receipt_base_url(
+            receipt["baseUrl"], allow_insecure_http
+        )
+        receipt_api_key_env = _environment_name(
+            "receipt_api_key_env", receipt["apiKeyEnv"]
+        )
+        receipt_timeout_seconds = _positive_number(
+            "receipt_timeout_seconds", receipt.get("timeoutSeconds", 5), 60
+        )
+        receipt_poll_interval_seconds = _positive_number(
+            "receipt_poll_interval_seconds",
+            receipt.get("pollIntervalSeconds", 2),
+            300,
+        )
+        receipt_lease_seconds = _positive_number(
+            "receipt_lease_seconds", receipt.get("leaseSeconds", 30), 3600
+        )
+        receipt_initial_backoff_seconds = _positive_number(
+            "receipt_initial_backoff_seconds",
+            receipt.get("initialBackoffSeconds", 1),
+            3600,
+        )
+        receipt_max_backoff_seconds = _positive_number(
+            "receipt_max_backoff_seconds",
+            receipt.get("maxBackoffSeconds", 300),
+            86_400,
+        )
+        if receipt_lease_seconds <= receipt_timeout_seconds:
+            raise RuntimeHostError("receipt_lease_too_short")
+        if receipt_max_backoff_seconds < receipt_initial_backoff_seconds:
+            raise RuntimeHostError("receipt_backoff_invalid")
     return RuntimeHostConfig(
         tenant_id=_identifier("tenant_id", document["tenantId"]),
         runtime_id=_identifier("runtime_id", document["runtimeId"]),
@@ -337,6 +434,13 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             document.get("maxRequestBytes", DEFAULT_MAX_REQUEST_BYTES),
             16 * 1024 * 1024,
         ),
+        receipt_base_url=receipt_base_url,
+        receipt_api_key_env=receipt_api_key_env,
+        receipt_timeout_seconds=receipt_timeout_seconds,
+        receipt_poll_interval_seconds=receipt_poll_interval_seconds,
+        receipt_lease_seconds=receipt_lease_seconds,
+        receipt_initial_backoff_seconds=receipt_initial_backoff_seconds,
+        receipt_max_backoff_seconds=receipt_max_backoff_seconds,
     )
 
 
@@ -427,6 +531,7 @@ class ReferenceRuntimeHost:
         api_token: str,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+        receipt_dispatcher: Optional[RuntimeReceiptDispatcher] = None,
     ) -> None:
         if not isinstance(api_token, str) or len(api_token.encode("utf-8")) < 32:
             raise RuntimeHostError("api_token_too_short")
@@ -442,6 +547,7 @@ class ReferenceRuntimeHost:
         self._inflight = set()
         self._inflight_condition = threading.Condition()
         self._closing = False
+        self._receipt_dispatcher = receipt_dispatcher
 
     def _authorized(self, headers: Mapping[str, str]) -> bool:
         value = headers.get("authorization", "")
@@ -550,9 +656,30 @@ class ReferenceRuntimeHost:
                     break
                 self._inflight_condition.wait(timeout=remaining)
             drained = not self._inflight
-        self._runner.close()
+        try:
+            self._runner.close()
+        finally:
+            if self._receipt_dispatcher is not None:
+                self._receipt_dispatcher.close()
         if not drained:
             raise RuntimeHostError("runtime_shutdown_timeout")
+
+
+def _lifecycle_receipt_id(
+    config: RuntimeHostConfig, attestation_id: str, transition: str
+) -> str:
+    identity = "\x00".join(
+        (
+            config.tenant_id,
+            config.runtime_id,
+            config.deployment_id,
+            config.release_id,
+            attestation_id,
+            transition,
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return "runtime-%s-%s" % (transition, digest)
 
 
 def build_reference_runtime_host(
@@ -573,6 +700,15 @@ def build_reference_runtime_host(
         raise RuntimeHostError("runtime_api_token_missing")
     if len(api_token.encode("utf-8")) < 32:
         raise RuntimeHostError("api_token_too_short")
+    receipt_api_key = None
+    if config.receipt_base_url is not None:
+        if config.receipt_api_key_env is None:
+            raise RuntimeHostError("receipt_api_key_env_missing")
+        receipt_api_key = env.get(config.receipt_api_key_env, "")
+        if not receipt_api_key:
+            raise RuntimeHostError("receipt_api_key_missing")
+        if config.receipt_lease_seconds <= config.receipt_timeout_seconds:
+            raise RuntimeHostError("receipt_lease_too_short")
     model_api_key = None
     if config.model_gateway_api_key_env is not None:
         model_api_key = env.get(config.model_gateway_api_key_env, "")
@@ -593,6 +729,7 @@ def build_reference_runtime_host(
         expected_runtime=config.runtime_target,
         supported_capabilities=available_runtime_capabilities(),
     )
+    admission_now = now or datetime.now(timezone.utc)
     admitted, activation = activate_runtime_release(
         config.bundle,
         config.promotion_attestation,
@@ -604,12 +741,67 @@ def build_reference_runtime_host(
         ),
         runtime_id=config.runtime_id,
         policy=policy,
-        now=now or datetime.now(timezone.utc),
+        now=admission_now,
     )
+    emitter = evidence_emitter or JsonLineEvidenceEmitter()
+    receipt_outbox = None
+    receipt_dispatcher = None
+    if config.receipt_base_url is not None and receipt_api_key is not None:
+        receipt_outbox = PostgresRuntimeReceiptOutbox(
+            dsn,
+            tenant_id=config.tenant_id,
+        )
+        identity_attributes = {
+            "prometa.bundle.digest": admitted.artifact_digest,
+            "prometa.attestation.id": admitted.promotion.attestation_id,
+            "prometa.release.id": config.release_id,
+            "prometa.deployment.id": config.deployment_id,
+            "prometa.runtime.target": config.runtime_target,
+            "prometa.runtime.id": config.runtime_id,
+            "prometa.runtime.version": config.runtime_version,
+        }
+
+        def receipt_status(outcome: str, details: Mapping[str, str]) -> None:
+            attributes = dict(identity_attributes)
+            attributes.update(
+                {
+                    "prometa.receipt.id": details["receiptId"],
+                    "prometa.receipt.transition": details["transition"],
+                }
+            )
+            if "errorCode" in details:
+                attributes["prometa.receipt.error_code"] = details["errorCode"]
+            emitter.emit(
+                RuntimeEvidenceEvent(
+                    name="runtime.receipt.delivery",
+                    outcome=outcome,
+                    occurred_at=datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    attributes=attributes,
+                )
+            )
+
+        receipt_dispatcher = RuntimeReceiptDispatcher(
+            receipt_outbox,
+            RuntimeReceiptClient(
+                config.receipt_base_url,
+                receipt_api_key,
+                timeout=config.receipt_timeout_seconds,
+            ),
+            poll_interval_seconds=config.receipt_poll_interval_seconds,
+            lease_seconds=config.receipt_lease_seconds,
+            initial_backoff_seconds=config.receipt_initial_backoff_seconds,
+            max_backoff_seconds=config.receipt_max_backoff_seconds,
+            shutdown_timeout_seconds=min(
+                300, config.receipt_timeout_seconds + 2
+            ),
+            on_status=receipt_status,
+        )
     kernel = RuntimeKernel(
         admitted,
         model_adapter=model_adapter,
-        evidence_emitter=evidence_emitter or JsonLineEvidenceEmitter(),
+        evidence_emitter=emitter,
         runtime_id=config.runtime_id,
         runtime_version=config.runtime_version,
         execution_policy=RuntimeExecutionPolicy(
@@ -621,15 +813,56 @@ def build_reference_runtime_host(
             runtime_id=config.runtime_id,
         ),
     )
-    return (
-        ReferenceRuntimeHost(
-            kernel,
-            api_token=api_token,
-            request_timeout_seconds=config.request_timeout_seconds,
-            max_request_bytes=config.max_request_bytes,
-        ),
-        activation.created,
+    host = ReferenceRuntimeHost(
+        kernel,
+        api_token=api_token,
+        request_timeout_seconds=config.request_timeout_seconds,
+        max_request_bytes=config.max_request_bytes,
+        receipt_dispatcher=receipt_dispatcher,
     )
+    if receipt_outbox is not None and receipt_dispatcher is not None:
+        activation_at = activation.activated_at or admission_now
+        admitted_receipt = build_runtime_receipt(
+            attestation_id=admitted.promotion.attestation_id,
+            artifact_digest=admitted.artifact_digest,
+            release_id=config.release_id,
+            deployment_id=config.deployment_id,
+            target_environment=config.environment,
+            runtime_target=config.runtime_target,
+            runtime_id=config.runtime_id,
+            runtime_version=config.runtime_version,
+            transition="admitted",
+            outcome="accepted",
+            receipt_id=_lifecycle_receipt_id(
+                config, admitted.promotion.attestation_id, "admitted"
+            ),
+            event_at=activation_at,
+        )
+        active_receipt = build_runtime_receipt(
+            attestation_id=admitted.promotion.attestation_id,
+            artifact_digest=admitted.artifact_digest,
+            release_id=config.release_id,
+            deployment_id=config.deployment_id,
+            target_environment=config.environment,
+            runtime_target=config.runtime_target,
+            runtime_id=config.runtime_id,
+            runtime_version=config.runtime_version,
+            transition="active",
+            outcome="succeeded",
+            receipt_id=_lifecycle_receipt_id(
+                config, admitted.promotion.attestation_id, "active"
+            ),
+            event_at=datetime.now(timezone.utc),
+        )
+        try:
+            receipt_outbox.enqueue(admitted_receipt)
+            receipt_outbox.enqueue(active_receipt)
+        except Exception:
+            host.close()
+            raise
+        receipt_dispatcher.start()
+        receipt_dispatcher.wake()
+    return host, activation.created
 
 
 class _RuntimeHttpServer(ThreadingHTTPServer):

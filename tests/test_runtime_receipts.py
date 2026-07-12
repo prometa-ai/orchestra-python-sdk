@@ -77,8 +77,9 @@ def test_rejects_unsafe_local_receipts_before_network_io() -> None:
 
 
 class _Response:
-    def __init__(self, value):
+    def __init__(self, value, url=None):
         self._value = value
+        self._url = url
 
     def __enter__(self):
         return self
@@ -93,6 +94,9 @@ class _Response:
 
     def close(self):
         return None
+
+    def geturl(self):
+        return self._url or "https://orchestra.example.test/api/runtime-receipts"
 
 
 def test_client_submits_with_runtime_scope_key_and_no_extra_dependency(monkeypatch) -> None:
@@ -132,6 +136,22 @@ def test_client_surfaces_http_status_without_exposing_the_key(monkeypatch) -> No
         client.submit(_receipt())
     assert caught.value.status == 403
     assert "secret-key" not in str(caught.value)
+
+
+def test_client_rejects_login_redirects_instead_of_marking_delivery(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(
+            {"receiptId": "receipt-1", "status": "recorded"},
+            "https://orchestra.example.test/login",
+        ),
+    )
+    client = RuntimeReceiptClient("https://orchestra.example.test", "secret-key")
+
+    with pytest.raises(RuntimeReceiptSubmissionError, match="redirected") as caught:
+        client.submit(_receipt())
+
+    assert caught.value.status == 302
 
 
 def test_client_rejects_invalid_or_oversized_acknowledgements(monkeypatch) -> None:

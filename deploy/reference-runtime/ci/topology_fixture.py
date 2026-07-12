@@ -1174,14 +1174,17 @@ def _platform_request(
     headers = {"accept": "application/json", "x-api-key": api_key}
     if payload is not None:
         headers["content-type"] = "application/json"
+    url = base_url.rstrip("/") + path
     request = Request(
-        base_url.rstrip("/") + path,
+        url,
         data=payload,
         headers=headers,
         method=method,
     )
     try:
         with urlopen(request, timeout=5) as response:
+            if response.geturl() != url:
+                raise ValueError("platform_receipt_api_redirected")
             return int(response.status), _strict_json_bytes(
                 response.read(1024 * 1024 + 1)
             )

@@ -180,6 +180,12 @@ class RuntimeReceiptClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                geturl = getattr(response, "geturl", None)
+                final_url = geturl() if callable(geturl) else self._url
+                if final_url != self._url:
+                    raise RuntimeReceiptSubmissionError(
+                        302, "Runtime receipt endpoint redirected"
+                    )
                 response_body = response.read(_MAX_RESPONSE_BYTES + 1)
                 if len(response_body) > _MAX_RESPONSE_BYTES:
                     raise RuntimeReceiptSubmissionError(

@@ -319,6 +319,28 @@ PostgreSQL failover/PITR, production ingress/TLS, autoscaling, overload
 fairness, storage durability, air-gap installation, or a tenant-specific
 RPO/RTO. Those environments still require their own certification evidence.
 
+### Optional live Orchestra receipt proof
+
+The same harness can additionally prove asynchronous lifecycle-receipt delivery
+against a running Orchestra platform container. This mode is intentionally not
+part of the SDK-only job: it needs a platform database fixture whose release and
+attestation IDs match the dynamically signed tenant bundles.
+
+Set `PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF=true` together with:
+
+- `PROMETA_RUNTIME_TOPOLOGY_PLATFORM_CONTAINER`, the running platform container;
+- `PROMETA_RUNTIME_TOPOLOGY_PLATFORM_VERIFY_URL`, its operator-reachable base URL;
+- `PROMETA_RUNTIME_TOPOLOGY_PLATFORM_PROVISIONER`, an executable accepting
+  `setup --fixture <path>` and `cleanup --fixture <path>`.
+
+The harness connects only that container to the ephemeral K3d network, adds its
+exact IPv4 `/32` and port `3000` to each runtime NetworkPolicy, provisions
+separate `runtime:write` and `release:read` keys per tenant, and removes the
+fixture on exit. It requires two delivered outbox rows per tenant, the complete
+`admitted`/`active` platform projection, a rejected binding mismatch, and both
+read- and write-side tenant isolation. The retained report still records zero
+synchronous control-plane calls and never includes keys or signed payloads.
+
 ## Request API
 
 - `GET /healthz`: process liveness;

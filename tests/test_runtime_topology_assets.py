@@ -2,6 +2,7 @@ import importlib.util
 import json
 import stat
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -94,7 +95,8 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "task_store_unavailable" in harness_text
     assert "prometa_runtime_release_activation" in harness_text
     assert "controlPlanePull" not in harness_text
-    assert "receiptDelivery" not in harness_text
+    assert "PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF" in harness_text
+    assert "verify-platform-receipts" in harness_text
 
 
 def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
@@ -192,6 +194,171 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
             "prometa-runtime-host:topology-test",
             "0.19.0",
         )
+
+
+def test_topology_fixture_optionally_wires_live_platform_receipts(tmp_path):
+    pytest.importorskip("cryptography")
+    fixture = _load_module("topology_fixture_receipts", FIXTURE_PATH)
+    output = tmp_path / "fixture"
+
+    fixture.prepare(
+        PROFILE,
+        output,
+        PROBE_PATH,
+        "prometa-runtime-host:topology-test",
+        "0.18.0",
+        "http://172.22.0.9:3000",
+        "172.22.0.9/32",
+    )
+
+    config = json.loads((output / "tenant-a-config.json").read_text())
+    values = json.loads((output / "tenant-a-values.json").read_text())
+    credentials = (output / "tenant-a-credentials.env").read_text()
+    platform = json.loads((output / "platform-receipt-fixture.json").read_text())
+
+    assert config["receiptDelivery"] == {
+        "baseUrl": "http://172.22.0.9:3000",
+        "apiKeyEnv": "ORCHESTRA_RUNTIME_RECEIPT_API_KEY",
+        "allowInsecureHttp": True,
+        "timeoutSeconds": 3,
+        "pollIntervalSeconds": 1,
+        "leaseSeconds": 15,
+        "initialBackoffSeconds": 1,
+        "maxBackoffSeconds": 8,
+    }
+    assert "receipt-api-key=pk_topology_" in credentials
+    assert values["credentials"]["receiptApiKeyOptional"] is False
+    assert values["networkPolicy"]["egress"][-1] == {
+        "to": [{"ipBlock": {"cidr": "172.22.0.9/32"}}],
+        "ports": [{"protocol": "TCP", "port": 3000}],
+    }
+    assert platform["contractVersion"] == 1
+    assert [tenant["tenant"] for tenant in platform["tenants"]] == ["a", "b"]
+    assert platform["tenants"][0]["writeApiKey"].startswith("pk_topology_")
+    assert platform["tenants"][0]["readApiKey"].startswith("pk_topology_")
+    assert platform["tenants"][0]["writeApiKey"] != platform["tenants"][0]["readApiKey"]
+    assert (
+        stat.S_IMODE((output / "platform-receipt-fixture.json").stat().st_mode) == 0o600
+    )
+
+    with pytest.raises(ValueError, match="receipt_endpoint_incomplete"):
+        fixture.prepare(
+            PROFILE,
+            tmp_path / "incomplete",
+            PROBE_PATH,
+            "prometa-runtime-host:topology-test",
+            "0.18.0",
+            "http://172.22.0.9:3000",
+        )
+    with pytest.raises(ValueError, match="receipt_endpoint_invalid"):
+        fixture.prepare(
+            PROFILE,
+            tmp_path / "broad-cidr",
+            PROBE_PATH,
+            "prometa-runtime-host:topology-test",
+            "0.18.0",
+            "http://172.22.0.9:3000",
+            "172.22.0.0/24",
+        )
+
+
+def test_topology_live_platform_verifier_checks_projection_and_isolation(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("cryptography")
+    fixture = _load_module("topology_fixture_platform_verify", FIXTURE_PATH)
+    assets = tmp_path / "fixture"
+    fixture.prepare(
+        PROFILE,
+        assets,
+        PROBE_PATH,
+        "prometa-runtime-host:topology-test",
+        "0.18.0",
+        "http://172.22.0.9:3000",
+        "172.22.0.9/32",
+    )
+    platform_path = assets / "platform-receipt-fixture.json"
+    tenants = json.loads(platform_path.read_text())["tenants"]
+
+    def document(tenant):
+        authorization = tenant["promotionAttestation"]["authorization"]
+        attestation_id = tenant["promotionAttestation"]["attestationId"]
+        payloads = []
+        for transition, outcome, instant in (
+            ("admitted", "accepted", "2026-07-13T00:00:00.000Z"),
+            ("active", "succeeded", "2026-07-13T00:00:01.000Z"),
+        ):
+            payloads.append(
+                {
+                    "receiptId": f"runtime-{transition}-{tenant['tenant']}",
+                    "attestationId": attestation_id,
+                    "artifactDigest": authorization["artifactDigest"],
+                    "releaseId": tenant["releaseId"],
+                    "deploymentId": tenant["deploymentId"],
+                    "targetEnvironment": "prod",
+                    "runtimeTarget": "tenant-runtime",
+                    "runtimeId": tenant["runtimeId"],
+                    "runtimeVersion": tenant["runtimeVersion"],
+                    "transition": transition,
+                    "outcome": outcome,
+                    "reason": None,
+                    "eventAt": instant,
+                }
+            )
+        return {
+            "receipts": [{"payload": payload} for payload in reversed(payloads)],
+            "count": 2,
+            "totalCount": 2,
+            "projection": {
+                "source": "authenticated_tenant_runtime_receipts",
+                "authority": "tenant_runtime_assertion",
+                "completeness": "complete",
+                "receiptCount": 2,
+                "attestationCount": 1,
+                "deploymentId": tenant["deploymentId"],
+                "releaseId": tenant["releaseId"],
+                "runtimeTarget": "tenant-runtime",
+                "warningCodes": [],
+                "outOfOrderCount": 0,
+                "milestones": {"admitted": True, "active": True},
+                "latestAssertion": {"transition": "active", "outcome": "succeeded"},
+            },
+        }
+
+    documents = {tenant["deploymentId"]: document(tenant) for tenant in tenants}
+
+    def request(_base_url, path, api_key, *, method="GET", body=None):
+        if method == "POST":
+            if body["receiptId"] == "topology-invalid-binding-a":
+                return 409, {"code": "attestation_binding_mismatch"}
+            return 404, {"code": "attestation_not_found"}
+        deployment_id = parse_qs(urlsplit(path).query)["deploymentId"][0]
+        owner = next(item for item in tenants if item["deploymentId"] == deployment_id)
+        if api_key != owner["readApiKey"]:
+            return 200, {
+                "receipts": [],
+                "count": 0,
+                "totalCount": 0,
+                "projection": None,
+            }
+        return 200, documents[deployment_id]
+
+    monkeypatch.setattr(fixture, "_platform_request", request)
+    proof = tmp_path / "proof.json"
+    fixture.verify_platform_receipts(
+        platform_path, "http://127.0.0.1:3000", proof, timeout_seconds=1
+    )
+
+    assert json.loads(proof.read_text()) == {
+        "contractVersion": 1,
+        "mode": "live-platform",
+        "runtimeReceiptsPerTenant": 2,
+        "asynchronousReceiptDelivery": True,
+        "platformBindingValidation": True,
+        "platformProjectionVisible": True,
+        "receiptReadTenantIsolation": True,
+        "receiptWriteTenantIsolation": True,
+    }
 
 
 def test_topology_partition_removes_only_database_egress(tmp_path):
@@ -324,6 +491,64 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
         '"signature"',
     ):
         assert forbidden not in lowered
+
+
+def test_topology_report_includes_only_validated_live_receipt_evidence(tmp_path):
+    fixture = _load_module("topology_fixture_receipt_report", FIXTURE_PATH)
+    proof = tmp_path / "proof.json"
+    report = tmp_path / "report.json"
+    proof.write_text(
+        json.dumps(
+            {
+                "contractVersion": 1,
+                "mode": "live-platform",
+                "runtimeReceiptsPerTenant": 2,
+                "asynchronousReceiptDelivery": True,
+                "platformBindingValidation": True,
+                "platformProjectionVisible": True,
+                "receiptReadTenantIsolation": True,
+                "receiptWriteTenantIsolation": True,
+            }
+        )
+    )
+
+    fixture.write_report(
+        PROFILE,
+        report,
+        "v1.34.8+k3s1",
+        1,
+        1,
+        2,
+        2,
+        proof,
+        2,
+        2,
+    )
+
+    evidence = json.loads(report.read_text())
+    assert evidence["receiptEvidenceMode"] == "live-platform"
+    assert evidence["runtimeReceiptsPerTenant"] == 2
+    assert evidence["receiptOutboxDeliveredPerTenant"] == 2
+    assert evidence["asynchronousReceiptDelivery"] is True
+    assert evidence["platformBindingValidation"] is True
+    assert evidence["platformProjectionVisible"] is True
+    assert evidence["receiptReadTenantIsolation"] is True
+    assert evidence["receiptWriteTenantIsolation"] is True
+    assert evidence["synchronousControlPlaneCalls"] == 0
+
+    with pytest.raises(ValueError, match="platform_receipt_proof_invalid"):
+        fixture.write_report(
+            PROFILE,
+            tmp_path / "invalid.json",
+            "v1.34.8+k3s1",
+            1,
+            1,
+            2,
+            2,
+            proof,
+            1,
+            2,
+        )
 
 
 def test_topology_probe_rejects_ambiguous_json_and_invalid_urls():

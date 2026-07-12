@@ -496,7 +496,10 @@ runtime can implement `RuntimeConformanceDriver` and select a factory with
 not certification by the Prometa control plane. The separate
 `deploy/reference-runtime/ci/topology-certification.sh` profile adds retained
 K3s kube-router evidence for two-tenant isolation, load, a database-egress
-partition, and pod replacement. Production acceptance still requires the same
+partition, and pod replacement. Its opt-in live-platform mode also verifies
+asynchronous lifecycle receipts and the release-scoped Orchestra projection;
+see [`deploy/reference-runtime/README.md`](deploy/reference-runtime/README.md#optional-live-orchestra-receipt-proof).
+Production acceptance still requires the same
 proof against the tenant's actual CNI, ingress, database, storage, and recovery
 topology.
 

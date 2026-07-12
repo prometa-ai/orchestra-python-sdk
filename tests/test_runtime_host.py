@@ -39,6 +39,7 @@ from prometa.runtime import (
     RuntimeHostError,
     RuntimeHostConfig,
     RuntimeKernel,
+    RuntimePersistenceError,
     admit_runtime_release,
     build_reference_runtime_host,
     canonical_payload_digest,
@@ -774,6 +775,34 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     with pytest.raises(RuntimeHostError) as caught:
         load_runtime_host_config(path)
     assert caught.value.code == "host_config_invalid_json"
+
+
+def test_host_rejects_incompatible_database_before_release_activation(
+    tmp_path, monkeypatch
+) -> None:
+    import prometa.runtime.host as host_module
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_config_document()), encoding="utf-8")
+    config = load_runtime_host_config(path)
+
+    def incompatible(_dsn):
+        raise RuntimePersistenceError("runtime_schema_too_new")
+
+    monkeypatch.setattr(
+        host_module, "check_postgres_runtime_compatibility", incompatible
+    )
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            config,
+            environment={
+                "PROMETA_RUNTIME_DATABASE_URL": "postgresql://unused",
+                "PROMETA_RUNTIME_API_TOKEN": (
+                    "runtime-token-0123456789abcdefghijklmnop"
+                ),
+            },
+        )
+    assert caught.value.code == "runtime_schema_too_new"
 
 
 def test_json_line_evidence_is_bounded_and_contains_no_request_payload() -> None:

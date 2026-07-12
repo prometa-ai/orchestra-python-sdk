@@ -1,3 +1,4 @@
+import json
 import re
 import stat
 import subprocess
@@ -47,6 +48,10 @@ def test_runtime_chart_references_external_sensitive_objects():
     assert "automountServiceAccountToken: false" in values
     assert "controlPlaneApiKeyKey: control-plane-api-key" in values
     assert "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" in rendered_sources
+    assert "prometa-runtime-postgres-compatibility" in rendered_sources
+    assert "pre-install,pre-upgrade,pre-rollback" in rendered_sources
+    assert "prometa.io/database-maintenance" in rendered_sources
+    assert "prometa.io/runtime-config-rollout-id" in rendered_sources
 
 
 def test_runtime_examples_enable_bounded_payload_free_task_recovery():
@@ -113,3 +118,53 @@ def test_runtime_chart_backup_is_optional_external_and_fail_closed():
     assert ".Values.backup.existingSecret" in cronjob
     assert "kind: Secret" not in cronjob
     assert "app.kubernetes.io/component: backup" in policy
+
+
+def test_runtime_chart_compatibility_hook_uses_target_image_and_migration_identity():
+    chart = ROOT / "deploy/reference-runtime/chart"
+    values = (chart / "values.yaml").read_text(encoding="utf-8")
+    compatibility = (chart / "templates/compatibility-job.yaml").read_text(
+        encoding="utf-8"
+    )
+    migration = (chart / "templates/migration-job.yaml").read_text(
+        encoding="utf-8"
+    )
+    policy = (chart / "templates/networkpolicy.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "compatibilityCheck: true" in values
+    assert 'helm.sh/hook: pre-install,pre-upgrade,pre-rollback' in compatibility
+    assert 'helm.sh/hook-weight: "10"' in compatibility
+    assert "if .Values.migration.compatibilityCheck" in compatibility
+    assert 'include "prometa-runtime.image"' in compatibility
+    assert 'command: ["prometa-runtime-postgres-compatibility"]' in compatibility
+    assert 'prometa.io/database-maintenance: "true"' in compatibility
+    assert 'prometa.io/database-maintenance: "true"' in migration
+    assert "pre-install,pre-upgrade,pre-rollback" in policy
+    assert "helm.sh/hook-delete-policy: before-hook-creation" in policy
+    assert "before-hook-creation,hook-succeeded" not in policy
+    assert "or .Values.migration.enabled .Values.migration.compatibilityCheck" in policy
+
+
+def test_runtime_upgrade_baseline_is_explicit_and_drill_is_executable():
+    root = ROOT / "deploy/reference-runtime"
+    manifest = json.loads(
+        (root / "compatibility-baselines.json").read_text(encoding="utf-8")
+    )
+    drill = root / "ci/upgrade-rollback-drill.sh"
+
+    assert manifest == {
+        "contractVersion": 1,
+        "baselines": [
+            {
+                "name": "phase3-chart-0.1.0",
+                "gitRef": "51e2faa",
+                "chartVersion": "0.1.0",
+                "runtimeVersion": "0.18.0",
+                "postgresSchemaVersion": 2,
+                "artifactStatus": "source-baseline-not-published-release",
+            }
+        ],
+    }
+    assert drill.stat().st_mode & stat.S_IXUSR

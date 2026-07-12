@@ -1,7 +1,10 @@
 # Replace these names with objects managed by your secret/config delivery
 # system. The chart deliberately does not create either object.
 runtimeConfig:
-  existingSecret: tenant-runtime-release
+  # Use an immutable object per freshly authorized deployment, including a
+  # rollback to prior bundle bytes.
+  existingSecret: tenant-runtime-release-deployment-prod-v1
+  rolloutId: deployment-prod-v1
 
 credentials:
   existingSecret: tenant-runtime-credentials

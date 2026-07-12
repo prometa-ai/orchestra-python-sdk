@@ -54,6 +54,9 @@ _RECEIPT_SEQUENCE = {
     "stopped": 80,
 }
 RUNTIME_POSTGRES_SCHEMA_VERSION = 5
+RUNTIME_POSTGRES_COMPATIBILITY_VERSION = 1
+RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 5
+RUNTIME_POSTGRES_MAX_SCHEMA_VERSION = RUNTIME_POSTGRES_SCHEMA_VERSION
 _RUNTIME_TABLES = (
     "prometa_runtime_schema_migrations",
     "prometa_runtime_admission_replay",
@@ -326,6 +329,26 @@ class RuntimePostgresVerificationReport:
         }
 
 
+@dataclass(frozen=True)
+class RuntimePostgresCompatibilityReport:
+    """Payload-free result of a target runtime/database compatibility check."""
+
+    schema_version: int
+    migration_versions: Tuple[int, ...]
+    minimum_schema_version: int
+    maximum_schema_version: int
+
+    def as_dict(self) -> Mapping[str, Any]:
+        return {
+            "compatibility": "compatible",
+            "compatibilityVersion": RUNTIME_POSTGRES_COMPATIBILITY_VERSION,
+            "schemaVersion": self.schema_version,
+            "migrationVersions": list(self.migration_versions),
+            "minimumSchemaVersion": self.minimum_schema_version,
+            "maximumSchemaVersion": self.maximum_schema_version,
+        }
+
+
 def _validate_identifier(
     name: str, value: str, max_length: int = _MAX_IDENTIFIER_LENGTH
 ) -> str:
@@ -445,6 +468,74 @@ def install_postgres_runtime_schema(
         raise
     except Exception:
         raise RuntimePersistenceError("runtime_schema_install_failed") from None
+
+
+def check_postgres_runtime_compatibility(
+    dsn: str,
+    *,
+    connect: Optional[Callable[[str], Any]] = None,
+) -> RuntimePostgresCompatibilityReport:
+    """Verify that this runtime can safely use an installed schema."""
+
+    if not isinstance(dsn, str) or not dsn.strip():
+        raise ValueError("dsn must be a non-empty string")
+    connector = connect or _default_connect
+    try:
+        with connector(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
+                cursor.execute(
+                    "SELECT to_regclass('public.prometa_runtime_schema_migrations')"
+                )
+                migration_table = cursor.fetchone()
+                if migration_table is None or migration_table[0] is None:
+                    raise RuntimePersistenceError("runtime_schema_uninitialized")
+
+                cursor.execute(
+                    """
+                    SELECT version
+                    FROM prometa_runtime_schema_migrations
+                    ORDER BY version
+                    """
+                )
+                versions = tuple(int(row[0]) for row in cursor.fetchall())
+                if not versions:
+                    raise RuntimePersistenceError("runtime_schema_uninitialized")
+                if versions != tuple(range(1, versions[-1] + 1)):
+                    raise RuntimePersistenceError("runtime_schema_migration_gap")
+                schema_version = versions[-1]
+                if schema_version < RUNTIME_POSTGRES_MIN_SCHEMA_VERSION:
+                    raise RuntimePersistenceError("runtime_schema_too_old")
+                if schema_version > RUNTIME_POSTGRES_MAX_SCHEMA_VERSION:
+                    raise RuntimePersistenceError("runtime_schema_too_new")
+
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name = ANY(%s)
+                    ORDER BY table_name
+                    """,
+                    (list(_RUNTIME_TABLES),),
+                )
+                present_tables = {str(row[0]) for row in cursor.fetchall()}
+                if present_tables != set(_RUNTIME_TABLES):
+                    raise RuntimePersistenceError("runtime_schema_incompatible")
+    except RuntimePersistenceError:
+        raise
+    except Exception:
+        raise RuntimePersistenceError(
+            "runtime_schema_compatibility_failed"
+        ) from None
+    return RuntimePostgresCompatibilityReport(
+        schema_version=schema_version,
+        migration_versions=versions,
+        minimum_schema_version=RUNTIME_POSTGRES_MIN_SCHEMA_VERSION,
+        maximum_schema_version=RUNTIME_POSTGRES_MAX_SCHEMA_VERSION,
+    )
 
 
 def verify_postgres_runtime_integrity(
@@ -1991,16 +2082,43 @@ def verify_main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+def compatibility_main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="prometa-runtime-postgres-compatibility",
+        description="Check target-runtime PostgreSQL schema compatibility.",
+    )
+    parser.add_argument(
+        "--dsn-env",
+        default="PROMETA_RUNTIME_DATABASE_URL",
+        help="Environment variable containing a libpq PostgreSQL DSN",
+    )
+    args = parser.parse_args(argv)
+    dsn = os.environ.get(args.dsn_env)
+    if not dsn:
+        parser.error("%s is not set" % args.dsn_env)
+    try:
+        report = check_postgres_runtime_compatibility(dsn)
+    except RuntimePersistenceError as exc:
+        parser.error(exc.code)
+    print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
 __all__ = [
     "RUNTIME_POSTGRES_SCHEMA_VERSION",
+    "RUNTIME_POSTGRES_COMPATIBILITY_VERSION",
+    "RUNTIME_POSTGRES_MIN_SCHEMA_VERSION",
+    "RUNTIME_POSTGRES_MAX_SCHEMA_VERSION",
     "RuntimePersistenceError",
+    "RuntimePostgresCompatibilityReport",
     "RuntimePostgresVerificationReport",
     "RuntimeStateRecord",
     "install_postgres_runtime_schema",
+    "check_postgres_runtime_compatibility",
     "verify_postgres_runtime_integrity",
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
@@ -2009,5 +2127,6 @@ __all__ = [
     "PostgresRuntimeTaskStore",
     "PostgresRuntimeStateStore",
     "main",
+    "compatibility_main",
     "verify_main",
 ]

@@ -1,15 +1,15 @@
 {{- include "prometa-runtime.validateValues" . }}
-{{- if .Values.migration.enabled }}
+{{- if .Values.migration.compatibilityCheck }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "prometa-runtime.fullname" . }}-migrate
+  name: {{ include "prometa-runtime.fullname" . }}-compatibility
   labels:
     {{- include "prometa-runtime.labels" . | nindent 4 }}
-    app.kubernetes.io/component: migration
+    app.kubernetes.io/component: compatibility
   annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "0"
+    helm.sh/hook: pre-install,pre-upgrade,pre-rollback
+    helm.sh/hook-weight: "10"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   backoffLimit: {{ .Values.migration.backoffLimit }}
@@ -19,7 +19,7 @@ spec:
     metadata:
       labels:
         {{- include "prometa-runtime.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: migration
+        app.kubernetes.io/component: compatibility
         prometa.io/database-maintenance: "true"
     spec:
       restartPolicy: Never
@@ -32,10 +32,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: migrate
+        - name: compatibility
           image: {{ include "prometa-runtime.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["prometa-runtime-postgres-init"]
+          command: ["prometa-runtime-postgres-compatibility"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:

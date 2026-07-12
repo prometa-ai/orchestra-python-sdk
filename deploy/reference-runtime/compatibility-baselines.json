@@ -1,0 +1,13 @@
+{
+  "contractVersion": 1,
+  "baselines": [
+    {
+      "name": "phase3-chart-0.1.0",
+      "gitRef": "51e2faa",
+      "chartVersion": "0.1.0",
+      "runtimeVersion": "0.18.0",
+      "postgresSchemaVersion": 2,
+      "artifactStatus": "source-baseline-not-published-release"
+    }
+  ]
+}

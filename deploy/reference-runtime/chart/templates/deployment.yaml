@@ -19,9 +19,14 @@ spec:
       app.kubernetes.io/component: runtime
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.runtimeConfig.rolloutId .Values.podAnnotations }}
       annotations:
+        {{- with .Values.runtimeConfig.rolloutId }}
+        prometa.io/runtime-config-rollout-id: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       labels:
         {{- include "prometa-runtime.selectorLabels" . | nindent 8 }}

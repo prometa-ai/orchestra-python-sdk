@@ -12,6 +12,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from prometa.runtime import (
+    RUNTIME_POSTGRES_COMPATIBILITY_VERSION,
+    RUNTIME_POSTGRES_MAX_SCHEMA_VERSION,
+    RUNTIME_POSTGRES_MIN_SCHEMA_VERSION,
     RUNTIME_POSTGRES_SCHEMA_VERSION,
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
@@ -25,10 +28,12 @@ from prometa.runtime import (
     RuntimeTaskError,
     build_runtime_receipt,
     canonical_payload_digest,
+    check_postgres_runtime_compatibility,
     install_postgres_runtime_schema,
     verify_postgres_runtime_integrity,
 )
 from prometa.runtime.postgres import (
+    compatibility_main as postgres_compatibility_main,
     main as postgres_init_main,
     verify_main as postgres_verify_main,
 )
@@ -92,6 +97,50 @@ class _StaticConnection:
 
     def cursor(self):
         return _StaticCursor(self.row)
+
+
+class _CompatibilityCursor:
+    def __init__(self, versions, tables):
+        self.versions = versions
+        self.tables = tables
+        self.rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def execute(self, statement, parameters=None):
+        if "to_regclass" in statement:
+            self.rows = [("prometa_runtime_schema_migrations",)]
+        elif "SELECT version" in statement:
+            self.rows = [(version,) for version in self.versions]
+        elif "information_schema.tables" in statement:
+            self.rows = [(table,) for table in self.tables]
+        else:
+            self.rows = []
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _CompatibilityConnection:
+    def __init__(self, versions, tables):
+        self.versions = versions
+        self.tables = tables
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def cursor(self):
+        return _CompatibilityCursor(self.versions, self.tables)
 
 
 def test_postgres_adapters_validate_inputs_before_connecting() -> None:
@@ -212,12 +261,47 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert "password" not in str(caught.value)
 
     with pytest.raises(RuntimePersistenceError) as caught:
+        check_postgres_runtime_compatibility(
+            "postgresql://secret:password@db.example/runtime",
+            connect=_unavailable,
+        )
+    assert caught.value.code == "runtime_schema_compatibility_failed"
+    assert "password" not in str(caught.value)
+
+    with pytest.raises(RuntimePersistenceError) as caught:
         verify_postgres_runtime_integrity(
             "postgresql://secret:password@db.example/runtime",
             connect=_unavailable,
         )
     assert caught.value.code == "runtime_schema_verification_failed"
     assert "password" not in str(caught.value)
+
+    with pytest.raises(RuntimePersistenceError) as caught:
+        check_postgres_runtime_compatibility(
+            "postgresql://unused",
+            connect=lambda dsn: _StaticConnection((None,)),
+        )
+    assert caught.value.code == "runtime_schema_uninitialized"
+
+    with pytest.raises(ValueError, match="dsn"):
+        check_postgres_runtime_compatibility(" ")
+
+    with pytest.raises(RuntimePersistenceError) as caught:
+        check_postgres_runtime_compatibility(
+            "postgresql://unused",
+            connect=lambda dsn: _CompatibilityConnection((), ()),
+        )
+    assert caught.value.code == "runtime_schema_uninitialized"
+
+    with pytest.raises(RuntimePersistenceError) as caught:
+        check_postgres_runtime_compatibility(
+            "postgresql://unused",
+            connect=lambda dsn: _CompatibilityConnection(
+                (1, 2, 3, 4, 5),
+                ("prometa_runtime_schema_migrations",),
+            ),
+        )
+    assert caught.value.code == "runtime_schema_incompatible"
 
 
 def test_state_validation_is_finite_and_bounded() -> None:
@@ -732,4 +816,83 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
                 WHERE tenant_id = %s AND runtime_id = %s AND request_id = %s
                 """,
                 (tenant_id, runtime_id, request_id),
+            )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
+    monkeypatch, capsys
+) -> None:
+    import psycopg
+
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    report = check_postgres_runtime_compatibility(dsn)
+    assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
+    assert report.migration_versions == (1, 2, 3, 4, 5)
+    assert report.minimum_schema_version == RUNTIME_POSTGRES_MIN_SCHEMA_VERSION
+    assert report.maximum_schema_version == RUNTIME_POSTGRES_MAX_SCHEMA_VERSION
+    assert report.as_dict()["compatibilityVersion"] == (
+        RUNTIME_POSTGRES_COMPATIBILITY_VERSION
+    )
+
+    monkeypatch.setenv("RUNTIME_COMPATIBILITY_DSN", dsn)
+    assert (
+        postgres_compatibility_main(
+            ["--dsn-env", "RUNTIME_COMPATIBILITY_DSN"]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "compatibility": "compatible",
+        "compatibilityVersion": 1,
+        "maximumSchemaVersion": 5,
+        "migrationVersions": [1, 2, 3, 4, 5],
+        "minimumSchemaVersion": 5,
+        "schemaVersion": 5,
+    }
+
+    def expect_code(code: str) -> None:
+        with pytest.raises(RuntimePersistenceError) as caught:
+            check_postgres_runtime_compatibility(dsn)
+        assert caught.value.code == code
+
+    try:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (6)"
+            )
+        expect_code("runtime_schema_too_new")
+    finally:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 6"
+            )
+
+    try:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 5"
+            )
+        expect_code("runtime_schema_too_old")
+    finally:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (5)"
+            )
+
+    try:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 3"
+            )
+        expect_code("runtime_schema_migration_gap")
+    finally:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (3)"
             )

@@ -62,13 +62,19 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if or (empty .Values.runtimeConfig.key) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.runtimeConfig.targetFile)) -}}
 {{- fail "runtimeConfig.key and a basename-only runtimeConfig.targetFile are required" -}}
 {{- end -}}
+{{- if and (not (empty .Values.runtimeConfig.rolloutId)) (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$" .Values.runtimeConfig.rolloutId)) -}}
+{{- fail "runtimeConfig.rolloutId must be a bounded deployment identifier" -}}
+{{- end -}}
+{{- if hasKey .Values.podAnnotations "prometa.io/runtime-config-rollout-id" -}}
+{{- fail "podAnnotations cannot override prometa.io/runtime-config-rollout-id" -}}
+{{- end -}}
 {{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.controlPlaneApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) -}}
 {{- fail "all credentials key names must be non-empty" -}}
 {{- end -}}
-{{- if and .Values.migration.enabled (empty .Values.migration.serviceAccountName) -}}
+{{- if and (or .Values.migration.enabled .Values.migration.compatibilityCheck) (empty .Values.migration.serviceAccountName) -}}
 {{- fail "migration.serviceAccountName must name a pre-existing account" -}}
 {{- end -}}
-{{- if and .Values.migration.enabled .Values.migration.networkPolicy.enabled (empty .Values.migration.networkPolicy.egress) -}}
+{{- if and (or .Values.migration.enabled .Values.migration.compatibilityCheck) .Values.migration.networkPolicy.enabled (empty .Values.migration.networkPolicy.egress) -}}
 {{- fail "migration.networkPolicy.egress is required while its fail-closed policy is enabled" -}}
 {{- end -}}
 {{- if .Values.backup.enabled -}}

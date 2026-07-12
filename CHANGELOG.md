@@ -29,6 +29,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   NetworkPolicy.
 - Reference runtime chart `0.2.0`, adding the optional backup operations
   contract without changing application version `0.18.0`.
+- A payload-free PostgreSQL compatibility contract and CLI, early host startup
+  enforcement, and chart `0.3.0` target-image hooks after migration and before
+  rollback. Unknown, gapped, older, or structurally incomplete schemas fail
+  before release activation.
+- An explicit `runtimeConfig.rolloutId`, immutable config guidance, and a CI
+  source-baseline drill that proves schema v2 to v5 host upgrade plus
+  A-to-B-to-freshly-authorized-A prior-bundle rollback.
 - Deployment recovery tests that kill a real host during inference, cut and
   restore its database path, and restore a logical archive into a fresh
   PostgreSQL database before replaying task history.
@@ -46,6 +53,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   target database, compatible schema, and post-restore integrity verification;
   backup enablement requires explicit sensitive-data acknowledgement and
   operator-managed credentials, storage, retention, and egress.
+- Rollback never reuses an old promotion authorization: the prior bundle bytes
+  require a fresh attestation, release/deployment identity, and immutable config
+  revision. The target image rejects a database schema outside its declared
+  compatibility range before activation.
 
 ## [0.18.0] - 2026-07-12
 

@@ -1,0 +1,83 @@
+# Replace these names with objects managed by your secret/config delivery
+# system. The chart deliberately does not create either object.
+runtimeConfig:
+  existingSecret: tenant-runtime-release
+
+credentials:
+  existingSecret: tenant-runtime-credentials
+
+replicaCount: 2
+
+image:
+  repository: registry.example.com/orchestra/prometa-runtime-host
+  tag: "0.18.0"
+
+serviceAccount:
+  annotations:
+    # Replace with the workload identity annotation for your cluster/provider.
+    example.com/workload-identity: tenant-runtime
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: prometa-runtime
+
+networkPolicy:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-gateway
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tenant-ai-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-models
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: model-gateway
+      ports:
+        - protocol: TCP
+          port: 8000
+
+migration:
+  networkPolicy:
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: tenant-data
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: postgresql
+        ports:
+          - protocol: TCP
+            port: 5432

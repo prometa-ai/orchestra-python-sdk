@@ -1,0 +1,22 @@
+{{- include "prometa-runtime.validateValues" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "prometa-runtime.fullname" . }}
+  labels:
+    {{- include "prometa-runtime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "prometa-runtime.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

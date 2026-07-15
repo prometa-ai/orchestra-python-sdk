@@ -9,6 +9,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- An optional `runtime-mcp` extra and governed tenant-side `ToolBroker` with
+  official stdio and Streamable HTTP transports, exact egress allowlists,
+  late-bound credentials, server/agent-specific permission projection, signed
+  scope/auth/environment/risk intersection, reviewer-reference enforcement,
+  and payload-free audit hooks.
+- MCP call idempotency contracts plus a single-process reference store. Write
+  and destructive calls require both approval evidence and an idempotency store;
+  duplicate, conflicting, in-flight, and indeterminate calls fail closed without
+  automatic result replay.
+- Signed bundle admission now cross-checks `mcpServers`, `requiredScopes`, and
+  `grantedScopes` against declared tools before a release can execute.
 - A bootstrap-only outbound runtime release handoff client using the new
   `runtime:read` platform scope, strict bounded responses, redirect refusal,
   complete release binding checks, and unchanged local cryptographic admission.
@@ -46,6 +57,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Security
 
+- MCP HTTP redirects and ambient proxy discovery are disabled, public plain
+  HTTP is rejected, credential-controlled protocol headers are forbidden, and
+  every declared origin or stdio command requires an explicit tenant egress
+  grant. Arguments, outputs, and credentials are excluded from broker audit
+  records; only identities, decisions, approval references, and SHA-256 digests
+  are retained.
+- Unknown MCP transport outcomes, response validation failures after a call,
+  and post-call audit failures become indeterminate idempotency records rather
+  than retryable failures. The Prometa control plane's production-tool hard
+  block remains unchanged because this adapter runs only in the tenant plane.
 - Pull mode requires HTTPS by default, never sends its API key through a
   redirect, never falls back after terminal authorization or binding failures,
   and never contacts the control plane while serving tenant requests.

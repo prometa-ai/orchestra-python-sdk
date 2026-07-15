@@ -51,6 +51,11 @@ openllmetry-all = [
     "opentelemetry-instrumentation-llamaindex>=0.60,<1; python_version >= '3.10'",
 ]
 runtime = ["cryptography>=42", "jsonschema>=4.23,<5"]
+runtime-mcp = [
+    "cryptography>=42",
+    "jsonschema>=4.23,<5",
+    "mcp>=1.28.1,<2; python_version >= '3.10'",
+]
 runtime-postgres = [
     "cryptography>=42",
     "jsonschema>=4.23,<5",

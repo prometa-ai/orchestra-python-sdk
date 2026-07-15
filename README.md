@@ -11,10 +11,11 @@ automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
 and joinable on the platform. Version 0.18.0 adds a first tenant-deployed
 reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. The host can also bootstrap from
-an outbound, read-only release handoff with bounded tenant-side cache fallback.
-None of this adds a dependency or runtime behavior to the default observability
-install.
+container around the optional Phase 2A kernel. Current source also adds the
+first governed tenant-side MCP broker as a separate optional extra. The host can
+bootstrap from an outbound, read-only release handoff with bounded tenant-side
+cache fallback. None of this adds a dependency or runtime behavior to the
+default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -215,12 +216,14 @@ Bundle integrity, promotion authorization, and runtime evidence remain
 separate. The platform stays outside the synchronous request path; the model
 gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
 and emergency stop are tenant-owned. The first reference host is model-only and
-tenant-deployed. The shipped increment does not include a production MCP
-transport adapter, stored-payload or automatic task replay, resumable HITL
-checkpoints, memory, compression, A2A, rollout automation, topology-specific
-production certification, or managed-CNI/database proof. A pinned two-node
-K3s/kube-router reference profile now supplies narrow multi-tenant isolation,
-load, database-partition, duplicate-claim, and pod-replacement evidence.
+tenant-deployed. The optional MCP adapter is a library capability and is not
+wired into that host yet. The shipped increment does not include a durable
+multi-replica MCP idempotency adapter, stored-payload or automatic task replay,
+resumable HITL checkpoints, memory, compression, A2A, rollout automation,
+topology-specific production certification, or managed-CNI/database proof. A
+pinned two-node K3s/kube-router reference profile now supplies narrow
+multi-tenant isolation, load, database-partition, duplicate-claim, and
+pod-replacement evidence.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -233,7 +236,107 @@ independent proof of cluster state.
 
 Importing `prometa.runtime` does not add dependencies to `import prometa` or
 change telemetry behavior. Cryptographic and JSON Schema enforcement are
-installed only through the `runtime` extra.
+installed only through the `runtime` extra, and the official MCP transport SDK
+is installed only through `runtime-mcp` on Python 3.10 or newer.
+
+#### Governed tenant-side MCP adapter
+
+Install the transport adapter only in a tenant-owned executor:
+
+```bash
+pip install "prometa-sdk[runtime-mcp]"
+```
+
+The broker receives only tool calls already admitted by `RuntimeKernel`. It
+intersects the signed tool's logical server, scopes, auth binding, risk, side
+effects, and approval requirement with a tenant-local connection and a
+CI/GitOps-projected permission row. The platform is not called synchronously.
+
+```python
+import os
+
+from prometa.runtime import (
+    EnvironmentMcpCredentialProvider,
+    ExplicitMcpEgressPolicy,
+    GovernedMcpToolBroker,
+    InMemoryMcpAuditSink,
+    McpBrokerPolicy,
+    McpCredentialBinding,
+    McpServerConfig,
+    McpToolGrant,
+    OfficialMcpTransportClient,
+)
+
+server = McpServerConfig(
+    name="Integration Tools",
+    connection_id="mcp-integration-prod",
+    transport="streamable-http",
+    endpoint="https://mcp.integration.example.com/mcp",
+    environment="production",
+    auth_mode="service-account",
+    scopes=("mcp.integration.read", "mcp.integration.write"),
+    risk_level="medium",
+)
+
+broker = GovernedMcpToolBroker(
+    servers=(server,),
+    grants=(
+        McpToolGrant(
+            tool_name="mcp.integration.lookup",
+            agent_ids=("agent-integration",),
+            permission="read",
+            risk_level="low",
+            server_connection_id=server.connection_id,
+        ),
+    ),
+    policy=McpBrokerPolicy(max_risk_level="medium"),
+    egress_policy=ExplicitMcpEgressPolicy(
+        allowed_http_origins=frozenset(
+            {"https://mcp.integration.example.com"}
+        )
+    ),
+    credential_provider=EnvironmentMcpCredentialProvider(
+        (
+            McpCredentialBinding(
+                server_name=server.name,
+                auth_mode="service-account",
+                http_headers={
+                    "Authorization": "MCP_INTEGRATION_AUTHORIZATION"
+                },
+            ),
+        ),
+        environ=os.environ,
+    ),
+    transport_client=OfficialMcpTransportClient(),
+    audit_sink=InMemoryMcpAuditSink(),
+)
+```
+
+Pass `broker` to `RuntimeKernel(tool_broker=broker, ...)`. Tenant production
+execution is allowed only when the verified bundle target and tenant-local
+server environment both resolve to production. This does not change the
+platform control plane's separate hard block on production tool execution.
+
+The adapter supports official stdio and Streamable HTTP transports. HTTP
+redirects and ambient proxy variables are disabled, public plain HTTP is
+rejected, and egress requires an exact origin or command allowlist. Credentials
+are resolved at call time from named environment variables or a tenant-supplied
+provider and never appear in audit events.
+
+Permission selection follows the platform matrix's server and agent
+specificity. The permission label is preserved as evidence; signed side-effect
+classification drives the stronger runtime rules. Write and destructive calls
+require a tenant reviewer reference and an idempotency store by default. Audit
+records contain identities and SHA-256 digests, not arguments or outputs, and
+an uncertain transport or post-call audit outcome is marked indeterminate so
+the runtime cannot retry it automatically.
+
+`InMemoryMcpIdempotencyStore` and `InMemoryMcpAuditSink` are for tests and
+single-process development only. They are not multi-replica durability claims.
+Deployments must provide durable tenant-owned implementations before enabling
+side-effecting tools across replicas. DNS and network-layer enforcement also
+remain the tenant's NetworkPolicy, firewall, or service-mesh responsibility;
+the SDK allowlist validates the declared destination.
 
 #### Multi-replica durability
 

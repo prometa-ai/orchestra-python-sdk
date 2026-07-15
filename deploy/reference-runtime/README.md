@@ -10,7 +10,8 @@ connections, grants, credentials, and egress remain tenant-owned; durable
 PostgreSQL call admission and payload-free audit coordinate replicas. Optional
 model-only task recovery coordinates request retries across replicas. Resumable
 HITL, stored payload replay, memory, A2A, rollout automation, standby failover,
-MCP topology certification, and production certification remain later work.
+write/destructive MCP topology evidence, and production certification remain
+later work.
 
 ## Build and conformance
 
@@ -301,10 +302,13 @@ immutable activation rows and zero synchronous control-plane calls. Because the
 baseline was not a separately published artifact, this is not release-channel,
 Kubernetes CNI, managed-database, or production certification.
 
-## K3s kube-router topology certification profile
+## K3s kube-router topology certification profiles
 
-The repository also runs one pinned, repeatable tenant-cluster reference
-profile. It is intentionally narrower than production certification:
+The repository runs two pinned, repeatable tenant-cluster reference profiles.
+They are intentionally narrower than production certification and share the
+same K3d, K3s, PostgreSQL, runtime, and chart pins.
+
+### Model-only profile
 
 - K3d `v5.8.3` with K3s `v1.34.8+k3s1` and its embedded kube-router
   NetworkPolicy controller;
@@ -337,6 +341,36 @@ The harness refuses version drift, verifies the upstream PostgreSQL digest,
 then normalizes it to a single-platform local image so Docker Desktop and Linux
 runners import the same OCI content into every K3s node. It verifies both
 imported images on every node before applying any workload.
+
+### Read-only MCP profile
+
+[`topology-profiles.mcp.json`](topology-profiles.mcp.json) adds a distinct
+`mcp-read-only` workload without weakening the model-only profile. It proves:
+
+- exact signed bundle binding for one low-risk, read-only tool through the
+  official stateless Streamable HTTP transport;
+- separate runtime-client and MCP-server Secret projections plus a rollout
+  requirement after credential rotation;
+- runtime-to-own-tools ingress and egress while same-tenant rogue and
+  cross-tenant callers remain denied;
+- PostgreSQL-backed one-winner call admission across two runtime replicas;
+- payload-free MCP audit persistence across runtime pod replacement;
+- fail-closed stale-credential handling, indeterminate call quarantine, and
+  denial of automatic replay after the runtime adopts the rotated Secret; and
+- tenant isolation throughout rotation, partition, and recovery drills.
+
+Run the MCP profile by selecting it explicitly:
+
+```bash
+K3D="$PWD/.tmp/k3d" \
+  PROMETA_RUNTIME_TOPOLOGY_PROFILE="$PWD/deploy/reference-runtime/topology-profiles.mcp.json" \
+  PROMETA_RUNTIME_TOPOLOGY_REPORT=runtime-mcp-topology-certification.json \
+  deploy/reference-runtime/ci/topology-certification.sh
+```
+
+This profile certifies only the stock host's read-only MCP contract. It does
+not certify write/destructive tools, resumable approval, tool-result replay,
+or exactly-once execution.
 
 The resulting report contains profile/version identifiers, counts, and boolean
 checks only. Ephemeral bundle signatures, API tokens, database credentials,

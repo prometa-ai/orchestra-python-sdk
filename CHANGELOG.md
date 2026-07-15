@@ -61,6 +61,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   tenants, two replicas per tenant on distinct nodes, real Helm hooks,
   concurrent load, one-winner duplicate claims, database-egress partition and
   recovery, pod replacement, activation joins, and payload-free task survival.
+- A separate read-only MCP K3s topology profile and CI gate proving signed tool
+  binding, official Streamable HTTP transport, exact tools-plane policy,
+  cross-replica PostgreSQL call admission, payload-free audit persistence,
+  tenant-isolated credential rotation, and indeterminate replay quarantine.
 
 ### Security
 
@@ -97,6 +101,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   failure during database partition. Its report omits fixture payloads,
   signatures, tokens, passwords, and model output and remains explicitly
   reference-profile evidence rather than production certification.
+- The MCP topology gate keeps runtime and server credentials in separate
+  Secrets, proves stale clients fail after server rotation, and requires a
+  runtime rollout before fresh calls recover. It certifies read-only tools only;
+  write/destructive tools and resumable approval remain outside the claim.
 
 ## [0.18.0] - 2026-07-12
 

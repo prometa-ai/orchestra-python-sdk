@@ -14,9 +14,11 @@ reference host, restart-safe PostgreSQL release activation, and a non-root
 container around the optional Phase 2A kernel. Current source also adds a
 governed tenant-side MCP broker as a separate optional extra, strict reference
 host wiring for read-only MCP bundles, and shared PostgreSQL MCP call admission
-and payload-free audit. The host can bootstrap from an outbound, read-only
-release handoff with bounded tenant-side cache fallback. None of this adds a
-dependency or runtime behavior to the default observability install.
+and payload-free audit. A separate pinned K3s profile now exercises that
+read-only MCP path across two tenants and two runtime replicas per tenant. The
+host can bootstrap from an outbound, read-only release handoff with bounded
+tenant-side cache fallback. None of this adds a dependency or runtime behavior
+to the default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -224,10 +226,10 @@ not supply a human-escalation adapter, so write or destructive bundles remain
 fail-closed; tenants may inject that adapter only through the library builder.
 The shipped increment does not include stored-payload or automatic task replay,
 resumable HITL checkpoints, memory, compression, A2A, rollout automation,
-MCP-enabled topology certification, or managed-CNI/database proof. A pinned
-two-node K3s/kube-router reference profile supplies narrower model-only
-multi-tenant isolation, load, database-partition, duplicate-claim, and
-pod-replacement evidence.
+write/destructive MCP topology evidence, or managed-CNI/database proof. Pinned
+two-node K3s/kube-router reference profiles supply narrower model-only and
+read-only MCP multi-tenant isolation, load, database-partition,
+duplicate-claim, pod-replacement, and credential-rotation evidence.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -549,9 +551,10 @@ tenant-selected immutable config revisions explicit. The CI drill uses a real
 schema-v2 source baseline, upgrades to schema v6 and bundle B, then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
-published-version certification claim. A separate pinned K3s/kube-router
-profile now proves the chart in one two-node, two-tenant reference topology;
-it does not generalize to OpenShift, managed CNIs/databases, or production.
+published-version certification claim. Separate pinned K3s/kube-router
+profiles now prove the chart's model-only and read-only MCP paths in one
+two-node, two-tenant reference topology; they do not generalize to OpenShift,
+managed CNIs/databases, write/destructive MCP, or production.
 
 #### Runtime conformance
 
@@ -632,10 +635,13 @@ exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
 runtime can implement `RuntimeConformanceDriver` and select a factory with
 `--driver package.module:create_driver`. This is an adapter-level test contract,
 not certification by the Prometa control plane. The separate
-`deploy/reference-runtime/ci/topology-certification.sh` profile adds retained
+`deploy/reference-runtime/ci/topology-certification.sh` profiles add retained
 K3s kube-router evidence for two-tenant isolation, load, a database-egress
-partition, and pod replacement. Its opt-in live-platform mode also verifies
-asynchronous lifecycle receipts and the release-scoped Orchestra projection;
+partition, and pod replacement. The explicit read-only MCP profile additionally
+proves signed tool binding, exact tools-plane policy, cross-replica call
+admission, payload-free audit, and fail-closed credential rotation. The
+model-only profile's opt-in live-platform mode also verifies asynchronous
+lifecycle receipts and the release-scoped Orchestra projection;
 see [`deploy/reference-runtime/README.md`](deploy/reference-runtime/README.md#optional-live-orchestra-receipt-proof).
 Production acceptance still requires the same
 proof against the tenant's actual CNI, ingress, database, storage, and recovery

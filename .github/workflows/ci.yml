@@ -31,6 +31,7 @@ jobs:
           ruff check prometa tests
           deploy/reference-runtime/ci/topology_fixture.py
           deploy/reference-runtime/ci/topology_probe.py
+          deploy/reference-runtime/ci/topology_mcp_server.py
 
       - name: Pytest
         run: pytest -q
@@ -80,6 +81,7 @@ jobs:
           tests/test_promotion_attestation.py
           deploy/reference-runtime/ci/topology_fixture.py
           deploy/reference-runtime/ci/topology_probe.py
+          deploy/reference-runtime/ci/topology_mcp_server.py
 
       - name: Runtime trust conformance
         run: >-
@@ -113,6 +115,7 @@ jobs:
           tests/test_runtime_mcp.py
           tests/test_runtime_mcp_transport.py
           tests/runtime_mcp_stdio_server.py
+          deploy/reference-runtime/ci/topology_mcp_server.py
 
   runtime-upgrade-rollback:
     runs-on: ubuntu-latest
@@ -363,3 +366,40 @@ jobs:
         with:
           name: runtime-topology-certification
           path: runtime-topology-certification.json
+
+  runtime-mcp-topology-certification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-helm@v4
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.34.8"
+
+      - name: Install runtime host and test tools
+        run: pip install ".[dev,runtime-host]"
+
+      - name: Install checksum-verified K3d
+        run: |
+          deploy/reference-runtime/ci/install-k3d.sh "$RUNNER_TEMP/k3d"
+          echo "K3D=$RUNNER_TEMP/k3d" >>"$GITHUB_ENV"
+
+      - name: Certify the governed MCP K3s reference topology
+        env:
+          PROMETA_RUNTIME_TOPOLOGY_PROFILE: deploy/reference-runtime/topology-profiles.mcp.json
+          PROMETA_RUNTIME_TOPOLOGY_REPORT: runtime-mcp-topology-certification.json
+          PROMETA_RUNTIME_TOPOLOGY_CLUSTER: prometa-runtime-mcp-topology
+          BUILDKIT_PROGRESS: plain
+        run: deploy/reference-runtime/ci/topology-certification.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-mcp-topology-certification
+          path: runtime-mcp-topology-certification.json

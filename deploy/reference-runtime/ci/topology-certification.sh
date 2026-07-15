@@ -6,9 +6,10 @@ python_command=${PYTHON:-python}
 kubectl_command=${KUBECTL:-kubectl}
 helm_command=${HELM:-helm}
 k3d_command=${K3D:-k3d}
-profile="$root/deploy/reference-runtime/topology-profiles.json"
+profile=${PROMETA_RUNTIME_TOPOLOGY_PROFILE:-"$root/deploy/reference-runtime/topology-profiles.json"}
 fixture="$root/deploy/reference-runtime/ci/topology_fixture.py"
 probe_source="$root/deploy/reference-runtime/ci/topology_probe.py"
+mcp_server_source="$root/deploy/reference-runtime/ci/topology_mcp_server.py"
 chart="$root/deploy/reference-runtime/chart"
 runtime_image=${PROMETA_RUNTIME_TOPOLOGY_IMAGE:-prometa-runtime-host:topology-cert}
 cluster=${PROMETA_RUNTIME_TOPOLOGY_CLUSTER:-prometa-runtime-topology}
@@ -132,6 +133,58 @@ model_count() {
     'import json,sys; value=json.load(sys.stdin); assert value.get("passed") is True; print(value["count"])'
 }
 
+runtime_pod_name() {
+  tenant=$1
+  KUBECONFIG="$kubeconfig" "$kubectl_command" get pods -n "runtime-$tenant" \
+    -l app.kubernetes.io/component=runtime \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+mcp_count() {
+  tenant=$1
+  pod=$(runtime_pod_name "$tenant")
+  output=$(probe "runtime-$tenant" "$pod" mcp-count \
+    --url "http://mcp-integration.tools-$tenant.svc.cluster.local:8000/count")
+  printf '%s\n' "$output" | "$python_command" -c \
+    'import json,sys; value=json.load(sys.stdin); assert value.get("passed") is True; print(value["count"])'
+}
+
+apply_secret_env() {
+  namespace=$1
+  name=$2
+  source=$3
+  KUBECONFIG="$kubeconfig" "$kubectl_command" create secret generic "$name" \
+    -n "$namespace" --from-env-file="$source" --dry-run=client -o json | \
+    KUBECONFIG="$kubeconfig" "$kubectl_command" apply -f - >/dev/null
+}
+
+wait_mcp_server_secret() {
+  tenant=$1
+  source=$2
+  expected=$(
+    "$python_command" -c '
+import hashlib, pathlib, sys
+line = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+token = line.split("=", 1)[1]
+print(hashlib.sha256(token.encode("utf-8")).hexdigest())
+' "$source"
+  )
+  for _ in {1..90}; do
+    if KUBECONFIG="$kubeconfig" "$kubectl_command" exec -n "tools-$tenant" \
+      deployment/mcp-integration -- python -c '
+import hashlib, pathlib, sys
+value = pathlib.Path("/var/run/secrets/prometa-mcp/token").read_text(encoding="utf-8").strip()
+raise SystemExit(0 if hashlib.sha256(value.encode("utf-8")).hexdigest() == sys.argv[1] else 1)
+' "$expected" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+  echo "MCP server credential projection did not converge for tenant $tenant." >&2
+  return 2
+}
+
 capture_pods() {
   tenant=$1
   destination=$2
@@ -243,6 +296,20 @@ if [ "$(profile_value networkPolicyController)" != "k3s-kube-router" ]; then
   echo "Unexpected NetworkPolicy controller in topology profile." >&2
   exit 2
 fi
+workload=$(profile_value workload)
+case "$workload" in
+  model-only) ;;
+  mcp-read-only)
+    if [ "$receipt_proof" = true ]; then
+      echo "The MCP reference profile does not combine live platform receipts." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "Unsupported topology workload: $workload" >&2
+    exit 2
+    ;;
+esac
 
 k3s_image=$(profile_value k3sImage)
 k3s_digest=$(profile_value k3sImageDigest)
@@ -294,7 +361,14 @@ cluster_created=true
 "$k3d_command" kubeconfig get "$cluster" >"$kubeconfig"
 chmod 0600 "$kubeconfig"
 
-receipt_prepare_args=()
+prepare_args=(
+  --profile "$profile"
+  --output-dir "$assets"
+  --probe-source "$probe_source"
+  --runtime-image "$runtime_image"
+  --runtime-version "$runtime_version"
+  --mcp-server-source "$mcp_server_source"
+)
 if [ "$receipt_proof" = true ]; then
   platform_network="k3d-$cluster"
   docker network connect "$platform_network" "$platform_container"
@@ -311,19 +385,13 @@ if not address:
     raise SystemExit("platform network address unavailable")
 print(address)
 ' "$platform_network")
-  receipt_prepare_args+=(
+  prepare_args+=(
     --receipt-base-url "http://$platform_ip:3000"
     --receipt-endpoint-cidr "$platform_ip/32"
   )
 fi
 
-"$python_command" "$fixture" prepare \
-  --profile "$profile" \
-  --output-dir "$assets" \
-  --probe-source "$probe_source" \
-  --runtime-image "$runtime_image" \
-  --runtime-version "$runtime_version" \
-  "${receipt_prepare_args[@]}"
+"$python_command" "$fixture" prepare "${prepare_args[@]}"
 
 if [ "$receipt_proof" = true ]; then
   fixture_cleanup_required=true
@@ -352,6 +420,10 @@ for tenant in a b; do
     -n "data-$tenant" deployment/postgres --timeout=180s
   KUBECONFIG="$kubeconfig" "$kubectl_command" rollout status \
     -n "models-$tenant" deployment/model-gateway --timeout=180s
+  if [ "$workload" = mcp-read-only ]; then
+    KUBECONFIG="$kubeconfig" "$kubectl_command" rollout status \
+      -n "tools-$tenant" deployment/mcp-integration --timeout=180s
+  fi
   KUBECONFIG="$kubeconfig" "$kubectl_command" wait --for=condition=Ready \
     -n "gateway-$tenant" pod/probe pod/rogue --timeout=180s
 
@@ -428,6 +500,20 @@ probe runtime-b "$runtime_pod_b" socket \
   --host postgres.data-a.svc.cluster.local --port 5432 --expect denied
 probe runtime-b "$runtime_pod_b" socket \
   --host model-gateway.models-a.svc.cluster.local --port 8000 --expect denied
+if [ "$workload" = mcp-read-only ]; then
+  probe runtime-a "$runtime_pod_a" socket \
+    --host mcp-integration.tools-a.svc.cluster.local --port 8000 --expect allowed
+  probe runtime-a "$runtime_pod_a" socket \
+    --host mcp-integration.tools-b.svc.cluster.local --port 8000 --expect denied
+  probe runtime-b "$runtime_pod_b" socket \
+    --host mcp-integration.tools-b.svc.cluster.local --port 8000 --expect allowed
+  probe runtime-b "$runtime_pod_b" socket \
+    --host mcp-integration.tools-a.svc.cluster.local --port 8000 --expect denied
+  probe gateway-a probe socket \
+    --host mcp-integration.tools-a.svc.cluster.local --port 8000 --expect denied
+  probe gateway-b probe socket \
+    --host mcp-integration.tools-b.svc.cluster.local --port 8000 --expect denied
+fi
 if [ "$receipt_proof" = true ]; then
   probe runtime-a "$runtime_pod_a" socket \
     --host "$platform_ip" --port 3000 --expect allowed
@@ -435,17 +521,33 @@ if [ "$receipt_proof" = true ]; then
     --host "$platform_ip" --port 3000 --expect allowed
 fi
 
-count_before=$(model_count a)
-probe gateway-a probe duplicates --urls "$urls_a" \
-  --request-id duplicate-a --attempts "$duplicate_attempts" --expect-answer tenant-a
-count_after=$(model_count a)
-test "$((count_after - count_before))" -eq 1
+if [ "$workload" = mcp-read-only ]; then
+  count_before=$(mcp_count a)
+  probe gateway-a probe duplicates --urls "$urls_a" \
+    --request-id duplicate-a --attempts "$duplicate_attempts" \
+    --expect-answer tenant-a --mcp
+  count_after=$(mcp_count a)
+  test "$((count_after - count_before))" -eq 1
 
-count_before=$(model_count b)
-probe gateway-b probe duplicates --urls "$urls_b" \
-  --request-id duplicate-b --attempts "$duplicate_attempts" --expect-answer tenant-b
-count_after=$(model_count b)
-test "$((count_after - count_before))" -eq 1
+  count_before=$(mcp_count b)
+  probe gateway-b probe duplicates --urls "$urls_b" \
+    --request-id duplicate-b --attempts "$duplicate_attempts" \
+    --expect-answer tenant-b --mcp
+  count_after=$(mcp_count b)
+  test "$((count_after - count_before))" -eq 1
+else
+  count_before=$(model_count a)
+  probe gateway-a probe duplicates --urls "$urls_a" \
+    --request-id duplicate-a --attempts "$duplicate_attempts" --expect-answer tenant-a
+  count_after=$(model_count a)
+  test "$((count_after - count_before))" -eq 1
+
+  count_before=$(model_count b)
+  probe gateway-b probe duplicates --urls "$urls_b" \
+    --request-id duplicate-b --attempts "$duplicate_attempts" --expect-answer tenant-b
+  count_after=$(model_count b)
+  test "$((count_after - count_before))" -eq 1
+fi
 
 KUBECONFIG="$kubeconfig" "$kubectl_command" get networkpolicy runtime \
   -n runtime-a -o json >"$workdir/runtime-a-policy.json"
@@ -459,9 +561,14 @@ KUBECONFIG="$kubeconfig" "$kubectl_command" apply \
   -f "$workdir/runtime-a-policy-partition.json"
 wait_socket_policy runtime-a "$runtime_pod_a" \
   postgres.data-a.svc.cluster.local 5432 denied
+partition_error=task_store_unavailable
+if [ "$workload" = mcp-read-only ]; then
+  partition_error=state_store_failed
+fi
 probe gateway-a probe request --url "$service_a" \
   --request-id database-partition-a --expect-status 503 \
-  --expect-error task_store_unavailable --timeout 12
+  --expect-error "$partition_error" \
+  --timeout 12
 test "$(model_count a)" -eq "$count_before"
 probe gateway-b probe request --url "$service_b" \
   --request-id database-partition-control-b --expect-answer tenant-b
@@ -472,7 +579,11 @@ wait_socket_policy runtime-a "$runtime_pod_a" \
   postgres.data-a.svc.cluster.local 5432 allowed
 probe gateway-a probe request --url "$service_a" \
   --request-id database-partition-a --expect-answer tenant-a
-test "$(model_count a)" -eq "$((count_before + 1))"
+model_increment=1
+if [ "$workload" = mcp-read-only ]; then
+  model_increment=2
+fi
+test "$(model_count a)" -eq "$((count_before + model_increment))"
 
 survivor_request=pod-replacement-survivor-a
 probe gateway-a probe request --url "$service_a" \
@@ -496,8 +607,62 @@ capture_pods a "$workdir/pods-a-replaced.json"
   --previous "$workdir/pods-a-inspected.json"
 capture_logs a "$workdir/pods-a-replaced-inspected.json" \
   "$workdir/replacement-activation-a.json" 0 1 true
-probe gateway-a probe task-status --url "$service_a" \
-  --request-id "$survivor_request" --expect-status completed
+if [ "$workload" = mcp-read-only ]; then
+  test "$(database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit WHERE request_id = '$survivor_request' AND phase = 'execution' AND outcome = 'completed';")" -eq 1
+else
+  probe gateway-a probe task-status --url "$service_a" \
+    --request-id "$survivor_request" --expect-status completed
+fi
+
+if [ "$workload" = mcp-read-only ]; then
+  for tenant in a b; do
+    if [ "$tenant" = a ]; then
+      other=b
+    else
+      other=a
+    fi
+    stale_request="credential-stale-$tenant"
+    apply_secret_env "tools-$tenant" mcp-server-credentials \
+      "$assets/tenant-$tenant-rotated-mcp-server.env"
+    apply_secret_env "runtime-$tenant" runtime-mcp-credentials \
+      "$assets/tenant-$tenant-rotated-mcp-runtime.env"
+    KUBECONFIG="$kubeconfig" "$kubectl_command" rollout restart \
+      -n "tools-$tenant" deployment/mcp-integration >/dev/null
+    KUBECONFIG="$kubeconfig" "$kubectl_command" rollout status \
+      -n "tools-$tenant" deployment/mcp-integration --timeout=180s
+    wait_mcp_server_secret "$tenant" \
+      "$assets/tenant-$tenant-rotated-mcp-server.env"
+    count_before=$(mcp_count "$tenant")
+
+    probe "gateway-$tenant" probe request --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
+      --request-id "$stale_request" --expect-status 500 \
+      --expect-error mcp_transport_failed --timeout 12
+    test "$(mcp_count "$tenant")" -eq "$count_before"
+    probe "gateway-$tenant" probe request --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
+      --request-id "$stale_request" --expect-status 500 \
+      --expect-error mcp_tool_call_indeterminate --timeout 12
+    test "$(mcp_count "$tenant")" -eq "$count_before"
+    probe "gateway-$other" probe request \
+      --url "http://runtime.runtime-$other.svc.cluster.local:8080" \
+      --request-id "rotation-control-$other-for-$tenant" \
+      --expect-answer "tenant-$other"
+
+    KUBECONFIG="$kubeconfig" "$helm_command" upgrade runtime "$chart" \
+      --namespace "runtime-$tenant" \
+      --values "$assets/tenant-$tenant-values.json" \
+      --set "runtimeConfig.rolloutId=topology-mcp-credential-v2-$tenant" \
+      --wait --timeout 5m
+    probe "gateway-$tenant" probe request \
+      --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
+      --request-id "$stale_request" --expect-status 500 \
+      --expect-error mcp_tool_call_indeterminate --timeout 12
+    probe "gateway-$tenant" probe request \
+      --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
+      --request-id "credential-rotated-$tenant" --expect-answer "tenant-$tenant"
+    test "$(mcp_count "$tenant")" -eq "$((count_before + 1))"
+  done
+fi
 
 activation_a=$(database_scalar a \
   "SELECT COUNT(*) FROM prometa_runtime_release_activation;")
@@ -512,6 +677,36 @@ test "$activation_b" -eq 1
 test "$foreign_a" -eq 0
 test "$foreign_b" -eq 0
 
+mcp_report_args=()
+if [ "$workload" = mcp-read-only ]; then
+  mcp_audit_a=$(database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit;")
+  mcp_audit_b=$(database_scalar b \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit;")
+  mcp_indeterminate_a=$(database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_idempotency WHERE status = 'indeterminate';")
+  mcp_indeterminate_b=$(database_scalar b \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_idempotency WHERE status = 'indeterminate';")
+  test "$mcp_audit_a" -gt 0
+  test "$mcp_audit_b" -gt 0
+  test "$mcp_indeterminate_a" -eq 1
+  test "$mcp_indeterminate_b" -eq 1
+  test "$(database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit WHERE tenant_id <> 'tenant-topology-a';")" -eq 0
+  test "$(database_scalar b \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit WHERE tenant_id <> 'tenant-topology-b';")" -eq 0
+  test "$(database_scalar a \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit WHERE event ? 'arguments' OR event ? 'output' OR event ? 'credentials';")" -eq 0
+  test "$(database_scalar b \
+    "SELECT COUNT(*) FROM prometa_runtime_mcp_audit WHERE event ? 'arguments' OR event ? 'output' OR event ? 'credentials';")" -eq 0
+  mcp_report_args=(
+    --mcp-audit-count-a "$mcp_audit_a"
+    --mcp-audit-count-b "$mcp_audit_b"
+    --mcp-indeterminate-count-a "$mcp_indeterminate_a"
+    --mcp-indeterminate-count-b "$mcp_indeterminate_b"
+  )
+fi
+
 node_count_a=$(
   "$python_command" "$fixture" json-value \
     --input "$workdir/pods-a-replaced-inspected.json" --key nodeCount
@@ -525,7 +720,15 @@ kubernetes_version=$(
     "$python_command" -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"])'
 )
 
-receipt_report_args=()
+report_args=(
+  --profile "$profile"
+  --output "$report"
+  --kubernetes-version "$kubernetes_version"
+  --activation-count-a "$activation_a"
+  --activation-count-b "$activation_b"
+  --node-count-a "$node_count_a"
+  --node-count-b "$node_count_b"
+)
 if [ "$receipt_proof" = true ]; then
   "$python_command" "$fixture" verify-platform-receipts \
     --fixture "$assets/platform-receipt-fixture.json" \
@@ -538,22 +741,18 @@ if [ "$receipt_proof" = true ]; then
     "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status = 'delivered';" 2)
   test "$(database_scalar a "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status <> 'delivered';")" -eq 0
   test "$(database_scalar b "SELECT COUNT(*) FROM prometa_runtime_receipt_outbox WHERE status <> 'delivered';")" -eq 0
-  receipt_report_args+=(
+  report_args+=(
     --receipt-proof "$workdir/platform-receipt-proof.json"
     --receipt-outbox-delivered-a "$delivered_a"
     --receipt-outbox-delivered-b "$delivered_b"
   )
 fi
 
+if [ "$workload" = mcp-read-only ]; then
+  report_args+=("${mcp_report_args[@]}")
+fi
+
 mkdir -p "$(dirname -- "$report")"
-"$python_command" "$fixture" report \
-  --profile "$profile" \
-  --output "$report" \
-  --kubernetes-version "$kubernetes_version" \
-  --activation-count-a "$activation_a" \
-  --activation-count-b "$activation_b" \
-  --node-count-a "$node_count_a" \
-  --node-count-b "$node_count_b" \
-  "${receipt_report_args[@]}"
+"$python_command" "$fixture" report "${report_args[@]}"
 
 echo "Tenant runtime topology certification passed: $report"

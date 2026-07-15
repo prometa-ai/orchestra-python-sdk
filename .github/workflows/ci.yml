@@ -87,6 +87,33 @@ jobs:
           tests/test_runtime_*.py
           tests/test_promotion_attestation.py
 
+  runtime-mcp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install governed MCP runtime extra
+        run: pip install ".[dev,runtime-mcp]"
+
+      - name: Verify MCP governance and official transports
+        run: >-
+          pytest -q
+          tests/test_runtime_mcp.py
+          tests/test_runtime_mcp_transport.py
+
+      - name: Dependency boundary and lint
+        run: >-
+          ruff check
+          prometa/runtime/mcp.py
+          tests/test_runtime_mcp.py
+          tests/test_runtime_mcp_transport.py
+          tests/runtime_mcp_stdio_server.py
+
   runtime-upgrade-rollback:
     runs-on: ubuntu-latest
     timeout-minutes: 15

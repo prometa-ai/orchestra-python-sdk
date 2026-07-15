@@ -115,6 +115,9 @@ class RuntimeBundleConfig:
     tools: Tuple[RuntimeTool, ...]
     guardrails: Tuple[RuntimeGuardrail, ...]
     contract: RuntimeContract
+    mcp_servers: Tuple[str, ...] = ()
+    required_scopes: Tuple[str, ...] = ()
+    granted_scopes: Tuple[str, ...] = ()
 
     @property
     def max_iterations(self) -> int:
@@ -490,6 +493,15 @@ def parse_runtime_bundle(
         _parse_tool(value)
         for value in _sequence(content.get("tools", []), "invalid_runtime_tools", 128)
     )
+    mcp_servers = _string_tuple(
+        content.get("mcpServers", []), "invalid_runtime_mcp_servers", 128
+    )
+    required_scopes = _string_tuple(
+        content.get("requiredScopes", []), "invalid_runtime_scopes", 256
+    )
+    granted_scopes = _string_tuple(
+        content.get("grantedScopes", []), "invalid_runtime_scopes", 256
+    )
     guardrails = tuple(
         _parse_guardrail(value)
         for value in _sequence(
@@ -502,6 +514,16 @@ def parse_runtime_bundle(
             owner = tool_identifiers.setdefault(identifier, index)
             if owner != index:
                 raise BundleVerificationError("ambiguous_runtime_tool")
+    derived_mcp_servers = {
+        tool.mcp_server for tool in tools if tool.mcp_server is not None
+    }
+    if set(mcp_servers) != derived_mcp_servers:
+        raise BundleVerificationError("runtime_mcp_server_manifest_mismatch")
+    derived_required_scopes = {scope for tool in tools for scope in tool.scopes}
+    if set(required_scopes) != derived_required_scopes:
+        raise BundleVerificationError("runtime_required_scope_manifest_mismatch")
+    if not derived_required_scopes.issubset(set(granted_scopes)):
+        raise BundleVerificationError("runtime_tool_scope_not_granted")
     if len({guardrail.name for guardrail in guardrails}) != len(guardrails):
         raise BundleVerificationError("ambiguous_runtime_guardrail")
     topology = _json_copy(
@@ -594,6 +616,9 @@ def parse_runtime_bundle(
         primary_model=primaries[0],
         topology=topology,
         tools=tools,
+        mcp_servers=mcp_servers,
+        required_scopes=required_scopes,
+        granted_scopes=granted_scopes,
         guardrails=guardrails,
         contract=contract,
     )

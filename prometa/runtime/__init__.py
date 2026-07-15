@@ -8,7 +8,8 @@ Orchestra control plane synchronously. Install
 adapters, or ``prometa-sdk[runtime-host]`` for the first tenant-deployed
 model-only host and its PostgreSQL dependency. Optional bootstrap pull may read
 one tenant-selected release handoff, but no tenant request execution path calls
-the Orchestra control plane.
+the Orchestra control plane. Install ``prometa-sdk[runtime-mcp]`` on Python
+3.10+ for the governed tenant-side MCP transport adapter.
 """
 
 from .trust import (
@@ -102,6 +103,32 @@ from .kernel import (
     RuntimeKernel,
 )
 from .model_gateway import OpenAICompatibleModelAdapter
+from .mcp import (
+    MCP_TRANSPORTS,
+    MCP_AUTH_MODES,
+    MCP_RISK_LEVELS,
+    MCP_ENVIRONMENTS,
+    MCP_PERMISSION_LEVELS,
+    McpServerConfig,
+    McpToolGrant,
+    McpBrokerPolicy,
+    McpEgressPolicy,
+    ExplicitMcpEgressPolicy,
+    McpTransportCredentials,
+    McpCredentialProvider,
+    McpCredentialBinding,
+    EnvironmentMcpCredentialProvider,
+    McpAuditEvent,
+    McpAuditSink,
+    InMemoryMcpAuditSink,
+    McpIdempotencyRecord,
+    McpIdempotencyStore,
+    InMemoryMcpIdempotencyStore,
+    McpTransportClient,
+    McpTransportError,
+    OfficialMcpTransportClient,
+    GovernedMcpToolBroker,
+)
 from .postgres import (
     RUNTIME_POSTGRES_COMPATIBILITY_VERSION,
     RUNTIME_POSTGRES_MIN_SCHEMA_VERSION,
@@ -232,6 +259,30 @@ __all__ = [
     "available_runtime_capabilities",
     "RuntimeKernel",
     "OpenAICompatibleModelAdapter",
+    "MCP_TRANSPORTS",
+    "MCP_AUTH_MODES",
+    "MCP_RISK_LEVELS",
+    "MCP_ENVIRONMENTS",
+    "MCP_PERMISSION_LEVELS",
+    "McpServerConfig",
+    "McpToolGrant",
+    "McpBrokerPolicy",
+    "McpEgressPolicy",
+    "ExplicitMcpEgressPolicy",
+    "McpTransportCredentials",
+    "McpCredentialProvider",
+    "McpCredentialBinding",
+    "EnvironmentMcpCredentialProvider",
+    "McpAuditEvent",
+    "McpAuditSink",
+    "InMemoryMcpAuditSink",
+    "McpIdempotencyRecord",
+    "McpIdempotencyStore",
+    "InMemoryMcpIdempotencyStore",
+    "McpTransportClient",
+    "McpTransportError",
+    "OfficialMcpTransportClient",
+    "GovernedMcpToolBroker",
     "RUNTIME_POSTGRES_SCHEMA_VERSION",
     "RUNTIME_POSTGRES_COMPATIBILITY_VERSION",
     "RUNTIME_POSTGRES_MIN_SCHEMA_VERSION",

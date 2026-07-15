@@ -296,6 +296,9 @@ def test_tool_and_human_guard_requirements_cannot_be_downgraded(vector) -> None:
                 "requiredGuardrails": ["tenant_risk_gate"],
             }
         ]
+        content["mcpServers"] = ["Orders"]
+        content["requiredScopes"] = ["orders.read"]
+        content["grantedScopes"] = ["orders.read"]
         content["runtimeContract"]["requiredCapabilities"].append(
             CAPABILITY_TOOL_BROKER
         )
@@ -340,6 +343,85 @@ def test_tool_and_human_guard_requirements_cannot_be_downgraded(vector) -> None:
             },
         ),
     )
+
+
+def test_signed_mcp_server_and_scope_aggregates_must_match_tools(vector) -> None:
+    def add_tool(content):
+        content["tools"] = [
+            {
+                "name": "Lookup",
+                "source": "mcp",
+                "operation": "orders.lookup",
+                "inputSchema": {"type": "object"},
+                "mcpServer": "Orders",
+                "sideEffects": "read-only",
+                "riskLevel": "low",
+                "authBinding": "service-account",
+                "scopes": ["orders.read"],
+                "requiredGuardrails": [],
+            }
+        ]
+        content["mcpServers"] = ["Orders"]
+        content["requiredScopes"] = ["orders.read"]
+        content["grantedScopes"] = ["orders.read"]
+        content["runtimeContract"]["requiredCapabilities"].append(
+            CAPABILITY_TOOL_BROKER
+        )
+
+    valid = _mutated_verified(vector, add_tool)
+    config = parse_runtime_bundle(
+        valid,
+        supported_capabilities={
+            *BASE_RUNTIME_CAPABILITIES,
+            CAPABILITY_SCHEMA_VALIDATE,
+            CAPABILITY_TOOL_BROKER,
+        },
+    )
+    assert config.mcp_servers == ("Orders",)
+    assert config.required_scopes == ("orders.read",)
+    assert config.granted_scopes == ("orders.read",)
+    legacy_positional = type(config)(
+        config.manifest,
+        config.system_prompt,
+        config.models,
+        config.primary_model,
+        config.topology,
+        config.tools,
+        config.guardrails,
+        config.contract,
+    )
+    assert legacy_positional.mcp_servers == ()
+
+    mutations = [
+        (
+            "runtime_mcp_server_manifest_mismatch",
+            lambda content: (add_tool(content), content.update({"mcpServers": []})),
+        ),
+        (
+            "runtime_required_scope_manifest_mismatch",
+            lambda content: (
+                add_tool(content),
+                content.update({"requiredScopes": []}),
+            ),
+        ),
+        (
+            "runtime_tool_scope_not_granted",
+            lambda content: (add_tool(content), content.update({"grantedScopes": []})),
+        ),
+    ]
+    for code, mutate in mutations:
+        candidate = _mutated_verified(vector, mutate)
+        _assert_code(
+            code,
+            lambda candidate=candidate: parse_runtime_bundle(
+                candidate,
+                supported_capabilities={
+                    *BASE_RUNTIME_CAPABILITIES,
+                    CAPABILITY_SCHEMA_VALIDATE,
+                    CAPABILITY_TOOL_BROKER,
+                },
+            ),
+        )
 
 
 def test_primary_model_and_tool_schema_are_strict(vector) -> None:

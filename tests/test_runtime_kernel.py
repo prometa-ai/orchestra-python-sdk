@@ -227,7 +227,14 @@ def _with_tool(admitted, *, approval_required=False, required_guardrails=()):
             }
         ),
     )
-    config = replace(admitted.config, tools=(tool,), contract=contract)
+    config = replace(
+        admitted.config,
+        tools=(tool,),
+        mcp_servers=("Orders",),
+        required_scopes=("orders.read",),
+        granted_scopes=("orders.read",),
+        contract=contract,
+    )
     return replace(admitted, config=config)
 
 
@@ -486,6 +493,11 @@ def test_tool_calls_are_declared_schema_guarded_and_brokered() -> None:
     assert result.tool_calls == 1
     assert result.attempts == 2
     assert broker.requests[0].arguments == {"orderId": "order-42"}
+    assert broker.requests[0].agent_id == "agent-golden-1"
+    assert broker.requests[0].release_id == "release-golden-v1"
+    assert broker.requests[0].deployment_id == "deployment-golden-v1"
+    assert broker.requests[0].environment == "prod"
+    assert broker.requests[0].granted_scopes == ("orders.read",)
     assert adapter.requests[1].messages[-1]["role"] == "tool"
     assert any(
         event.name == "runtime.tool.call" and event.outcome == "completed"
@@ -614,6 +626,7 @@ def test_tool_approval_is_tenant_owned_and_fail_closed() -> None:
     assert asyncio.run(kernel.execute(vector["sampleInput"])).tool_calls == 1
     assert reviewer.requests[0].stage == "tool"
     assert reviewer.requests[0].payload == {"orderId": "order-42"}
+    assert broker.requests[-1].approval_references == ("tenant-review-1",)
 
 
 def test_human_approval_guard_requires_an_explicit_tenant_decision() -> None:

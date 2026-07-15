@@ -214,11 +214,23 @@ class HumanEscalation(Protocol):
 
 
 @dataclass(frozen=True)
+class _GuardOutcome:
+    payload: Any
+    approval_references: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ToolInvocationRequest:
     request_id: str
     call_id: str
     tool: RuntimeTool
     arguments: Mapping[str, Any]
+    agent_id: Optional[str] = None
+    release_id: Optional[str] = None
+    deployment_id: Optional[str] = None
+    environment: Optional[str] = None
+    granted_scopes: Tuple[str, ...] = ()
+    approval_references: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -578,11 +590,11 @@ class RuntimeKernel:
         request_id: str,
         *,
         tool: Optional[RuntimeTool] = None,
-    ) -> Any:
+    ) -> _GuardOutcome:
         guardrails = self.admission.config.guardrails
         required = set(tool.required_guardrails if tool else ())
         if not guardrails and not required:
-            return payload
+            return _GuardOutcome(payload)
         if self.guard_evaluator is None:
             raise RuntimeExecutionError("guard_evaluator_missing")
         try:
@@ -642,22 +654,27 @@ class RuntimeKernel:
                 for guardrail in guardrails
             )
             if requires_human:
-                return await self._human_review(
+                human_decision = await self._human_review(
                     request_id,
                     stage,
                     "Signed human-approval guardrail",
                     tool,
                     guarded_payload,
                 )
-            return guarded_payload
+                return _GuardOutcome(
+                    guarded_payload,
+                    (human_decision.reviewer_reference,),
+                )
+            return _GuardOutcome(guarded_payload)
         if decision.action == "escalate":
-            return await self._human_review(
+            human_decision = await self._human_review(
                 request_id,
                 stage,
                 decision.reason or "guardrail escalation",
                 tool,
                 payload,
             )
+            return _GuardOutcome(payload, (human_decision.reviewer_reference,))
         raise RuntimeExecutionError("guard_denied")
 
     async def _human_review(
@@ -667,7 +684,7 @@ class RuntimeKernel:
         reason: str,
         tool: Optional[RuntimeTool],
         payload: Any,
-    ) -> Any:
+    ) -> HumanEscalationDecision:
         if self.human_escalation is None:
             self._emit(
                 "runtime.human_review",
@@ -710,7 +727,7 @@ class RuntimeKernel:
         )
         if not decision.approved:
             raise RuntimeExecutionError("human_review_denied")
-        return payload
+        return decision
 
     def _tool_by_name(self, name: str) -> RuntimeTool:
         matches = [
@@ -729,19 +746,22 @@ class RuntimeKernel:
         arguments = self._validate_schema(
             "tool_input", call.arguments, tool.input_schema, request_id
         )
-        arguments = await self._guard("tool", arguments, request_id, tool=tool)
+        guard_outcome = await self._guard("tool", arguments, request_id, tool=tool)
+        arguments = guard_outcome.payload
+        approval_references = list(guard_outcome.approval_references)
         if self.admission.config.guardrails or tool.required_guardrails:
             arguments = self._validate_schema(
                 "tool_input", arguments, tool.input_schema, request_id
             )
         if tool.approval_required:
-            await self._human_review(
+            approval = await self._human_review(
                 request_id,
                 "tool",
                 "Tool %s requires human approval" % tool.operation,
                 tool,
                 arguments,
             )
+            approval_references.append(approval.reviewer_reference)
         self._emit(
             "runtime.tool.call",
             "started",
@@ -760,6 +780,14 @@ class RuntimeKernel:
                         call_id=call.call_id,
                         tool=tool,
                         arguments=arguments,
+                        agent_id=self.admission.config.manifest.agent_id,
+                        release_id=self.admission.promotion.claims["releaseId"],
+                        deployment_id=self.admission.promotion.claims["deploymentId"],
+                        environment=self.admission.bundle.claims[
+                            "targetEnvironment"
+                        ],
+                        granted_scopes=self.admission.config.granted_scopes,
+                        approval_references=tuple(approval_references),
                     )
                 ),
                 timeout=self.policy.tool_timeout_seconds,
@@ -918,7 +946,9 @@ class RuntimeKernel:
                 self.admission.config.contract.input_schema,
                 request_id,
             )
-            runtime_input = await self._guard("input", runtime_input, request_id)
+            runtime_input = (
+                await self._guard("input", runtime_input, request_id)
+            ).payload
             if self.admission.config.guardrails:
                 runtime_input = self._validate_schema(
                     "input",
@@ -1069,7 +1099,9 @@ class RuntimeKernel:
                             self.admission.config.contract.output_schema,
                             request_id,
                         )
-                        output = await self._guard("output", output, request_id)
+                        output = (
+                            await self._guard("output", output, request_id)
+                        ).payload
                         if self.admission.config.guardrails:
                             output = self._validate_schema(
                                 "output",

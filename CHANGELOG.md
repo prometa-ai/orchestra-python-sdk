@@ -18,6 +18,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   and destructive calls require both approval evidence and an idempotency store;
   duplicate, conflicting, in-flight, and indeterminate calls fail closed without
   automatic result replay.
+- PostgreSQL schema v6 with tenant/runtime-scoped MCP idempotency reservations
+  and append-only payload-free audit. Reservations shared by replicas quarantine
+  stale or uncertain outcomes as indeterminate instead of replaying them.
+- Strict reference-host `mcpBroker` configuration, exact signed release binding,
+  late-bound credential names, explicit egress, official MCP transport wiring,
+  and an MCP Helm values example. The reference image installs MCP dependencies;
+  missing or weakened bindings fail closed.
 - Signed bundle admission now cross-checks `mcpServers`, `requiredScopes`, and
   `grantedScopes` against declared tools before a release can execute.
 - A bootstrap-only outbound runtime release handoff client using the new
@@ -45,7 +52,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   rollback. Unknown, gapped, older, or structurally incomplete schemas fail
   before release activation.
 - An explicit `runtimeConfig.rolloutId`, immutable config guidance, and a CI
-  source-baseline drill that proves schema v2 to v5 host upgrade plus
+  source-baseline drill that proves schema v2 to v6 host upgrade plus
   A-to-B-to-freshly-authorized-A prior-bundle rollback.
 - Deployment recovery tests that kill a real host during inference, cut and
   restore its database path, and restore a logical archive into a fresh
@@ -74,6 +81,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   or release identity, stale ownership, exhausted attempts, and unsupported
   side-effecting tools. Task storage, status responses, and claim evidence omit
   request bodies, response bodies, prompts, outputs, keys, and credentials.
+- The stock reference-host CLI enables only read-only MCP releases. Write or
+  destructive bundles require an explicitly injected tenant HumanEscalation
+  adapter, and tool-bearing releases remain incompatible with task recovery.
 - Restore requires an explicit confirmation, matching SHA-256 manifest, empty
   target database, compatible schema, and post-restore integrity verification;
   backup enablement requires explicit sensitive-data acknowledgement and

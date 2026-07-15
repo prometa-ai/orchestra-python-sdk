@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from .admission import RuntimeActivationResult
 from .control_plane import RuntimeReleaseHandoff
+from .mcp import McpAuditEvent, McpIdempotencyRecord
 from .receipts import RuntimeReceiptOutboxItem
 from .tasks import (
     RuntimeTaskClaim,
@@ -40,6 +42,7 @@ _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
 _MAX_RECEIPT_BYTES = 64 * 1024
 _MAX_RELEASE_DOCUMENT_BYTES = 12 * 1024 * 1024
+_MAX_MCP_AUDIT_BYTES = 128 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _RUNTIME_ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
@@ -53,9 +56,9 @@ _RECEIPT_SEQUENCE = {
     "failed": 70,
     "stopped": 80,
 }
-RUNTIME_POSTGRES_SCHEMA_VERSION = 5
+RUNTIME_POSTGRES_SCHEMA_VERSION = 6
 RUNTIME_POSTGRES_COMPATIBILITY_VERSION = 1
-RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 5
+RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 6
 RUNTIME_POSTGRES_MAX_SCHEMA_VERSION = RUNTIME_POSTGRES_SCHEMA_VERSION
 _RUNTIME_TABLES = (
     "prometa_runtime_schema_migrations",
@@ -67,6 +70,8 @@ _RUNTIME_TABLES = (
     "prometa_runtime_release_cache",
     "prometa_runtime_task",
     "prometa_runtime_task_event",
+    "prometa_runtime_mcp_idempotency",
+    "prometa_runtime_mcp_audit",
 )
 _TASK_TABLE_COLUMNS = {
     "prometa_runtime_task": frozenset(
@@ -110,6 +115,41 @@ _TASK_TABLE_COLUMNS = {
         }
     ),
 }
+_MCP_TABLE_COLUMNS = {
+    "prometa_runtime_mcp_idempotency": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "idempotency_key",
+            "request_digest",
+            "status",
+            "reserved_until",
+            "output_digest",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "prometa_runtime_mcp_audit": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "event_id",
+            "audit_reference",
+            "phase",
+            "outcome",
+            "occurred_at",
+            "request_id",
+            "call_id",
+            "operation",
+            "server_connection_id",
+            "idempotency_key",
+            "reason",
+            "event",
+            "created_at",
+        }
+    ),
+}
+_INTEGRITY_TABLE_COLUMNS = {**_TASK_TABLE_COLUMNS, **_MCP_TABLE_COLUMNS}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS prometa_runtime_schema_migrations (
@@ -272,6 +312,65 @@ CREATE TABLE IF NOT EXISTS prometa_runtime_task_event (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_mcp_idempotency (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('reserved', 'completed', 'indeterminate')
+    ),
+    reserved_until TIMESTAMPTZ,
+    output_digest TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, runtime_id, idempotency_key),
+    CHECK (
+        (status = 'reserved' AND reserved_until IS NOT NULL
+            AND output_digest IS NULL)
+        OR
+        (status = 'completed' AND reserved_until IS NULL
+            AND output_digest IS NOT NULL)
+        OR
+        (status = 'indeterminate' AND reserved_until IS NULL
+            AND output_digest IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_mcp_idempotency_status_idx
+    ON prometa_runtime_mcp_idempotency (
+        tenant_id, runtime_id, status, reserved_until
+    );
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_mcp_audit (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    audit_reference TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    request_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    server_connection_id TEXT,
+    idempotency_key TEXT,
+    reason TEXT,
+    event JSONB NOT NULL CHECK (jsonb_typeof(event) = 'object'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, runtime_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_mcp_audit_reference_idx
+    ON prometa_runtime_mcp_audit (
+        tenant_id, runtime_id, audit_reference, occurred_at
+    );
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_mcp_audit_request_idx
+    ON prometa_runtime_mcp_audit (
+        tenant_id, runtime_id, request_id, call_id, occurred_at
+    );
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
@@ -290,6 +389,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (5)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (6)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -450,6 +553,128 @@ def _release_document(value: Any) -> Mapping[str, Any]:
     return dict(value)
 
 
+def _mcp_audit_text(
+    name: str,
+    value: Any,
+    *,
+    required: bool = True,
+    maximum: int = 512,
+) -> Optional[str]:
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or "\x00" in value
+    ):
+        raise ValueError("invalid MCP audit %s" % name)
+    return value
+
+
+def _serialize_mcp_audit(
+    event: McpAuditEvent,
+) -> Tuple[str, str, datetime, Mapping[str, Any]]:
+    if not isinstance(event, McpAuditEvent):
+        raise ValueError("event must be an McpAuditEvent")
+    try:
+        occurred_at = datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("invalid MCP audit occurred_at") from None
+    if occurred_at.tzinfo is None:
+        raise ValueError("invalid MCP audit occurred_at")
+    occurred_at = occurred_at.astimezone(timezone.utc)
+
+    scopes = tuple(
+        _mcp_audit_text("scope", value, maximum=256) for value in event.scopes
+    )
+    approvals = tuple(
+        _mcp_audit_text("approval_reference", value, maximum=512)
+        for value in event.approval_references
+    )
+    if len(scopes) > 256 or len(set(scopes)) != len(scopes):
+        raise ValueError("invalid MCP audit scopes")
+    if len(approvals) > 256 or len(set(approvals)) != len(approvals):
+        raise ValueError("invalid MCP audit approval references")
+    for digest in (event.argument_digest, event.output_digest):
+        if digest is not None:
+            _validate_digest(digest)
+
+    document = {
+        "auditReference": _mcp_audit_text(
+            "audit_reference", event.audit_reference, maximum=256
+        ),
+        "phase": _mcp_audit_text("phase", event.phase, maximum=64),
+        "outcome": _mcp_audit_text("outcome", event.outcome, maximum=64),
+        "occurredAt": occurred_at.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        ),
+        "requestId": _mcp_audit_text("request_id", event.request_id, maximum=256),
+        "callId": _mcp_audit_text("call_id", event.call_id, maximum=256),
+        "agentId": _mcp_audit_text(
+            "agent_id", event.agent_id, required=False, maximum=256
+        ),
+        "releaseId": _mcp_audit_text(
+            "release_id", event.release_id, required=False, maximum=256
+        ),
+        "deploymentId": _mcp_audit_text(
+            "deployment_id", event.deployment_id, required=False, maximum=256
+        ),
+        "environment": _mcp_audit_text(
+            "environment", event.environment, required=False, maximum=64
+        ),
+        "serverName": _mcp_audit_text(
+            "server_name", event.server_name, required=False, maximum=120
+        ),
+        "serverConnectionId": _mcp_audit_text(
+            "server_connection_id",
+            event.server_connection_id,
+            required=False,
+            maximum=200,
+        ),
+        "transport": _mcp_audit_text(
+            "transport", event.transport, required=False, maximum=64
+        ),
+        "operation": _mcp_audit_text(
+            "operation", event.operation, maximum=256
+        ),
+        "permission": _mcp_audit_text(
+            "permission", event.permission, required=False, maximum=64
+        ),
+        "effectiveRisk": _mcp_audit_text(
+            "effective_risk", event.effective_risk, required=False, maximum=64
+        ),
+        "sideEffects": _mcp_audit_text(
+            "side_effects", event.side_effects, maximum=64
+        ),
+        "scopes": list(scopes),
+        "approvalReferences": list(approvals),
+        "argumentDigest": event.argument_digest,
+        "outputDigest": event.output_digest,
+        "idempotencyKey": _mcp_audit_text(
+            "idempotency_key", event.idempotency_key, required=False, maximum=256
+        ),
+        "reason": _mcp_audit_text(
+            "reason", event.reason, required=False, maximum=256
+        ),
+    }
+    try:
+        encoded = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("MCP audit event must be finite JSON") from None
+    if len(encoded.encode("utf-8")) > _MAX_MCP_AUDIT_BYTES:
+        raise ValueError("MCP audit event exceeds 128 KiB")
+    event_id = "mcpa1:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return event_id, encoded, occurred_at, document
+
+
 def install_postgres_runtime_schema(
     dsn: str,
     *,
@@ -578,17 +803,17 @@ def verify_postgres_runtime_integrity(
                       AND table_name = ANY(%s)
                     ORDER BY table_name, ordinal_position
                     """,
-                    (list(_TASK_TABLE_COLUMNS),),
+                    (list(_INTEGRITY_TABLE_COLUMNS),),
                 )
                 columns = {
                     table_name: set()
-                    for table_name in _TASK_TABLE_COLUMNS
+                    for table_name in _INTEGRITY_TABLE_COLUMNS
                 }
                 for table_name, column_name in cursor.fetchall():
                     columns[str(table_name)].add(str(column_name))
                 if any(
                     columns[table_name] != expected
-                    for table_name, expected in _TASK_TABLE_COLUMNS.items()
+                    for table_name, expected in _INTEGRITY_TABLE_COLUMNS.items()
                 ):
                     raise RuntimePersistenceError(
                         "runtime_schema_integrity_failed"
@@ -661,6 +886,63 @@ def verify_postgres_runtime_integrity(
 
                 cursor.execute(
                     """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_mcp_idempotency
+                    WHERE request_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR (output_digest IS NOT NULL AND
+                           output_digest !~ '^sha256:[0-9a-f]{64}$')
+                       OR ((status = 'reserved') IS DISTINCT FROM
+                           (reserved_until IS NOT NULL AND
+                            output_digest IS NULL))
+                       OR ((status = 'completed') IS DISTINCT FROM
+                           (reserved_until IS NULL AND
+                            output_digest IS NOT NULL))
+                       OR ((status = 'indeterminate') IS DISTINCT FROM
+                           (reserved_until IS NULL AND
+                            output_digest IS NULL))
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_mcp_audit
+                    WHERE event->>'auditReference' IS DISTINCT FROM
+                            audit_reference
+                       OR event->>'phase' IS DISTINCT FROM phase
+                       OR event->>'outcome' IS DISTINCT FROM outcome
+                       OR event->>'requestId' IS DISTINCT FROM request_id
+                       OR event->>'callId' IS DISTINCT FROM call_id
+                       OR event->>'operation' IS DISTINCT FROM operation
+                       OR event->>'serverConnectionId' IS DISTINCT FROM
+                            server_connection_id
+                       OR event->>'idempotencyKey' IS DISTINCT FROM
+                            idempotency_key
+                       OR event->>'reason' IS DISTINCT FROM reason
+                       OR (event->>'argumentDigest' IS NOT NULL AND
+                           event->>'argumentDigest'
+                               !~ '^sha256:[0-9a-f]{64}$')
+                       OR (event->>'outputDigest' IS NOT NULL AND
+                           event->>'outputDigest'
+                               !~ '^sha256:[0-9a-f]{64}$')
+                       OR event ? 'arguments'
+                       OR event ? 'output'
+                       OR event ? 'credentials'
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
                     SELECT
                         (SELECT COUNT(*) FROM prometa_runtime_schema_migrations),
                         (SELECT COUNT(*) FROM prometa_runtime_admission_replay),
@@ -670,7 +952,9 @@ def verify_postgres_runtime_integrity(
                         (SELECT COUNT(*) FROM prometa_runtime_receipt_outbox),
                         (SELECT COUNT(*) FROM prometa_runtime_release_cache),
                         (SELECT COUNT(*) FROM prometa_runtime_task),
-                        (SELECT COUNT(*) FROM prometa_runtime_task_event)
+                        (SELECT COUNT(*) FROM prometa_runtime_task_event),
+                        (SELECT COUNT(*) FROM prometa_runtime_mcp_idempotency),
+                        (SELECT COUNT(*) FROM prometa_runtime_mcp_audit)
                     """
                 )
                 count_row = cursor.fetchone()
@@ -1946,6 +2230,394 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
             events=tuple(events),
             history_truncated=record.sequence > len(events),
         )
+
+
+class PostgresMcpIdempotencyStore(_PostgresTenantStore):
+    """Fail-closed MCP reservation state shared by runtime replicas.
+
+    An expired reservation is quarantined as indeterminate. It is never
+    reacquired automatically because the previous replica may have reached the
+    tenant tool before it stopped.
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        tenant_id: str,
+        runtime_id: str,
+        reservation_timeout_seconds: float = 300.0,
+        connect: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        super().__init__(dsn, tenant_id=tenant_id, connect=connect)
+        self.runtime_id = _validate_identifier("runtime_id", runtime_id)
+        if (
+            isinstance(reservation_timeout_seconds, bool)
+            or not isinstance(reservation_timeout_seconds, (int, float))
+            or reservation_timeout_seconds <= 0
+            or reservation_timeout_seconds > 86_400
+        ):
+            raise ValueError(
+                "reservation_timeout_seconds must be between 0 and 86400"
+            )
+        self.reservation_timeout_seconds = float(reservation_timeout_seconds)
+
+    async def reserve(self, key: str, request_digest: str) -> str:
+        identity = _validate_identifier("idempotency_key", key, 256)
+        digest = _validate_digest(request_digest)
+        return await asyncio.to_thread(self._reserve_sync, identity, digest)
+
+    def _reserve_sync(self, key: str, request_digest: str) -> str:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_mcp_idempotency (
+                            tenant_id, runtime_id, idempotency_key,
+                            request_digest, status, reserved_until
+                        ) VALUES (
+                            %s, %s, %s, %s, 'reserved',
+                            CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
+                        )
+                        ON CONFLICT DO NOTHING
+                        RETURNING status
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            key,
+                            request_digest,
+                            self.reservation_timeout_seconds,
+                        ),
+                    )
+                    if cursor.fetchone() is not None:
+                        return "acquired"
+                    cursor.execute(
+                        """
+                        SELECT request_digest, status
+                        FROM prometa_runtime_mcp_idempotency
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, self.runtime_id, key),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        raise RuntimePersistenceError(
+                            "mcp_idempotency_record_missing"
+                        )
+                    if existing[0] != request_digest:
+                        return "conflict"
+                    status = str(existing[1])
+                    if status == "reserved":
+                        cursor.execute(
+                            """
+                            UPDATE prometa_runtime_mcp_idempotency
+                            SET status = 'indeterminate',
+                                reserved_until = NULL,
+                                output_digest = NULL,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE tenant_id = %s AND runtime_id = %s
+                              AND idempotency_key = %s
+                              AND status = 'reserved'
+                              AND reserved_until <= CURRENT_TIMESTAMP
+                            RETURNING status
+                            """,
+                            (self.tenant_id, self.runtime_id, key),
+                        )
+                        if cursor.fetchone() is not None:
+                            return "indeterminate"
+                    if status not in {"reserved", "completed", "indeterminate"}:
+                        raise RuntimePersistenceError(
+                            "mcp_idempotency_record_invalid"
+                        )
+                    return status
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "mcp_idempotency_store_unavailable"
+            ) from None
+
+    async def complete(
+        self, key: str, request_digest: str, output_digest: str
+    ) -> None:
+        identity = _validate_identifier("idempotency_key", key, 256)
+        request = _validate_digest(request_digest)
+        output = _validate_digest(output_digest)
+        await asyncio.to_thread(self._complete_sync, identity, request, output)
+
+    def _complete_sync(
+        self, key: str, request_digest: str, output_digest: str
+    ) -> None:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_mcp_idempotency
+                        SET status = 'completed',
+                            reserved_until = NULL,
+                            output_digest = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                          AND request_digest = %s
+                          AND status = 'reserved'
+                        RETURNING idempotency_key
+                        """,
+                        (
+                            output_digest,
+                            self.tenant_id,
+                            self.runtime_id,
+                            key,
+                            request_digest,
+                        ),
+                    )
+                    if cursor.fetchone() is None:
+                        raise RuntimePersistenceError(
+                            "mcp_idempotency_transition_invalid"
+                        )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "mcp_idempotency_store_unavailable"
+            ) from None
+
+    async def release(self, key: str, request_digest: str) -> None:
+        identity = _validate_identifier("idempotency_key", key, 256)
+        digest = _validate_digest(request_digest)
+        await asyncio.to_thread(self._release_sync, identity, digest)
+
+    def _release_sync(self, key: str, request_digest: str) -> None:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        DELETE FROM prometa_runtime_mcp_idempotency
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                          AND request_digest = %s
+                          AND status = 'reserved'
+                        RETURNING idempotency_key
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            key,
+                            request_digest,
+                        ),
+                    )
+                    if cursor.fetchone() is not None:
+                        return
+                    cursor.execute(
+                        """
+                        SELECT request_digest, status
+                        FROM prometa_runtime_mcp_idempotency
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, self.runtime_id, key),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        return
+                    raise RuntimePersistenceError(
+                        "mcp_idempotency_transition_invalid"
+                    )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "mcp_idempotency_store_unavailable"
+            ) from None
+
+    async def mark_indeterminate(self, key: str, request_digest: str) -> None:
+        identity = _validate_identifier("idempotency_key", key, 256)
+        digest = _validate_digest(request_digest)
+        await asyncio.to_thread(self._mark_indeterminate_sync, identity, digest)
+
+    def _mark_indeterminate_sync(self, key: str, request_digest: str) -> None:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_mcp_idempotency (
+                            tenant_id, runtime_id, idempotency_key,
+                            request_digest, status, reserved_until
+                        ) VALUES (%s, %s, %s, %s, 'indeterminate', NULL)
+                        ON CONFLICT DO NOTHING
+                        RETURNING idempotency_key
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            key,
+                            request_digest,
+                        ),
+                    )
+                    if cursor.fetchone() is not None:
+                        return
+                    cursor.execute(
+                        """
+                        SELECT request_digest
+                        FROM prometa_runtime_mcp_idempotency
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                        FOR UPDATE
+                        """,
+                        (self.tenant_id, self.runtime_id, key),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        raise RuntimePersistenceError(
+                            "mcp_idempotency_record_missing"
+                        )
+                    if existing[0] != request_digest:
+                        raise RuntimePersistenceError(
+                            "mcp_idempotency_digest_mismatch"
+                        )
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_mcp_idempotency
+                        SET status = 'indeterminate',
+                            reserved_until = NULL,
+                            output_digest = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                        """,
+                        (self.tenant_id, self.runtime_id, key),
+                    )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "mcp_idempotency_store_unavailable"
+            ) from None
+
+    async def get(self, key: str) -> Optional[McpIdempotencyRecord]:
+        identity = _validate_identifier("idempotency_key", key, 256)
+        return await asyncio.to_thread(self._get_sync, identity)
+
+    def _get_sync(self, key: str) -> Optional[McpIdempotencyRecord]:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT request_digest, status, output_digest
+                        FROM prometa_runtime_mcp_idempotency
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND idempotency_key = %s
+                        """,
+                        (self.tenant_id, self.runtime_id, key),
+                    )
+                    row = cursor.fetchone()
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "mcp_idempotency_store_unavailable"
+            ) from None
+        if row is None:
+            return None
+        request_digest, status, output_digest = row
+        if (
+            not isinstance(request_digest, str)
+            or _SHA256_DIGEST.fullmatch(request_digest) is None
+            or status not in {"reserved", "completed", "indeterminate"}
+            or (
+                output_digest is not None
+                and (
+                    not isinstance(output_digest, str)
+                    or _SHA256_DIGEST.fullmatch(output_digest) is None
+                )
+            )
+        ):
+            raise RuntimePersistenceError("mcp_idempotency_record_invalid")
+        return McpIdempotencyRecord(
+            request_digest=request_digest,
+            status=status,
+            output_digest=output_digest,
+        )
+
+
+class PostgresMcpAuditSink(_PostgresTenantStore):
+    """Append-only payload-free MCP audit storage for tenant runtimes."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        tenant_id: str,
+        runtime_id: str,
+        connect: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        super().__init__(dsn, tenant_id=tenant_id, connect=connect)
+        self.runtime_id = _validate_identifier("runtime_id", runtime_id)
+
+    async def record(self, event: McpAuditEvent) -> None:
+        event_id, encoded, occurred_at, document = _serialize_mcp_audit(event)
+        await asyncio.to_thread(
+            self._record_sync,
+            event_id,
+            encoded,
+            occurred_at,
+            document,
+        )
+
+    def _record_sync(
+        self,
+        event_id: str,
+        encoded: str,
+        occurred_at: datetime,
+        document: Mapping[str, Any],
+    ) -> None:
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_mcp_audit (
+                            tenant_id, runtime_id, event_id,
+                            audit_reference, phase, outcome, occurred_at,
+                            request_id, call_id, operation,
+                            server_connection_id, idempotency_key, reason, event
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s::jsonb
+                        )
+                        ON CONFLICT (tenant_id, runtime_id, event_id)
+                        DO NOTHING
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            event_id,
+                            document["auditReference"],
+                            document["phase"],
+                            document["outcome"],
+                            occurred_at,
+                            document["requestId"],
+                            document["callId"],
+                            document["operation"],
+                            document["serverConnectionId"],
+                            document["idempotencyKey"],
+                            document["reason"],
+                            encoded,
+                        ),
+                    )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("mcp_audit_store_unavailable") from None
 
 
 class PostgresRuntimeStateStore(_PostgresTenantStore):

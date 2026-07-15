@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -639,6 +640,15 @@ class OfficialMcpTransportClient:
         return rendered
 
 
+def official_mcp_transport_available() -> bool:
+    """Return whether the optional official transport dependencies are installed."""
+
+    return (
+        importlib.util.find_spec("mcp") is not None
+        and importlib.util.find_spec("httpx") is not None
+    )
+
+
 @dataclass(frozen=True)
 class _Authorization:
     server: McpServerConfig
@@ -1107,5 +1117,6 @@ __all__ = [
     "McpTransportClient",
     "McpTransportError",
     "OfficialMcpTransportClient",
+    "official_mcp_transport_available",
     "GovernedMcpToolBroker",
 ]

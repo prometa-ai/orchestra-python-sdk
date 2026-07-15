@@ -1,0 +1,80 @@
+runtimeConfig:
+  existingSecret: tenant-runtime-mcp-release-prod-v1
+  rolloutId: deployment-mcp-prod-v1
+
+credentials:
+  existingSecret: tenant-runtime-credentials
+
+replicaCount: 2
+
+image:
+  repository: registry.example.com/orchestra/prometa-runtime-host
+  tag: "0.18.0"
+
+# The chart does not create or copy MCP credentials. The host configuration
+# names this environment variable, while the operator projects its value from
+# a separately managed Secret.
+extraEnv:
+  - name: MCP_INTEGRATION_AUTHORIZATION
+    valueFrom:
+      secretKeyRef:
+        name: tenant-runtime-mcp-credentials
+        key: integration-authorization
+
+networkPolicy:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-gateway
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tenant-ai-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-models
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: model-gateway
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-tools
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mcp-integration
+      ports:
+        - protocol: TCP
+          port: 8443
+
+migration:
+  networkPolicy:
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: tenant-data
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: postgresql
+        ports:
+          - protocol: TCP
+            port: 5432

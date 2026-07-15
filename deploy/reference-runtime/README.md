@@ -4,13 +4,13 @@ This image is an optional tenant-plane host for the Phase 2A kernel. It is not
 part of the Prometa control plane and does not make a synchronous control-plane
 call while serving requests.
 
-The host supports signed, promoted, model-only `single-react` bundles through a
-generic OpenAI-compatible model gateway. Optional payload-free task recovery
-coordinates retries across replicas. Logical backup, fresh-database restore,
-and payload-free integrity verification are available as tenant-operated
-deployment tools. Concrete MCP, resumable HITL, stored payload replay, memory,
-A2A, rollout automation, standby failover, and production certification remain
-later work.
+The host supports signed, promoted `single-react` bundles through a generic
+OpenAI-compatible model gateway and an optional governed MCP broker. MCP
+connections, grants, credentials, and egress remain tenant-owned; durable
+PostgreSQL call admission and payload-free audit coordinate replicas. Optional
+model-only task recovery coordinates request retries across replicas. Resumable
+HITL, stored payload replay, memory, A2A, rollout automation, standby failover,
+MCP topology certification, and production certification remain later work.
 
 ## Build and conformance
 
@@ -40,7 +40,8 @@ Mount one strict JSON document at `/etc/prometa-runtime/config.json`.
 `config.example.json` embeds the exact signed Builder bundle and promotion
 attestation. `config.pull.example.json` instead names one attestation selected
 by tenant CI/CD and retrieves the pair through the outbound bootstrap channel.
-The two release sources are mutually exclusive.
+`config.mcp.example.json` adds a strict read-only MCP broker to the embedded
+shape. The two release sources are mutually exclusive.
 
 The JSON file contains public trust material and immutable rollout identity,
 not credentials. Supply these through the environment or a workload secret
@@ -53,6 +54,18 @@ provider:
   `controlPlanePull.apiKeyEnv` names it; use a narrow `runtime:read` key.
 - `ORCHESTRA_RUNTIME_RECEIPT_API_KEY`: required only when the optional
   `receiptDelivery.apiKeyEnv` names it; use a narrow `runtime:write` key.
+- MCP credential variables such as `MCP_INTEGRATION_AUTHORIZATION`: required
+  only when named by `mcpBroker.credentialBindings`; values stay in a workload
+  secret and out of the mounted configuration.
+
+The optional `mcpBroker` block must bind every host connection to the exact
+signed `mcpServers` declaration and every configured grant to a signed tool.
+It also requires explicit HTTP origins or stdio commands, late-bound credential
+names, write/destructive approval and idempotency policy, and a reservation
+timeout longer than any tool call. Missing official transport dependencies or a
+weakened/mismatched binding fails closed. The stock CLI can execute read-only
+tools; write or destructive bundles additionally require a tenant-supplied
+`HumanEscalation` adapter through `build_reference_runtime_host()`.
 
 To enable asynchronous lifecycle receipts, add this optional block to the
 mounted configuration. HTTPS is required unless `allowInsecureHttp` is set
@@ -110,6 +123,12 @@ PostgreSQL's transaction clock is authoritative for production lease expiry.
 The serving role needs `SELECT, INSERT, UPDATE` on the task table and
 `SELECT, INSERT` on the event table.
 
+An MCP-enabled host uses `prometa_runtime_mcp_idempotency` to reserve calls
+across replicas and `prometa_runtime_mcp_audit` for append-only payload-free
+decisions. Stale or uncertain reservations become `indeterminate` and cannot be
+automatically reacquired. The serving role needs `SELECT, INSERT, UPDATE,
+DELETE` on the idempotency table and `INSERT` on the audit table.
+
 Install the database schema with a migration identity before starting the
 lower-privilege host:
 
@@ -154,9 +173,10 @@ Restore is deliberately fresh-database-only:
    `PROMETA_RUNTIME_RESTORE_CONFIRM=restore-tenant-runtime`, then run
    `operations/restore-postgres.sh` with matching PostgreSQL client tools.
 4. Point `PROMETA_RUNTIME_DATABASE_URL` at the restored database and run
-   `prometa-runtime-postgres-verify`. The verifier checks schema v5, required
-   payload-free task columns, migration continuity, lease/status projections,
-   and complete ordered task history while returning only table counts.
+   `prometa-runtime-postgres-verify`. The verifier checks schema v6, required
+   payload-free task and MCP columns, migration continuity, lease/status
+   projections, ordered task history, and payload-free MCP audit while returning
+   only table counts.
 5. Start an isolated runtime, exercise health and one controlled request, then
    let tenant CI/CD perform cutover or rollback.
 
@@ -175,8 +195,9 @@ optional backup CronJob, ServiceAccount, and optional HPA/PDB. It does **not** c
 configuration, credentials, backup storage, PostgreSQL, a model gateway, an
 ingress, or any Prometa control-plane service.
 
-Start from `values.production.example.yaml`. The chart refuses to render until
-`credentials.existingSecret` and exactly one of
+Start from `values.production.example.yaml`, or
+`values.mcp.example.yaml` for the explicit MCP Secret projection and egress
+shape. The chart refuses to render until `credentials.existingSecret` and exactly one of
 `runtimeConfig.existingSecret` or `runtimeConfig.existingConfigMap` are set:
 
 ```bash
@@ -187,6 +208,11 @@ helm upgrade --install tenant-runtime deploy/reference-runtime/chart \
   --namespace tenant-runtime \
   -f deploy/reference-runtime/chart/values.production.example.yaml
 ```
+
+For the MCP example, mount `config.mcp.example.json` through the referenced
+runtime config Secret, replace all placeholders with one admitted release, and
+provision the separately referenced MCP credential Secret. The chart never
+creates, copies, or renders that credential.
 
 The credential Secret must expose the configured runtime database, request API
 token, optional model/control-plane/receipt API keys, and migration database
@@ -218,10 +244,11 @@ Security defaults are deliberately fail-closed:
   must already exist when it is not the namespace `default` account.
 
 The production example opens only tenant-gateway ingress plus PostgreSQL and
-model-gateway egress. Add control-plane, telemetry, or receipt-endpoint egress
-only when the corresponding path is configured. For external services use a
-tightly scoped `ipBlock` or a CNI-supported FQDN policy; Kubernetes
-NetworkPolicy does not natively express DNS names.
+model-gateway egress. The MCP example adds only the declared tenant-tools pod
+and port. Add control-plane, telemetry, or receipt-endpoint egress only when the
+corresponding path is configured. For external services use a tightly scoped
+`ipBlock` or a CNI-supported FQDN policy; Kubernetes NetworkPolicy does not
+natively express DNS names.
 
 Enabling the HPA or multiple replicas does not by itself add distributed
 request locking. Configure `taskRecovery` to enable the shipped lease and
@@ -267,8 +294,8 @@ deploy/reference-runtime/ci/upgrade-rollback-drill.sh
 ```
 
 `compatibility-baselines.json` pins chart `0.1.0` commit `51e2faa` at schema v2.
-The drill starts release A on that source, migrates to v5 and starts release B on
-current code, then starts the baseline host against v5 with release A's exact
+The drill starts release A on that source, migrates to v6 and starts release B on
+current code, then starts the baseline host against v6 with release A's exact
 bundle bytes and a fresh rollback promotion/deployment. It verifies three
 immutable activation rows and zero synchronous control-plane calls. Because the
 baseline was not a separately published artifact, this is not release-channel,
@@ -367,9 +394,11 @@ but never replays the response body.
 
 This is cross-replica coordination and lifecycle replay, not exactly-once
 inference. A process can fail after a model call and before the completion
-commit, so a recovered attempt may call the model again. Side-effecting tools,
-automatic background replay, encrypted payload/result retention, and resumable
-HITL checkpoints are not part of lifecycle v1.
+commit, so a recovered attempt may call the model again. Tool-bearing releases
+cannot enable `taskRecovery`; their per-call MCP reservations use the separate
+fail-closed indeterminate contract. Automatic background replay, encrypted
+payload/result retention, and resumable HITL checkpoints are not part of
+lifecycle v1.
 
 ## Activation semantics
 

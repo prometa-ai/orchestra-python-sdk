@@ -4,7 +4,7 @@ FROM ${PYTHON_IMAGE} AS builder
 WORKDIR /src
 COPY pyproject.toml README.md ./
 COPY prometa ./prometa
-RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host]"
+RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host,runtime-mcp]"
 
 FROM ${PYTHON_IMAGE}
 
@@ -21,7 +21,7 @@ RUN groupadd --gid 10001 runtime \
     && useradd --uid 10001 --gid runtime --create-home --shell /usr/sbin/nologin runtime
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
-      "prometa-sdk[runtime-host]==0.18.0" \
+      "prometa-sdk[runtime-host,runtime-mcp]==0.18.0" \
     && rm -rf /wheels
 
 USER 10001:10001

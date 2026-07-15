@@ -61,7 +61,7 @@ pg_restore --exit-on-error --no-owner --no-privileges \
 schema_version=$(psql -X -A -t -v ON_ERROR_STOP=1 -c \
   "SELECT MAX(version) FROM prometa_runtime_schema_migrations") \
   || fail "restored schema check failed"
-[ "$schema_version" = "${PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-5}" ] \
+[ "$schema_version" = "${PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-6}" ] \
   || fail "restored schema version is incompatible"
 
 printf '{"archive":"%s","restore":"completed","schemaVersion":%s}\n' \

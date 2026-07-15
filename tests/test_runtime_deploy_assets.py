@@ -29,7 +29,7 @@ def test_runtime_deploy_assets_follow_package_version():
 
     assert 'appVersion: "%s"' % version in chart
     assert 'org.opencontainers.image.version="%s"' % version in dockerfile
-    assert '"prometa-sdk[runtime-host]==%s"' % version in dockerfile
+    assert '"prometa-sdk[runtime-host,runtime-mcp]==%s"' % version in dockerfile
     assert "prometa-runtime-host:%s" % version in compose
 
 
@@ -65,6 +65,38 @@ def test_runtime_examples_enable_bounded_payload_free_task_recovery():
         assert '"historyLimit": 50' in document
 
 
+def test_runtime_mcp_examples_keep_credentials_external_and_egress_explicit():
+    root = ROOT / "deploy/reference-runtime"
+    document = json.loads(
+        (root / "config.mcp.example.json").read_text(encoding="utf-8")
+    )
+    broker = document["mcpBroker"]
+    assert "taskRecovery" not in document
+    assert broker["servers"][0]["environment"] == "production"
+    assert broker["policy"]["requireApprovalFor"] == [
+        "write",
+        "destructive",
+    ]
+    assert broker["policy"]["requireIdempotencyFor"] == [
+        "write",
+        "destructive",
+    ]
+    assert broker["credentialBindings"][0]["httpHeaders"] == {
+        "Authorization": "MCP_INTEGRATION_AUTHORIZATION"
+    }
+    assert broker["egress"]["allowedHttpOrigins"] == [
+        "https://mcp-integration.tenant-tools.svc:8443"
+    ]
+    assert "tenant-mcp-key" not in json.dumps(document)
+
+    values = (root / "chart/values.mcp.example.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "MCP_INTEGRATION_AUTHORIZATION" in values
+    assert "tenant-runtime-mcp-credentials" in values
+    assert "port: 8443" in values
+
+
 def test_runtime_backup_restore_assets_are_fail_closed_and_secret_safe():
     root = ROOT / "deploy/reference-runtime"
     backup_path = root / "operations/backup-postgres.sh"
@@ -84,6 +116,7 @@ def test_runtime_backup_restore_assets_are_fail_closed_and_secret_safe():
     assert "target database is not empty" in restore
     assert "restore checksum mismatch" in restore
     assert "restore basename contains unsupported characters" in restore
+    assert "PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-6" in restore
     assert 'profiles: ["operations"]' in compose
     assert "runtime-backups:/backups" in compose
 

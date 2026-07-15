@@ -1,0 +1,89 @@
+{
+  "configVersion": 1,
+  "tenantId": "tenant-runtime-owner",
+  "runtimeId": "runtime-mcp-prod-01",
+  "runtimeVersion": "0.18.0",
+  "orgId": "org-from-signed-release",
+  "environment": "prod",
+  "releaseId": "release-from-promotion-attestation",
+  "deploymentId": "deployment-from-promotion-attestation",
+  "runtimeTarget": "tenant-runtime",
+  "bundle": {},
+  "promotionAttestation": {},
+  "bundleTrust": [
+    {
+      "issuer": "https://orchestra.example/",
+      "keyId": "bundle-signing-key-id",
+      "publicKeySpkiDerBase64": "tenant-provisioned-public-key",
+      "allowedOrgIds": ["org-from-signed-release"],
+      "allowedAudiences": ["prometa-runtime"],
+      "allowedEnvironments": ["prod"]
+    }
+  ],
+  "promotionTrust": [
+    {
+      "issuer": "https://orchestra.example/promotion",
+      "keyId": "promotion-signing-key-id",
+      "publicKeySpkiDerBase64": "tenant-provisioned-public-key",
+      "allowedOrgIds": ["org-from-signed-release"],
+      "allowedAudiences": ["prometa-runtime-admission"],
+      "allowedEnvironments": ["prod"]
+    }
+  ],
+  "modelGateway": {
+    "baseUrl": "http://tenant-model-gateway:8000",
+    "apiKeyEnv": "MODEL_GATEWAY_API_KEY",
+    "endpointPath": "/v1/chat/completions",
+    "timeoutSeconds": 30,
+    "maxResponseBytes": 4194304
+  },
+  "mcpBroker": {
+    "servers": [
+      {
+        "name": "Integration Tools",
+        "connectionId": "mcp-integration-prod",
+        "transport": "streamable-http",
+        "environment": "production",
+        "authMode": "service-account",
+        "scopes": ["mcp.integration.read"],
+        "riskLevel": "medium",
+        "endpoint": "https://mcp-integration.tenant-tools.svc:8443/mcp",
+        "timeoutSeconds": 30,
+        "maxResponseBytes": 1048576
+      }
+    ],
+    "grants": [
+      {
+        "toolName": "mcp.integration.lookup",
+        "agentIds": ["agent-from-signed-release"],
+        "permission": "read",
+        "riskLevel": "low",
+        "serverConnectionId": "mcp-integration-prod"
+      }
+    ],
+    "policy": {
+      "maxRiskLevel": "medium",
+      "requireApprovalFor": ["write", "destructive"],
+      "requireIdempotencyFor": ["write", "destructive"]
+    },
+    "egress": {
+      "allowedHttpOrigins": ["https://mcp-integration.tenant-tools.svc:8443"],
+      "allowedStdioCommands": []
+    },
+    "credentialBindings": [
+      {
+        "serverName": "Integration Tools",
+        "authMode": "service-account",
+        "httpHeaders": {
+          "Authorization": "MCP_INTEGRATION_AUTHORIZATION"
+        }
+      }
+    ],
+    "toolTimeoutSeconds": 35,
+    "reservationTimeoutSeconds": 300
+  },
+  "databaseDsnEnv": "PROMETA_RUNTIME_DATABASE_URL",
+  "apiTokenEnv": "PROMETA_RUNTIME_API_TOKEN",
+  "requestTimeoutSeconds": 60,
+  "maxRequestBytes": 1048576
+}

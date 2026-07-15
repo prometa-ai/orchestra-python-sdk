@@ -11,11 +11,12 @@ automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
 and joinable on the platform. Version 0.18.0 adds a first tenant-deployed
 reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. Current source also adds the
-first governed tenant-side MCP broker as a separate optional extra. The host can
-bootstrap from an outbound, read-only release handoff with bounded tenant-side
-cache fallback. None of this adds a dependency or runtime behavior to the
-default observability install.
+container around the optional Phase 2A kernel. Current source also adds a
+governed tenant-side MCP broker as a separate optional extra, strict reference
+host wiring for read-only MCP bundles, and shared PostgreSQL MCP call admission
+and payload-free audit. The host can bootstrap from an outbound, read-only
+release handoff with bounded tenant-side cache fallback. None of this adds a
+dependency or runtime behavior to the default observability install.
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -215,13 +216,16 @@ JTIs are reserved together only after every check passes.
 Bundle integrity, promotion authorization, and runtime evidence remain
 separate. The platform stays outside the synchronous request path; the model
 gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
-and emergency stop are tenant-owned. The first reference host is model-only and
-tenant-deployed. The optional MCP adapter is a library capability and is not
-wired into that host yet. The shipped increment does not include a durable
-multi-replica MCP idempotency adapter, stored-payload or automatic task replay,
+and emergency stop are tenant-owned. The tenant-deployed reference host can
+wire a strictly configured MCP broker for signed read-only tools. It requires
+exact release/config binding, explicit egress, late-bound credentials, and
+shared PostgreSQL idempotency and payload-free audit. The stock host CLI does
+not supply a human-escalation adapter, so write or destructive bundles remain
+fail-closed; tenants may inject that adapter only through the library builder.
+The shipped increment does not include stored-payload or automatic task replay,
 resumable HITL checkpoints, memory, compression, A2A, rollout automation,
-topology-specific production certification, or managed-CNI/database proof. A
-pinned two-node K3s/kube-router reference profile now supplies narrow
+MCP-enabled topology certification, or managed-CNI/database proof. A pinned
+two-node K3s/kube-router reference profile supplies narrower model-only
 multi-tenant isolation, load, database-partition, duplicate-claim, and
 pod-replacement evidence.
 
@@ -332,11 +336,13 @@ an uncertain transport or post-call audit outcome is marked indeterminate so
 the runtime cannot retry it automatically.
 
 `InMemoryMcpIdempotencyStore` and `InMemoryMcpAuditSink` are for tests and
-single-process development only. They are not multi-replica durability claims.
-Deployments must provide durable tenant-owned implementations before enabling
-side-effecting tools across replicas. DNS and network-layer enforcement also
-remain the tenant's NetworkPolicy, firewall, or service-mesh responsibility;
-the SDK allowlist validates the declared destination.
+single-process development only. `PostgresMcpIdempotencyStore` and
+`PostgresMcpAuditSink` provide the reference multi-replica implementation. A
+stale reservation becomes `indeterminate`, never automatically reacquired,
+because the prior replica may already have reached the tool. DNS and
+network-layer enforcement remain the tenant's NetworkPolicy, firewall, or
+service-mesh responsibility; the SDK allowlist validates the declared
+destination.
 
 #### Multi-replica durability
 
@@ -361,7 +367,10 @@ delivery is configured, it also needs `SELECT, INSERT, UPDATE` on
 Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
 `prometa_runtime_release_cache`. Hosts with `taskRecovery` also need
 `SELECT, INSERT, UPDATE` on `prometa_runtime_task` and `SELECT, INSERT` on
-`prometa_runtime_task_event`.
+`prometa_runtime_task_event`. MCP-enabled hosts need
+`SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_mcp_idempotency` and
+`INSERT` on `prometa_runtime_mcp_audit`; an operator identity may additionally
+receive `SELECT` on the audit table for verification.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -376,11 +385,11 @@ newer, or structurally incompatible schema before the host activates a release.
 The installer remains the separate mutating step.
 
 `prometa-runtime-postgres-verify` is a payload-free pre-cutover check for a
-newly restored database. It requires exact migrations through schema v5,
-required task/event columns, valid lease and terminal projections, and complete
-ordered event history. Its JSON output contains only schema versions and table
-counts. Logical backup/restore scripts and the optional encrypted-PVC Helm
-backup CronJob live under
+newly restored database. It requires exact migrations through schema v6,
+required task/event and MCP columns, valid lease and terminal projections,
+complete ordered task history, and payload-free MCP audit records. Its JSON
+output contains only schema versions and table counts. Logical backup/restore
+scripts and the optional encrypted-PVC Helm backup CronJob live under
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md); restore is
 refused unless the target database is fresh and the archive checksum matches.
 
@@ -389,6 +398,8 @@ import os
 
 from prometa.runtime import (
     PostgresAdmissionReplayStore,
+    PostgresMcpAuditSink,
+    PostgresMcpIdempotencyStore,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
     install_postgres_runtime_schema,
@@ -410,6 +421,16 @@ task_store = PostgresRuntimeTaskStore(
     tenant_id="org_example",
     runtime_id="tenant-runtime-01",
 )
+mcp_idempotency_store = PostgresMcpIdempotencyStore(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+    runtime_id="tenant-runtime-01",
+)
+mcp_audit_sink = PostgresMcpAuditSink(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+    runtime_id="tenant-runtime-01",
+)
 ```
 
 Pass `replay_store` to `admit_runtime_release()` and `state_store` to
@@ -422,7 +443,9 @@ snapshots; they are not an exactly-once request lock or a resumable HITL
 workflow. `PostgresRuntimeTaskStore` is a separate lifecycle v1 contract: it
 atomically leases one request attempt across replicas, binds retries to the
 same input/release/deployment identity, appends ordered payload-free events,
-and permits bounded reclaim after an expired safe lease.
+and permits bounded reclaim after an expired safe lease. The MCP stores apply a
+different safety rule: expired or uncertain tool-call reservations become
+indeterminate and require operator reconciliation rather than automatic replay.
 
 #### Reference tenant runtime host
 
@@ -430,6 +453,12 @@ Install the host extra only in the tenant runtime image:
 
 ```bash
 pip install "prometa-sdk[runtime-host]"
+```
+
+For an MCP-enabled host installation, include both optional surfaces:
+
+```bash
+pip install "prometa-sdk[runtime-host,runtime-mcp]"
 ```
 
 `prometa-runtime-host` loads one strict mounted configuration, resolves either
@@ -446,13 +475,17 @@ different artifact digest fails closed. The host then serves:
   replay when `taskRecovery` is configured;
 - `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
 
-The request endpoint calls only the tenant model gateway and tenant state
-store. It validates schemas before model invocation, rejects duplicate
+The request endpoint calls only tenant-owned model, state, and optional MCP
+planes. It validates schemas before model invocation, rejects duplicate
 in-flight IDs within a replica, returns stable payload-free errors, and shuts
-down its persistent kernel event loop gracefully. Optional `taskRecovery`
-extends duplicate rejection across replicas and records ordered lifecycle
-metadata. It does not claim exactly-once model invocation, TLS termination,
-distributed rate limiting, or overload fairness.
+down its persistent kernel event loop gracefully. An `mcpBroker` block must
+match the signed server/tool contract and names only credential environment
+variables; no secret value belongs in mounted configuration. Missing transport
+dependencies, credentials, egress grants, or release bindings fail startup or
+the call before transport. Optional `taskRecovery` extends duplicate rejection
+across replicas and records ordered model-only lifecycle metadata. It cannot be
+combined with tool-bearing releases and does not claim exactly-once model
+invocation, TLS termination, distributed rate limiting, or overload fairness.
 
 Optional `receiptDelivery` configuration adds durable asynchronous `admitted`
 and `active` lifecycle evidence. The host commits receipts to its PostgreSQL
@@ -473,7 +506,7 @@ lease. Revocation, authorization, binding, or signature failures never fall
 back. Changing the attestation ID still requires tenant CI/CD to update the
 mounted config and roll the workload; this is not a hot-reload controller.
 
-Optional `taskRecovery` configuration enables lifecycle contract v1 for the
+Optional `taskRecovery` configuration enables lifecycle contract v1 only for a
 model-only host:
 
 ```json
@@ -502,8 +535,10 @@ bodies, credentials, prompts, or model output. Recovery is therefore
 client-driven: the caller resubmits semantically identical finite JSON input
 with the same request ID.
 Model invocation is at-least-once, and a completed task reports conflict rather
-than replaying its response body. Automatic replay, encrypted result retention,
-side-effecting tools, and resumable HITL checkpoints require later contracts.
+than replaying its response body. MCP call idempotency is a separate durable
+contract and does not make the enclosing task replayable. Automatic replay,
+encrypted result retention, and resumable HITL checkpoints require later
+contracts.
 
 The non-root container, Compose example, tenant-owned Helm chart, logical
 backup/restore assets, strict configuration shape, and operator commands live in
@@ -511,7 +546,7 @@ backup/restore assets, strict configuration shape, and operator commands live in
 Chart `0.3.0` runs the target image's compatibility check after migration and
 before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
 tenant-selected immutable config revisions explicit. The CI drill uses a real
-schema-v2 source baseline, upgrades to schema v5 and bundle B, then starts the
+schema-v2 source baseline, upgrades to schema v6 and bundle B, then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
 published-version certification claim. A separate pinned K3s/kube-router

@@ -16,6 +16,15 @@ from prometa.runtime import (
     RUNTIME_POSTGRES_MAX_SCHEMA_VERSION,
     RUNTIME_POSTGRES_MIN_SCHEMA_VERSION,
     RUNTIME_POSTGRES_SCHEMA_VERSION,
+    ExplicitMcpEgressPolicy,
+    GovernedMcpToolBroker,
+    McpAuditEvent,
+    McpBrokerPolicy,
+    McpServerConfig,
+    McpToolGrant,
+    McpTransportError,
+    PostgresMcpAuditSink,
+    PostgresMcpIdempotencyStore,
     PostgresAdmissionReplayStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
@@ -24,8 +33,11 @@ from prometa.runtime import (
     PostgresRuntimeTaskStore,
     RuntimeReleaseHandoff,
     RuntimePersistenceError,
+    RuntimeExecutionError,
     RuntimeTaskClaim,
     RuntimeTaskError,
+    RuntimeTool,
+    ToolInvocationRequest,
     build_runtime_receipt,
     canonical_payload_digest,
     check_postgres_runtime_compatibility,
@@ -65,6 +77,63 @@ def _handoff(
         },
         checked_at=fetched,
         fetched_at=fetched,
+    )
+
+
+def _mcp_audit_event(**overrides):
+    values = {
+        "audit_reference": "mcp-audit-postgres",
+        "phase": "execution",
+        "outcome": "completed",
+        "occurred_at": "2026-07-15T12:00:00.000Z",
+        "request_id": "request-postgres",
+        "call_id": "call-postgres",
+        "agent_id": "agent-postgres",
+        "release_id": "release-postgres",
+        "deployment_id": "deployment-postgres",
+        "environment": "prod",
+        "server_name": "Orders",
+        "server_connection_id": "orders-prod",
+        "transport": "streamable-http",
+        "operation": "orders.write",
+        "permission": "write",
+        "effective_risk": "medium",
+        "side_effects": "write",
+        "scopes": ("orders.write",),
+        "approval_references": ("review-postgres",),
+        "argument_digest": "sha256:" + "a" * 64,
+        "output_digest": "sha256:" + "b" * 64,
+        "idempotency_key": "mcp1:" + "c" * 64,
+        "reason": None,
+    }
+    values.update(overrides)
+    return McpAuditEvent(**values)
+
+
+def _mcp_tool_request(*, request_id="request-postgres", call_id="call-postgres"):
+    return ToolInvocationRequest(
+        request_id=request_id,
+        call_id=call_id,
+        tool=RuntimeTool(
+            name="Write order",
+            source="mcp",
+            operation="orders.write",
+            input_schema={"type": "object"},
+            mcp_server="Orders",
+            side_effects="write",
+            risk_level="medium",
+            auth_binding="none",
+            scopes=("orders.write",),
+            approval_required=True,
+            required_guardrails=(),
+        ),
+        arguments={"orderId": "order-postgres"},
+        agent_id="agent-postgres",
+        release_id="release-postgres",
+        deployment_id="deployment-postgres",
+        environment="prod",
+        granted_scopes=("orders.write",),
+        approval_references=("review-postgres",),
     )
 
 
@@ -297,7 +366,7 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
         check_postgres_runtime_compatibility(
             "postgresql://unused",
             connect=lambda dsn: _CompatibilityConnection(
-                (1, 2, 3, 4, 5),
+                (1, 2, 3, 4, 5, 6),
                 ("prometa_runtime_schema_migrations",),
             ),
         )
@@ -632,6 +701,203 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
     not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
     reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
 )
+def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> None:
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    tenant_id = "mcp-%s" % uuid.uuid4().hex
+    runtime_id = "runtime-mcp-shared"
+    request = _mcp_tool_request()
+
+    server = McpServerConfig(
+        name="Orders",
+        connection_id="orders-prod",
+        transport="streamable-http",
+        endpoint="https://orders.example.test/mcp",
+        environment="production",
+        auth_mode="none",
+        scopes=("orders.write",),
+        risk_level="medium",
+    )
+    grant = McpToolGrant(
+        tool_name="orders.write",
+        agent_ids=("agent-postgres",),
+        permission="write",
+        risk_level="medium",
+        server_connection_id="orders-prod",
+    )
+
+    class BlockingTransport:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def call_tool(
+            self, server, operation, arguments, credentials, metadata
+        ):
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return {"recorded": True}
+
+    def broker(tenant, transport, *, reservation_timeout_seconds=30):
+        return GovernedMcpToolBroker(
+            servers=(server,),
+            grants=(grant,),
+            policy=McpBrokerPolicy(max_risk_level="medium"),
+            egress_policy=ExplicitMcpEgressPolicy(
+                allowed_http_origins=frozenset({"https://orders.example.test"})
+            ),
+            transport_client=transport,
+            audit_sink=PostgresMcpAuditSink(
+                dsn,
+                tenant_id=tenant,
+                runtime_id=runtime_id,
+            ),
+            idempotency_store=PostgresMcpIdempotencyStore(
+                dsn,
+                tenant_id=tenant,
+                runtime_id=runtime_id,
+                reservation_timeout_seconds=reservation_timeout_seconds,
+            ),
+        )
+
+    async def scenario():
+        transport = BlockingTransport()
+        first = broker(tenant_id, transport)
+        second = broker(tenant_id, transport)
+        owner = asyncio.create_task(first.invoke(request))
+        await asyncio.wait_for(transport.started.wait(), timeout=2)
+        with pytest.raises(RuntimeExecutionError) as caught:
+            await second.invoke(request)
+        assert caught.value.code == "mcp_tool_call_in_progress"
+        assert transport.calls == 1
+        transport.release.set()
+        result = await owner
+        assert result.output == {"recorded": True}
+
+        with pytest.raises(RuntimeExecutionError) as caught:
+            await second.invoke(request)
+        assert caught.value.code == "mcp_duplicate_tool_call"
+        assert transport.calls == 1
+
+        isolated_transport = BlockingTransport()
+        isolated_transport.release.set()
+        isolated = broker(tenant_id + "-other", isolated_transport)
+        isolated_result = await isolated.invoke(request)
+        assert isolated_result.output == {"recorded": True}
+        assert isolated_transport.calls == 1
+
+        stale_key = "mcp1:" + "d" * 64
+        stale_digest = "sha256:" + "e" * 64
+        stale = PostgresMcpIdempotencyStore(
+            dsn,
+            tenant_id=tenant_id,
+            runtime_id=runtime_id,
+            reservation_timeout_seconds=0.05,
+        )
+        assert await stale.reserve(stale_key, stale_digest) == "acquired"
+        await asyncio.sleep(0.1)
+        replacement = PostgresMcpIdempotencyStore(
+            dsn,
+            tenant_id=tenant_id,
+            runtime_id=runtime_id,
+            reservation_timeout_seconds=0.05,
+        )
+        assert await replacement.reserve(stale_key, stale_digest) == "indeterminate"
+        stale_record = await replacement.get(stale_key)
+        assert stale_record is not None
+        assert stale_record.status == "indeterminate"
+
+        uncertain_request = _mcp_tool_request(
+            request_id="request-uncertain",
+            call_id="call-uncertain",
+        )
+
+        class UncertainTransport:
+            async def call_tool(self, *args, **kwargs):
+                raise McpTransportError(
+                    "mcp_transport_failed", outcome_unknown=True
+                )
+
+        uncertain = broker(tenant_id, UncertainTransport())
+        with pytest.raises(RuntimeExecutionError) as caught:
+            await uncertain.invoke(uncertain_request)
+        assert caught.value.code == "mcp_transport_failed"
+        with pytest.raises(RuntimeExecutionError) as caught:
+            await second.invoke(uncertain_request)
+        assert caught.value.code == "mcp_tool_call_indeterminate"
+
+    asyncio.run(scenario())
+
+    import psycopg
+
+    with psycopg.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT event
+                FROM prometa_runtime_mcp_audit
+                WHERE tenant_id = %s AND runtime_id = %s
+                ORDER BY occurred_at, event_id
+                """,
+                (tenant_id, runtime_id),
+            )
+            events = [row[0] for row in cursor.fetchall()]
+    assert events
+    assert {event["outcome"] for event in events}.issuperset(
+        {"accepted", "completed", "denied", "failed"}
+    )
+    encoded_events = json.dumps(events, sort_keys=True)
+    assert "order-postgres" not in encoded_events
+    assert '"arguments"' not in encoded_events
+    assert '"output"' not in encoded_events
+    assert '"credentials"' not in encoded_events
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_postgres_mcp_audit_is_append_only_and_payload_free() -> None:
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    tenant_id = "mcp-audit-%s" % uuid.uuid4().hex
+    sink = PostgresMcpAuditSink(
+        dsn,
+        tenant_id=tenant_id,
+        runtime_id="runtime-mcp-audit",
+    )
+    event = _mcp_audit_event()
+    asyncio.run(sink.record(event))
+    asyncio.run(sink.record(event))
+
+    import psycopg
+
+    with psycopg.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT event
+                FROM prometa_runtime_mcp_audit
+                WHERE tenant_id = %s AND runtime_id = %s
+                """,
+                (tenant_id, "runtime-mcp-audit"),
+            )
+            rows = cursor.fetchall()
+    assert len(rows) == 1
+    stored = rows[0][0]
+    assert stored["argumentDigest"] == "sha256:" + "a" * 64
+    assert stored["outputDigest"] == "sha256:" + "b" * 64
+    assert "arguments" not in stored
+    assert "output" not in stored
+    assert "credentials" not in stored
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
 def test_postgres_task_leases_recover_and_replay_ordered_history() -> None:
     dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
     install_postgres_runtime_schema(dsn)
@@ -807,7 +1073,7 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
     try:
         report = verify_postgres_runtime_integrity(dsn)
         assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-        assert report.migration_versions == (1, 2, 3, 4, 5)
+        assert report.migration_versions == (1, 2, 3, 4, 5, 6)
         assert report.table_counts["prometa_runtime_task"] >= 1
         assert report.table_counts["prometa_runtime_task_event"] >= 2
         assert "private input" not in repr(report)
@@ -817,7 +1083,7 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
         assert postgres_verify_main(["--dsn-env", "RUNTIME_VERIFY_DSN"]) == 0
         output = json.loads(capsys.readouterr().out)
         assert output["integrity"] == "verified"
-        assert output["schemaVersion"] == 5
+        assert output["schemaVersion"] == 6
         assert "private" not in repr(output)
 
         with psycopg.connect(dsn) as connection:
@@ -856,7 +1122,7 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     install_postgres_runtime_schema(dsn)
     report = check_postgres_runtime_compatibility(dsn)
     assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-    assert report.migration_versions == (1, 2, 3, 4, 5)
+    assert report.migration_versions == (1, 2, 3, 4, 5, 6)
     assert report.minimum_schema_version == RUNTIME_POSTGRES_MIN_SCHEMA_VERSION
     assert report.maximum_schema_version == RUNTIME_POSTGRES_MAX_SCHEMA_VERSION
     assert report.as_dict()["compatibilityVersion"] == (
@@ -874,10 +1140,10 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     assert output == {
         "compatibility": "compatible",
         "compatibilityVersion": 1,
-        "maximumSchemaVersion": 5,
-        "migrationVersions": [1, 2, 3, 4, 5],
-        "minimumSchemaVersion": 5,
-        "schemaVersion": 5,
+        "maximumSchemaVersion": 6,
+        "migrationVersions": [1, 2, 3, 4, 5, 6],
+        "minimumSchemaVersion": 6,
+        "schemaVersion": 6,
     }
 
     def expect_code(code: str) -> None:
@@ -888,25 +1154,25 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (6)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (7)"
             )
         expect_code("runtime_schema_too_new")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 6"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 7"
             )
 
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 5"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 6"
             )
         expect_code("runtime_schema_too_old")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (5)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (6)"
             )
 
     try:

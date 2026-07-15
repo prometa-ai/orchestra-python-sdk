@@ -127,6 +127,7 @@ from .mcp import (
     McpTransportClient,
     McpTransportError,
     OfficialMcpTransportClient,
+    official_mcp_transport_available,
     GovernedMcpToolBroker,
 )
 from .postgres import (
@@ -146,6 +147,8 @@ from .postgres import (
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
     PostgresRuntimeTaskStore,
+    PostgresMcpIdempotencyStore,
+    PostgresMcpAuditSink,
     PostgresRuntimeStateStore,
 )
 from .conformance import (
@@ -169,6 +172,7 @@ from .host import (
     DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     RuntimeHostError,
+    RuntimeHostMcpConfig,
     RuntimeHostConfig,
     RuntimeHostResponse,
     JsonLineEvidenceEmitter,
@@ -282,6 +286,7 @@ __all__ = [
     "McpTransportClient",
     "McpTransportError",
     "OfficialMcpTransportClient",
+    "official_mcp_transport_available",
     "GovernedMcpToolBroker",
     "RUNTIME_POSTGRES_SCHEMA_VERSION",
     "RUNTIME_POSTGRES_COMPATIBILITY_VERSION",
@@ -299,6 +304,8 @@ __all__ = [
     "PostgresRuntimeReceiptOutbox",
     "PostgresRuntimeReleaseCache",
     "PostgresRuntimeTaskStore",
+    "PostgresMcpIdempotencyStore",
+    "PostgresMcpAuditSink",
     "PostgresRuntimeStateStore",
     "CONFORMANCE_REPORT_VERSION",
     "CONFORMANCE_COMMAND_PROTOCOL_VERSION",
@@ -318,6 +325,7 @@ __all__ = [
     "DEFAULT_MAX_REQUEST_BYTES",
     "DEFAULT_REQUEST_TIMEOUT_SECONDS",
     "RuntimeHostError",
+    "RuntimeHostMcpConfig",
     "RuntimeHostConfig",
     "RuntimeHostResponse",
     "JsonLineEvidenceEmitter",

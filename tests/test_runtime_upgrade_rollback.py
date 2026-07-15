@@ -31,6 +31,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from prometa.runtime import (
+    RUNTIME_POSTGRES_SCHEMA_VERSION,
     check_postgres_runtime_compatibility,
     install_postgres_runtime_schema,
 )
@@ -544,7 +545,7 @@ def test_source_baseline_upgrade_and_fresh_prior_bundle_rollback(tmp_path) -> No
             if index == 1:
                 install_postgres_runtime_schema(dsn)
                 report = check_postgres_runtime_compatibility(dsn)
-                assert report.migration_versions == (1, 2, 3, 4, 5)
+                assert report.migration_versions == (1, 2, 3, 4, 5, 6)
             attestation = _attestation(
                 bundle,
                 label=label,
@@ -604,7 +605,7 @@ def test_source_baseline_upgrade_and_fresh_prior_bundle_rollback(tmp_path) -> No
                     "PROMETA_RUNTIME_UPGRADE_BASELINE_REF", "unspecified"
                 ),
                 "baselineSchemaVersion": 2,
-                "targetSchemaVersion": 5,
+                "targetSchemaVersion": RUNTIME_POSTGRES_SCHEMA_VERSION,
                 "deploymentSequence": [
                     "deployment-a",
                     "deployment-b",

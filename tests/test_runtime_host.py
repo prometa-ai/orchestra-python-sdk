@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,17 +30,22 @@ from prometa.runtime import (
     InMemoryAdmissionReplayStore,
     InMemoryEvidenceEmitter,
     InMemoryRuntimeTaskStore,
+    GovernedMcpToolBroker,
+    HumanEscalationDecision,
     JsonLineEvidenceEmitter,
     ModelAdapterError,
     ModelInvocationResponse,
+    ModelToolCall,
     PostgresRuntimeTaskStore,
     ReferenceRuntimeHost,
     RuntimeAdmissionPolicy,
+    RuntimeActivationResult,
     RuntimeEvidenceEvent,
     RuntimeHostError,
     RuntimeHostConfig,
     RuntimeKernel,
     RuntimePersistenceError,
+    RuntimeTool,
     admit_runtime_release,
     build_reference_runtime_host,
     canonical_payload_digest,
@@ -95,6 +101,31 @@ def _admitted():
         now=_instant(verification["now"]),
     )
     return vector, admitted
+
+
+def _mcp_admitted():
+    vector, admitted = _admitted()
+    tool = RuntimeTool(
+        name="Write order",
+        source="mcp",
+        operation="orders.write",
+        input_schema={"type": "object"},
+        mcp_server="Orders",
+        side_effects="write",
+        risk_level="medium",
+        auth_binding="service-account",
+        scopes=("orders.write",),
+        approval_required=True,
+        required_guardrails=(),
+    )
+    config = replace(
+        admitted.config,
+        tools=(tool,),
+        mcp_servers=("Orders",),
+        required_scopes=("orders.write",),
+        granted_scopes=("orders.write",),
+    )
+    return vector, replace(admitted, config=config)
 
 
 class RecordingModelAdapter:
@@ -654,6 +685,55 @@ def _config_document():
     }
 
 
+def _mcp_broker_document():
+    return {
+        "servers": [
+            {
+                "name": "Orders",
+                "connectionId": "orders-prod",
+                "transport": "streamable-http",
+                "environment": "production",
+                "authMode": "service-account",
+                "scopes": ["orders.write"],
+                "riskLevel": "medium",
+                "endpoint": "http://mcp-orders.default.svc:8000/mcp",
+                "allowInsecureHttp": True,
+                "timeoutSeconds": 20,
+                "maxResponseBytes": 1048576,
+            }
+        ],
+        "grants": [
+            {
+                "toolName": "orders.write",
+                "agentIds": ["agent-golden-1"],
+                "permission": "write",
+                "riskLevel": "medium",
+                "serverConnectionId": "orders-prod",
+            }
+        ],
+        "policy": {
+            "maxRiskLevel": "medium",
+            "requireApprovalFor": ["write", "destructive"],
+            "requireIdempotencyFor": ["write", "destructive"],
+        },
+        "egress": {
+            "allowedHttpOrigins": ["http://mcp-orders.default.svc:8000"],
+            "allowedStdioCommands": [],
+        },
+        "credentialBindings": [
+            {
+                "serverName": "Orders",
+                "authMode": "service-account",
+                "httpHeaders": {
+                    "Authorization": "MCP_ORDERS_AUTHORIZATION"
+                },
+            }
+        ],
+        "toolTimeoutSeconds": 25,
+        "reservationTimeoutSeconds": 90,
+    }
+
+
 def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     tmp_path,
 ) -> None:
@@ -739,6 +819,51 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert durable_config.task_recovery_max_attempts == 4
     assert durable_config.task_recovery_history_limit == 25
 
+    mcp_enabled = _config_document()
+    mcp_enabled["mcpBroker"] = _mcp_broker_document()
+    path.write_text(json.dumps(mcp_enabled), encoding="utf-8")
+    mcp_config = load_runtime_host_config(path)
+    assert mcp_config.mcp_broker is not None
+    assert mcp_config.mcp_broker.servers[0].name == "Orders"
+    assert mcp_config.mcp_broker.servers[0].connection_id == "orders-prod"
+    assert mcp_config.mcp_broker.grants[0].tool_name == "orders.write"
+    assert mcp_config.mcp_broker.tool_timeout_seconds == 25
+    assert mcp_config.mcp_broker.reservation_timeout_seconds == 90
+    assert (
+        mcp_config.mcp_broker.credential_bindings[0].http_headers[
+            "Authorization"
+        ]
+        == "MCP_ORDERS_AUTHORIZATION"
+    )
+
+    weakened = json.loads(json.dumps(mcp_enabled))
+    weakened["mcpBroker"]["policy"]["requireIdempotencyFor"] = ["write"]
+    path.write_text(json.dumps(weakened), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "mcp_policy_weakened"
+
+    missing_credential_binding = json.loads(json.dumps(mcp_enabled))
+    missing_credential_binding["mcpBroker"]["credentialBindings"] = []
+    path.write_text(json.dumps(missing_credential_binding), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "mcp_credential_binding_missing"
+
+    missing_egress = json.loads(json.dumps(mcp_enabled))
+    missing_egress["mcpBroker"]["egress"]["allowedHttpOrigins"] = []
+    path.write_text(json.dumps(missing_egress), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "mcp_egress_binding_missing"
+
+    short_reservation = json.loads(json.dumps(mcp_enabled))
+    short_reservation["mcpBroker"]["reservationTimeoutSeconds"] = 25
+    path.write_text(json.dumps(short_reservation), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "mcp_reservation_timeout_too_short"
+
     durable["taskRecovery"]["leaseSeconds"] = 60
     path.write_text(json.dumps(durable), encoding="utf-8")
     with pytest.raises(RuntimeHostError) as caught:
@@ -803,6 +928,264 @@ def test_host_rejects_incompatible_database_before_release_activation(
             },
         )
     assert caught.value.code == "runtime_schema_too_new"
+
+
+def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
+    tmp_path, monkeypatch
+) -> None:
+    import prometa.runtime.host as host_module
+
+    document = _config_document()
+    document["mcpBroker"] = _mcp_broker_document()
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    config = load_runtime_host_config(path)
+    _vector_value, admitted = _mcp_admitted()
+
+    monkeypatch.setattr(
+        host_module, "check_postgres_runtime_compatibility", lambda _dsn: None
+    )
+    monkeypatch.setattr(
+        host_module,
+        "activate_runtime_release",
+        lambda *args, **kwargs: (
+            admitted,
+            RuntimeActivationResult(created=True),
+        ),
+    )
+    environment = {
+        "PROMETA_RUNTIME_DATABASE_URL": "postgresql://unused",
+        "PROMETA_RUNTIME_API_TOKEN": API_TOKEN,
+        "MODEL_GATEWAY_API_KEY": "model-key",
+        "MCP_ORDERS_AUTHORIZATION": "Bearer tenant-mcp-key",
+    }
+
+    class TenantTransport:
+        async def call_tool(self, *args, **kwargs):
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        host_module, "official_mcp_transport_available", lambda: False
+    )
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            config,
+            environment=environment,
+            evidence_emitter=InMemoryEvidenceEmitter(),
+        )
+    assert caught.value.code == "mcp_dependency_missing"
+
+    transport = TenantTransport()
+    host, created = build_reference_runtime_host(
+        config,
+        environment=environment,
+        evidence_emitter=InMemoryEvidenceEmitter(),
+        mcp_transport_client=transport,
+    )
+    try:
+        assert created is True
+        assert isinstance(host.kernel.tool_broker, GovernedMcpToolBroker)
+        assert host.kernel.policy.tool_timeout_seconds == 25
+    finally:
+        host.close()
+
+    _vector_value, model_only = _admitted()
+    monkeypatch.setattr(
+        host_module,
+        "activate_runtime_release",
+        lambda *args, **kwargs: (
+            model_only,
+            RuntimeActivationResult(created=True),
+        ),
+    )
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            config,
+            environment=environment,
+            evidence_emitter=InMemoryEvidenceEmitter(),
+            mcp_transport_client=transport,
+        )
+    assert caught.value.code == "mcp_release_binding_mismatch"
+
+    unsafe_tool = replace(admitted.config.tools[0], approval_required=False)
+    unsafe_release = replace(
+        admitted,
+        config=replace(admitted.config, tools=(unsafe_tool,)),
+    )
+    monkeypatch.setattr(
+        host_module,
+        "activate_runtime_release",
+        lambda *args, **kwargs: (
+            unsafe_release,
+            RuntimeActivationResult(created=True),
+        ),
+    )
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            config,
+            environment=environment,
+            evidence_emitter=InMemoryEvidenceEmitter(),
+            mcp_transport_client=transport,
+        )
+    assert caught.value.code == "mcp_side_effect_approval_contract_missing"
+
+    path.write_text(json.dumps(_config_document()), encoding="utf-8")
+    model_only_config = load_runtime_host_config(path)
+    monkeypatch.setattr(
+        host_module,
+        "activate_runtime_release",
+        lambda *args, **kwargs: (
+            admitted,
+            RuntimeActivationResult(created=True),
+        ),
+    )
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            model_only_config,
+            environment=environment,
+            evidence_emitter=InMemoryEvidenceEmitter(),
+            mcp_transport_client=transport,
+        )
+    assert caught.value.code == "mcp_broker_config_missing"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
+def test_reference_host_executes_mcp_with_explicit_tenant_human_adapter(
+    tmp_path, monkeypatch
+) -> None:
+    import prometa.runtime.host as host_module
+
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    document = _config_document()
+    document["tenantId"] = "host-mcp-%s" % uuid.uuid4().hex
+    document["runtimeId"] = "runtime-host-mcp"
+    document["mcpBroker"] = _mcp_broker_document()
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    config = load_runtime_host_config(path)
+    vector, admitted = _mcp_admitted()
+
+    monkeypatch.setattr(
+        host_module,
+        "activate_runtime_release",
+        lambda *args, **kwargs: (
+            admitted,
+            RuntimeActivationResult(created=True),
+        ),
+    )
+
+    class TenantHumanEscalation:
+        async def request_review(self, request):
+            return HumanEscalationDecision(
+                approved=True,
+                reviewer_reference="tenant-review-1",
+            )
+
+    class TenantTransport:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(
+            self, server, operation, arguments, credentials, metadata
+        ):
+            self.calls.append(
+                (server.name, operation, arguments, credentials, metadata)
+            )
+            return {"recorded": True}
+
+    class ToolCallingModel:
+        def __init__(self):
+            self.responses = [
+                ModelInvocationResponse(
+                    content=None,
+                    tool_calls=(
+                        ModelToolCall(
+                            call_id="call-host-mcp",
+                            name="orders.write",
+                            arguments={"orderId": "order-host-mcp"},
+                        ),
+                    ),
+                ),
+                ModelInvocationResponse(content=vector["sampleOutput"]),
+            ]
+
+        async def invoke(self, request):
+            return self.responses.pop(0)
+
+    transport = TenantTransport()
+    host, created = build_reference_runtime_host(
+        config,
+        environment={
+            "PROMETA_RUNTIME_DATABASE_URL": dsn,
+            "PROMETA_RUNTIME_API_TOKEN": API_TOKEN,
+            "MODEL_GATEWAY_API_KEY": "model-key",
+            "MCP_ORDERS_AUTHORIZATION": "Bearer tenant-mcp-key",
+        },
+        evidence_emitter=InMemoryEvidenceEmitter(),
+        human_escalation=TenantHumanEscalation(),
+        mcp_transport_client=transport,
+    )
+    try:
+        assert created is True
+        host.kernel.model_adapter = ToolCallingModel()
+        response = _execute(
+            host,
+            {"requestId": "request-host-mcp", "input": vector["sampleInput"]},
+        )
+        assert response.status == 200
+        assert response.body["output"] == vector["sampleOutput"]
+        assert response.body["toolCalls"] == 1
+        assert len(transport.calls) == 1
+        server_name, operation, arguments, credentials, metadata = (
+            transport.calls[0]
+        )
+        assert server_name == "Orders"
+        assert operation == "orders.write"
+        assert arguments == {"orderId": "order-host-mcp"}
+        assert credentials.headers == {
+            "Authorization": "Bearer tenant-mcp-key"
+        }
+        assert metadata["prometa.io/request-id"] == "request-host-mcp"
+    finally:
+        host.close()
+
+    import psycopg
+
+    with psycopg.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, output_digest
+                FROM prometa_runtime_mcp_idempotency
+                WHERE tenant_id = %s AND runtime_id = %s
+                """,
+                (document["tenantId"], document["runtimeId"]),
+            )
+            idempotency = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT event
+                FROM prometa_runtime_mcp_audit
+                WHERE tenant_id = %s AND runtime_id = %s
+                ORDER BY occurred_at, event_id
+                """,
+                (document["tenantId"], document["runtimeId"]),
+            )
+            audit_events = [row[0] for row in cursor.fetchall()]
+    assert idempotency is not None
+    assert idempotency[0] == "completed"
+    assert idempotency[1].startswith("sha256:")
+    assert [event["outcome"] for event in audit_events] == [
+        "accepted",
+        "completed",
+    ]
+    encoded = json.dumps(audit_events, sort_keys=True)
+    assert "order-host-mcp" not in encoded
+    assert "tenant-mcp-key" not in encoded
 
 
 def test_json_line_evidence_is_bounded_and_contains_no_request_payload() -> None:

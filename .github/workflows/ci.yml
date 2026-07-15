@@ -186,7 +186,7 @@ jobs:
           set -euo pipefail
           test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
           docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
-            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 5; assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresMcpAuditSink, PostgresMcpIdempotencyStore, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, official_mcp_transport_available, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 6; assert official_mcp_transport_available(); assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
 
       - name: Run deployment profile through fresh host containers
         run: >-
@@ -215,11 +215,18 @@ jobs:
           deploy/reference-runtime/chart
           -f deploy/reference-runtime/chart/values.production.example.yaml
 
+      - name: Lint governed MCP reference values
+        run: >-
+          helm lint --strict
+          deploy/reference-runtime/chart
+          -f deploy/reference-runtime/chart/values.mcp.example.yaml
+
       - name: Verify fail-closed values and render variants
         run: |
           set -euo pipefail
           chart=deploy/reference-runtime/chart
           example=$chart/values.production.example.yaml
+          mcp_example=$chart/values.mcp.example.yaml
 
           if helm template missing-inputs "$chart" >/dev/null 2>&1; then
             echo "chart rendered without external config and credential references" >&2
@@ -267,6 +274,15 @@ jobs:
           grep -q 'tenant-runtime-backup-database' runtime-chart.yaml
           if grep -q '^kind: Secret$' runtime-chart.yaml; then
             echo "chart must reference, not create, credentials" >&2
+            exit 1
+          fi
+
+          helm template governed-mcp "$chart" -f "$mcp_example" >runtime-chart-mcp.yaml
+          grep -q 'name: MCP_INTEGRATION_AUTHORIZATION' runtime-chart-mcp.yaml
+          grep -q 'name: tenant-runtime-mcp-credentials' runtime-chart-mcp.yaml
+          grep -q 'port: 8443' runtime-chart-mcp.yaml
+          if grep -q '^kind: Secret$' runtime-chart-mcp.yaml; then
+            echo "MCP chart values must reference, not create, credentials" >&2
             exit 1
           fi
 

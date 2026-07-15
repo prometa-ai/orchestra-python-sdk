@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, TextIO, Tuple
 
 from .admission import (
+    AdmittedRuntimeRelease,
     RuntimeAdmissionPolicy,
     activate_runtime_release,
 )
@@ -38,6 +39,8 @@ from .control_plane import (
 )
 from .kernel import (
     EvidenceEmitter,
+    GuardEvaluator,
+    HumanEscalation,
     RuntimeEvidenceEvent,
     RuntimeExecutionError,
     RuntimeExecutionPolicy,
@@ -46,7 +49,22 @@ from .kernel import (
     available_runtime_capabilities,
 )
 from .model_gateway import OpenAICompatibleModelAdapter
+from .mcp import (
+    MCP_RISK_LEVELS,
+    EnvironmentMcpCredentialProvider,
+    ExplicitMcpEgressPolicy,
+    GovernedMcpToolBroker,
+    McpBrokerPolicy,
+    McpCredentialBinding,
+    McpServerConfig,
+    McpTransportClient,
+    McpToolGrant,
+    OfficialMcpTransportClient,
+    official_mcp_transport_available,
+)
 from .postgres import (
+    PostgresMcpAuditSink,
+    PostgresMcpIdempotencyStore,
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
@@ -94,6 +112,17 @@ class RuntimeHostError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RuntimeHostMcpConfig:
+    servers: Tuple[McpServerConfig, ...]
+    grants: Tuple[McpToolGrant, ...]
+    policy: McpBrokerPolicy
+    egress_policy: ExplicitMcpEgressPolicy
+    credential_bindings: Tuple[McpCredentialBinding, ...]
+    tool_timeout_seconds: float
+    reservation_timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class RuntimeHostConfig:
     tenant_id: str
     runtime_id: str
@@ -135,6 +164,7 @@ class RuntimeHostConfig:
     task_recovery_lease_seconds: float = 90.0
     task_recovery_max_attempts: int = 3
     task_recovery_history_limit: int = 50
+    mcp_broker: Optional[RuntimeHostMcpConfig] = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +295,23 @@ def _string_set(name: str, value: Any) -> Optional[frozenset]:
     return frozenset(_identifier(name, child, 512) for child in value)
 
 
+def _string_tuple_value(
+    name: str,
+    value: Any,
+    *,
+    maximum_items: int = 256,
+    maximum_length: int = 512,
+) -> Tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise RuntimeHostError("invalid_%s" % name)
+    result = tuple(
+        _bounded_string(name, child, maximum_length) for child in value
+    )
+    if len(set(result)) != len(result):
+        raise RuntimeHostError("invalid_%s" % name)
+    return result
+
+
 def _parse_trust_store(value: Any, code: str) -> BundleTrustStore:
     if not isinstance(value, list) or not value or len(value) > 32:
         raise RuntimeHostError(code)
@@ -297,6 +344,323 @@ def _parse_trust_store(value: Any, code: str) -> BundleTrustStore:
         return BundleTrustStore(entries)
     except ValueError:
         raise RuntimeHostError(code) from None
+
+
+def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
+    document = _mapping(value, "mcp_broker_config_invalid")
+    _exact_keys(
+        document,
+        required=("servers", "grants", "policy", "egress"),
+        optional=(
+            "credentialBindings",
+            "toolTimeoutSeconds",
+            "reservationTimeoutSeconds",
+        ),
+        code="mcp_broker_config_invalid",
+    )
+    raw_servers = document["servers"]
+    if not isinstance(raw_servers, list) or not 1 <= len(raw_servers) <= 64:
+        raise RuntimeHostError("mcp_servers_invalid")
+    servers = []
+    for raw_server in raw_servers:
+        item = _mapping(raw_server, "mcp_server_config_invalid")
+        _exact_keys(
+            item,
+            required=(
+                "name",
+                "connectionId",
+                "transport",
+                "environment",
+                "authMode",
+                "scopes",
+                "riskLevel",
+            ),
+            optional=(
+                "endpoint",
+                "command",
+                "arguments",
+                "workingDirectory",
+                "enabled",
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "maxResponseBytes",
+            ),
+            code="mcp_server_config_invalid",
+        )
+        try:
+            servers.append(
+                McpServerConfig(
+                    name=_bounded_string("mcp_server_name", item["name"], 120),
+                    connection_id=_identifier(
+                        "mcp_server_connection_id", item["connectionId"], 200
+                    ),
+                    transport=_identifier(
+                        "mcp_server_transport", item["transport"], 64
+                    ),
+                    environment=_identifier(
+                        "mcp_server_environment", item["environment"], 64
+                    ),
+                    auth_mode=_identifier(
+                        "mcp_server_auth_mode", item["authMode"], 64
+                    ),
+                    scopes=_string_tuple_value(
+                        "mcp_server_scopes", item["scopes"], maximum_length=256
+                    ),
+                    risk_level=_identifier(
+                        "mcp_server_risk_level", item["riskLevel"], 64
+                    ),
+                    endpoint=(
+                        _bounded_string("mcp_server_endpoint", item["endpoint"], 2048)
+                        if item.get("endpoint") is not None
+                        else None
+                    ),
+                    command=(
+                        _bounded_string("mcp_server_command", item["command"], 500)
+                        if item.get("command") is not None
+                        else None
+                    ),
+                    arguments=_string_tuple_value(
+                        "mcp_server_arguments",
+                        item.get("arguments", []),
+                        maximum_items=128,
+                    ),
+                    working_directory=(
+                        _bounded_string(
+                            "mcp_server_working_directory",
+                            item["workingDirectory"],
+                            1024,
+                        )
+                        if item.get("workingDirectory") is not None
+                        else None
+                    ),
+                    enabled=_boolean(
+                        "mcp_server_enabled", item.get("enabled", True)
+                    ),
+                    allow_insecure_http=_boolean(
+                        "mcp_server_allow_insecure_http",
+                        item.get("allowInsecureHttp", False),
+                    ),
+                    timeout_seconds=_positive_number(
+                        "mcp_server_timeout_seconds",
+                        item.get("timeoutSeconds", 30),
+                        300,
+                    ),
+                    max_response_bytes=_positive_integer(
+                        "mcp_server_max_response_bytes",
+                        item.get("maxResponseBytes", 1_048_576),
+                        10_485_760,
+                    ),
+                )
+            )
+        except ValueError:
+            raise RuntimeHostError("mcp_server_config_invalid") from None
+    server_names = {server.name for server in servers}
+    server_ids = {server.connection_id for server in servers}
+    if len(server_names) != len(servers) or len(server_ids) != len(servers):
+        raise RuntimeHostError("mcp_server_identity_duplicate")
+
+    raw_grants = document["grants"]
+    if not isinstance(raw_grants, list) or not 1 <= len(raw_grants) <= 1024:
+        raise RuntimeHostError("mcp_grants_invalid")
+    grants = []
+    for raw_grant in raw_grants:
+        item = _mapping(raw_grant, "mcp_grant_config_invalid")
+        _exact_keys(
+            item,
+            required=("toolName",),
+            optional=(
+                "agentIds",
+                "permission",
+                "riskLevel",
+                "serverConnectionId",
+            ),
+            code="mcp_grant_config_invalid",
+        )
+        try:
+            grant = McpToolGrant(
+                tool_name=_bounded_string(
+                    "mcp_grant_tool_name", item["toolName"], 200
+                ),
+                agent_ids=_string_tuple_value(
+                    "mcp_grant_agent_ids",
+                    item.get("agentIds", []),
+                    maximum_items=1024,
+                    maximum_length=256,
+                ),
+                permission=_identifier(
+                    "mcp_grant_permission", item.get("permission", "read"), 64
+                ),
+                risk_level=_identifier(
+                    "mcp_grant_risk_level", item.get("riskLevel", "low"), 64
+                ),
+                server_connection_id=(
+                    _identifier(
+                        "mcp_grant_server_connection_id",
+                        item["serverConnectionId"],
+                        200,
+                    )
+                    if item.get("serverConnectionId") is not None
+                    else None
+                ),
+            )
+        except ValueError:
+            raise RuntimeHostError("mcp_grant_config_invalid") from None
+        if (
+            grant.server_connection_id is not None
+            and grant.server_connection_id not in server_ids
+        ):
+            raise RuntimeHostError("mcp_grant_server_unknown")
+        grants.append(grant)
+    if len(set(grants)) != len(grants):
+        raise RuntimeHostError("mcp_grant_duplicate")
+
+    raw_policy = _mapping(document["policy"], "mcp_policy_config_invalid")
+    _exact_keys(
+        raw_policy,
+        required=("maxRiskLevel",),
+        optional=("requireApprovalFor", "requireIdempotencyFor"),
+        code="mcp_policy_config_invalid",
+    )
+    approval_classes = frozenset(
+        _string_tuple_value(
+            "mcp_require_approval_for",
+            raw_policy.get("requireApprovalFor", ["write", "destructive"]),
+            maximum_items=3,
+            maximum_length=64,
+        )
+    )
+    idempotency_classes = frozenset(
+        _string_tuple_value(
+            "mcp_require_idempotency_for",
+            raw_policy.get("requireIdempotencyFor", ["write", "destructive"]),
+            maximum_items=3,
+            maximum_length=64,
+        )
+    )
+    minimum_side_effect_policy = frozenset({"write", "destructive"})
+    if not minimum_side_effect_policy.issubset(approval_classes) or not (
+        minimum_side_effect_policy.issubset(idempotency_classes)
+    ):
+        raise RuntimeHostError("mcp_policy_weakened")
+    try:
+        policy = McpBrokerPolicy(
+            max_risk_level=_identifier(
+                "mcp_max_risk_level", raw_policy["maxRiskLevel"], 64
+            ),
+            require_approval_for=approval_classes,
+            require_idempotency_for=idempotency_classes,
+        )
+    except ValueError:
+        raise RuntimeHostError("mcp_policy_config_invalid") from None
+
+    raw_egress = _mapping(document["egress"], "mcp_egress_config_invalid")
+    _exact_keys(
+        raw_egress,
+        required=(),
+        optional=("allowedHttpOrigins", "allowedStdioCommands"),
+        code="mcp_egress_config_invalid",
+    )
+    try:
+        egress_policy = ExplicitMcpEgressPolicy(
+            allowed_http_origins=frozenset(
+                _string_tuple_value(
+                    "mcp_allowed_http_origins",
+                    raw_egress.get("allowedHttpOrigins", []),
+                    maximum_items=64,
+                    maximum_length=2048,
+                )
+            ),
+            allowed_stdio_commands=frozenset(
+                _string_tuple_value(
+                    "mcp_allowed_stdio_commands",
+                    raw_egress.get("allowedStdioCommands", []),
+                    maximum_items=64,
+                    maximum_length=500,
+                )
+            ),
+        )
+    except ValueError:
+        raise RuntimeHostError("mcp_egress_config_invalid") from None
+    if any(not egress_policy.allows(server) for server in servers):
+        raise RuntimeHostError("mcp_egress_binding_missing")
+
+    raw_bindings = document.get("credentialBindings", [])
+    if not isinstance(raw_bindings, list) or len(raw_bindings) > 64:
+        raise RuntimeHostError("mcp_credential_bindings_invalid")
+    bindings = []
+    for raw_binding in raw_bindings:
+        item = _mapping(raw_binding, "mcp_credential_binding_invalid")
+        _exact_keys(
+            item,
+            required=("serverName", "authMode"),
+            optional=("httpHeaders", "stdioEnvironment"),
+            code="mcp_credential_binding_invalid",
+        )
+        http_headers = _mapping(
+            item.get("httpHeaders", {}), "mcp_credential_binding_invalid"
+        )
+        stdio_environment = _mapping(
+            item.get("stdioEnvironment", {}), "mcp_credential_binding_invalid"
+        )
+        try:
+            binding = McpCredentialBinding(
+                server_name=_bounded_string(
+                    "mcp_credential_server_name", item["serverName"], 120
+                ),
+                auth_mode=_identifier(
+                    "mcp_credential_auth_mode", item["authMode"], 64
+                ),
+                http_headers=dict(http_headers),
+                stdio_environment=dict(stdio_environment),
+            )
+        except ValueError:
+            raise RuntimeHostError("mcp_credential_binding_invalid") from None
+        if binding.server_name not in server_names:
+            raise RuntimeHostError("mcp_credential_server_unknown")
+        bindings.append(binding)
+    binding_by_server = {binding.server_name: binding for binding in bindings}
+    if len(binding_by_server) != len(bindings):
+        raise RuntimeHostError("mcp_credential_binding_duplicate")
+    for server in servers:
+        binding = binding_by_server.get(server.name)
+        if server.auth_mode == "none":
+            if binding is not None and binding.auth_mode != "none":
+                raise RuntimeHostError("mcp_credential_auth_mismatch")
+            continue
+        if binding is None or binding.auth_mode != server.auth_mode:
+            raise RuntimeHostError("mcp_credential_binding_missing")
+        if server.transport == "streamable-http":
+            if not binding.http_headers or binding.stdio_environment:
+                raise RuntimeHostError("mcp_credential_transport_mismatch")
+        elif not binding.stdio_environment or binding.http_headers:
+            raise RuntimeHostError("mcp_credential_transport_mismatch")
+
+    maximum_server_timeout = max(server.timeout_seconds for server in servers)
+    tool_timeout_seconds = _positive_number(
+        "mcp_tool_timeout_seconds",
+        document.get("toolTimeoutSeconds", maximum_server_timeout),
+        600,
+    )
+    if tool_timeout_seconds < maximum_server_timeout:
+        raise RuntimeHostError("mcp_tool_timeout_too_short")
+    reservation_timeout_seconds = _positive_number(
+        "mcp_reservation_timeout_seconds",
+        document.get(
+            "reservationTimeoutSeconds", max(300, tool_timeout_seconds + 30)
+        ),
+        86_400,
+    )
+    if reservation_timeout_seconds <= tool_timeout_seconds:
+        raise RuntimeHostError("mcp_reservation_timeout_too_short")
+    return RuntimeHostMcpConfig(
+        servers=tuple(servers),
+        grants=tuple(grants),
+        policy=policy,
+        egress_policy=egress_policy,
+        credential_bindings=tuple(bindings),
+        tool_timeout_seconds=tool_timeout_seconds,
+        reservation_timeout_seconds=reservation_timeout_seconds,
+    )
 
 
 def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
@@ -337,11 +701,17 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "controlPlanePull",
             "receiptDelivery",
             "taskRecovery",
+            "mcpBroker",
         ),
         code="host_config_invalid",
     )
     if document["configVersion"] != HOST_CONFIG_VERSION:
         raise RuntimeHostError("host_config_version_unsupported")
+    mcp_broker = (
+        _parse_mcp_host_config(document["mcpBroker"])
+        if document.get("mcpBroker") is not None
+        else None
+    )
     has_bundle = "bundle" in document
     has_promotion = "promotionAttestation" in document
     has_embedded_release = has_bundle and has_promotion
@@ -601,6 +971,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         task_recovery_lease_seconds=task_recovery_lease_seconds,
         task_recovery_max_attempts=task_recovery_max_attempts,
         task_recovery_history_limit=task_recovery_history_limit,
+        mcp_broker=mcp_broker,
     )
 
 
@@ -1144,11 +1515,97 @@ def _resolve_release_material(
     )
 
 
+_MCP_TARGET_ENVIRONMENT = {
+    "prod": "production",
+    "production": "production",
+    "staging": "staging",
+    "dev": "development",
+    "development": "development",
+    "test": "test",
+}
+
+
+def _validate_mcp_release_binding(
+    config: RuntimeHostConfig, admitted: AdmittedRuntimeRelease
+) -> None:
+    mcp_tools = tuple(
+        tool for tool in admitted.config.tools if tool.source == "mcp"
+    )
+    local = config.mcp_broker
+    if local is None:
+        if mcp_tools:
+            raise RuntimeHostError("mcp_broker_config_missing")
+        return
+    if not mcp_tools:
+        raise RuntimeHostError("mcp_release_binding_mismatch")
+    configured_names = {server.name for server in local.servers}
+    if configured_names != set(admitted.config.mcp_servers):
+        raise RuntimeHostError("mcp_server_manifest_mismatch")
+    target_environment = _MCP_TARGET_ENVIRONMENT.get(config.environment)
+    if target_environment is None:
+        raise RuntimeHostError("mcp_environment_invalid")
+    servers = {server.name: server for server in local.servers}
+    signed_operations = {tool.operation for tool in mcp_tools}
+    if any(grant.tool_name not in signed_operations for grant in local.grants):
+        raise RuntimeHostError("mcp_grant_tool_unknown")
+    risk_rank = {
+        name: index for index, name in enumerate(MCP_RISK_LEVELS, start=1)
+    }
+    max_risk = risk_rank[local.policy.max_risk_level]
+    agent_id = admitted.config.manifest.agent_id
+    for tool in mcp_tools:
+        if tool.side_effects in {"write", "destructive"} and not (
+            tool.approval_required
+        ):
+            raise RuntimeHostError("mcp_side_effect_approval_contract_missing")
+        server = servers.get(tool.mcp_server or "")
+        if server is None:
+            raise RuntimeHostError("mcp_server_manifest_mismatch")
+        if server.environment != target_environment:
+            raise RuntimeHostError("mcp_environment_mismatch")
+        if tool.auth_binding != server.auth_mode:
+            raise RuntimeHostError("mcp_auth_binding_mismatch")
+        if not set(tool.scopes).issubset(set(server.scopes)):
+            raise RuntimeHostError("mcp_server_scope_mismatch")
+        candidates = []
+        for grant in local.grants:
+            if grant.tool_name != tool.operation:
+                continue
+            if grant.server_connection_id not in {
+                None,
+                server.connection_id,
+            }:
+                continue
+            if grant.agent_ids and agent_id not in grant.agent_ids:
+                continue
+            score = (
+                1 if grant.server_connection_id is not None else 0,
+                1 if grant.agent_ids else 0,
+            )
+            candidates.append((score, grant))
+        if not candidates:
+            raise RuntimeHostError("mcp_tool_not_granted")
+        best_score = max(score for score, _grant in candidates)
+        best = [grant for score, grant in candidates if score == best_score]
+        if len(best) != 1:
+            raise RuntimeHostError("mcp_tool_grant_ambiguous")
+        effective_risk = max(
+            risk_rank[tool.risk_level],
+            risk_rank[server.risk_level],
+            risk_rank[best[0].risk_level],
+        )
+        if effective_risk > max_risk:
+            raise RuntimeHostError("mcp_risk_ceiling_exceeded")
+
+
 def build_reference_runtime_host(
     config: RuntimeHostConfig,
     *,
     environment: Optional[Mapping[str, str]] = None,
     evidence_emitter: Optional[EvidenceEmitter] = None,
+    guard_evaluator: Optional[GuardEvaluator] = None,
+    human_escalation: Optional[HumanEscalation] = None,
+    mcp_transport_client: Optional[McpTransportClient] = None,
     now: Optional[datetime] = None,
 ) -> Tuple[ReferenceRuntimeHost, bool]:
     """Activate configured artifacts and construct the tenant request host."""
@@ -1187,6 +1644,39 @@ def build_reference_runtime_host(
         timeout_seconds=config.model_gateway_timeout_seconds,
         max_response_bytes=config.model_gateway_max_response_bytes,
     )
+    tool_broker = None
+    if config.mcp_broker is not None:
+        if (
+            mcp_transport_client is None
+            and not official_mcp_transport_available()
+        ):
+            raise RuntimeHostError("mcp_dependency_missing")
+        tool_broker = GovernedMcpToolBroker(
+            servers=config.mcp_broker.servers,
+            grants=config.mcp_broker.grants,
+            policy=config.mcp_broker.policy,
+            egress_policy=config.mcp_broker.egress_policy,
+            credential_provider=EnvironmentMcpCredentialProvider(
+                config.mcp_broker.credential_bindings,
+                environ=env,
+            ),
+            transport_client=(
+                mcp_transport_client or OfficialMcpTransportClient()
+            ),
+            audit_sink=PostgresMcpAuditSink(
+                dsn,
+                tenant_id=config.tenant_id,
+                runtime_id=config.runtime_id,
+            ),
+            idempotency_store=PostgresMcpIdempotencyStore(
+                dsn,
+                tenant_id=config.tenant_id,
+                runtime_id=config.runtime_id,
+                reservation_timeout_seconds=(
+                    config.mcp_broker.reservation_timeout_seconds
+                ),
+            ),
+        )
     admission_now = now or datetime.now(timezone.utc)
     material = _resolve_release_material(
         config,
@@ -1200,7 +1690,11 @@ def build_reference_runtime_host(
         expected_release_id=config.release_id,
         expected_deployment_id=config.deployment_id,
         expected_runtime=config.runtime_target,
-        supported_capabilities=available_runtime_capabilities(),
+        supported_capabilities=available_runtime_capabilities(
+            guard_evaluator=guard_evaluator,
+            tool_broker=tool_broker,
+            human_escalation=human_escalation,
+        ),
     )
     admitted, activation = activate_runtime_release(
         material.bundle,
@@ -1215,6 +1709,7 @@ def build_reference_runtime_host(
         policy=policy,
         now=admission_now,
     )
+    _validate_mcp_release_binding(config, admitted)
     if material.pulled_handoff is not None:
         if material.cache is None:
             raise RuntimeHostError("control_plane_cache_unavailable")
@@ -1283,7 +1778,15 @@ def build_reference_runtime_host(
         runtime_version=config.runtime_version,
         execution_policy=RuntimeExecutionPolicy(
             timeout_seconds=config.model_gateway_timeout_seconds,
+            tool_timeout_seconds=(
+                config.mcp_broker.tool_timeout_seconds
+                if config.mcp_broker is not None
+                else 30.0
+            ),
         ),
+        guard_evaluator=guard_evaluator,
+        tool_broker=tool_broker,
+        human_escalation=human_escalation,
         state_store=PostgresRuntimeStateStore(
             dsn,
             tenant_id=config.tenant_id,

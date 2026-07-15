@@ -2,8 +2,8 @@
   "contractVersion": 1,
   "profiles": [
     {
-      "name": "k3d-k3s-kube-router-v1",
-      "workload": "model-only",
+      "name": "k3d-k3s-kube-router-mcp-v1",
+      "workload": "mcp-read-only",
       "evidenceStatus": "reference-profile-not-production-certification",
       "networkPolicyController": "k3s-kube-router",
       "runtimeVersion": "0.18.0",
@@ -24,8 +24,8 @@
       "agentNodes": 1,
       "tenantCount": 2,
       "runtimeReplicasPerTenant": 2,
-      "uniqueLoadRequestsPerTenant": 24,
-      "duplicateAttemptsPerTenant": 12
+      "uniqueLoadRequestsPerTenant": 12,
+      "duplicateAttemptsPerTenant": 8
     }
   ]
 }

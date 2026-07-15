@@ -10,8 +10,10 @@ import pytest
 ROOT = Path(__file__).parent.parent
 DEPLOY = ROOT / "deploy/reference-runtime"
 PROFILE = DEPLOY / "topology-profiles.json"
+MCP_PROFILE = DEPLOY / "topology-profiles.mcp.json"
 FIXTURE_PATH = DEPLOY / "ci/topology_fixture.py"
 PROBE_PATH = DEPLOY / "ci/topology_probe.py"
+MCP_SERVER_PATH = DEPLOY / "ci/topology_mcp_server.py"
 
 
 def _load_module(name: str, path: Path):
@@ -44,6 +46,7 @@ def test_topology_profile_is_pinned_and_explicitly_non_production():
     assert len(document["profiles"]) == 1
     assert _profile() == {
         "name": "k3d-k3s-kube-router-v1",
+        "workload": "model-only",
         "evidenceStatus": "reference-profile-not-production-certification",
         "networkPolicyController": "k3s-kube-router",
         "runtimeVersion": "0.18.0",
@@ -96,7 +99,51 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "prometa_runtime_release_activation" in harness_text
     assert "controlPlanePull" not in harness_text
     assert "PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF" in harness_text
+    assert "PROMETA_RUNTIME_TOPOLOGY_PROFILE" in harness_text
+    assert "mcp_tool_call_indeterminate" in harness_text
+    assert "runtime-mcp-credentials" in harness_text
     assert "verify-platform-receipts" in harness_text
+
+
+def test_mcp_topology_profile_reuses_pins_but_has_an_explicit_workload():
+    model = _profile()
+    mcp = json.loads(MCP_PROFILE.read_text(encoding="utf-8"))["profiles"][0]
+
+    assert mcp["name"] == "k3d-k3s-kube-router-mcp-v1"
+    assert mcp["workload"] == "mcp-read-only"
+    assert mcp["evidenceStatus"] == (
+        "reference-profile-not-production-certification"
+    )
+    for key in (
+        "networkPolicyController",
+        "runtimeVersion",
+        "chartVersion",
+        "k3dVersion",
+        "k3dChecksums",
+        "k3sImage",
+        "k3sImageDigest",
+        "postgresImage",
+        "postgresImageDigest",
+        "postgresNodeImage",
+        "serverNodes",
+        "agentNodes",
+        "tenantCount",
+        "runtimeReplicasPerTenant",
+    ):
+        assert mcp[key] == model[key]
+    assert mcp["uniqueLoadRequestsPerTenant"] == 12
+    assert mcp["duplicateAttemptsPerTenant"] == 8
+
+
+def test_topology_profile_name_is_bound_to_its_workload(tmp_path):
+    fixture = _load_module("topology_fixture_profile_binding", FIXTURE_PATH)
+    document = json.loads(MCP_PROFILE.read_text(encoding="utf-8"))
+    document["profiles"][0]["workload"] = "model-only"
+    mismatched = tmp_path / "mismatched-profile.json"
+    mismatched.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="topology_profile_invalid"):
+        fixture._load_profile(mismatched)
 
 
 def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
@@ -193,6 +240,118 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
             PROBE_PATH,
             "prometa-runtime-host:topology-test",
             "0.19.0",
+        )
+
+
+def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
+    tmp_path,
+):
+    pytest.importorskip("cryptography")
+    fixture = _load_module("topology_fixture_mcp_prepare", FIXTURE_PATH)
+    output = tmp_path / "fixture"
+
+    fixture.prepare(
+        MCP_PROFILE,
+        output,
+        PROBE_PATH,
+        "prometa-runtime-host:topology-test",
+        "0.18.0",
+        mcp_server_source_path=MCP_SERVER_PATH,
+    )
+
+    config = json.loads((output / "tenant-a-config.json").read_text())
+    content = config["bundle"]["content"]
+    values = json.loads((output / "tenant-a-values.json").read_text())
+    resources = json.loads((output / "support-resources.json").read_text())
+
+    assert "taskRecovery" not in config
+    assert content["runtimeContract"]["requiredCapabilities"] == [
+        "evidence.emit.v1",
+        "model.invoke.v1",
+        "schema.validate.v1",
+        "tool.broker.v1",
+    ]
+    assert content["mcpServers"] == ["Tenant Tools"]
+    assert content["requiredScopes"] == ["tools:read"]
+    assert content["grantedScopes"] == ["tools:read"]
+    assert content["tools"][0]["sideEffects"] == "read-only"
+    assert content["tools"][0]["approvalRequired"] is False
+    assert config["mcpBroker"]["servers"][0]["transport"] == "streamable-http"
+    assert config["mcpBroker"]["servers"][0]["allowInsecureHttp"] is True
+    assert config["mcpBroker"]["credentialBindings"] == [
+        {
+            "serverName": "Tenant Tools",
+            "authMode": "api-key",
+            "httpHeaders": {
+                "Authorization": "MCP_TOPOLOGY_AUTHORIZATION"
+            },
+            "stdioEnvironment": {},
+        }
+    ]
+    assert values["extraEnv"] == [
+        {
+            "name": "MCP_TOPOLOGY_AUTHORIZATION",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": "runtime-mcp-credentials",
+                    "key": "authorization",
+                }
+            },
+        }
+    ]
+    egress_namespaces = {
+        peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+        for rule in values["networkPolicy"]["egress"]
+        for peer in rule["to"]
+    }
+    assert egress_namespaces == {"data-a", "models-a", "tools-a"}
+
+    namespaces = {
+        item["metadata"]["name"]
+        for item in resources["items"]
+        if item["kind"] == "Namespace"
+    }
+    assert {"tools-a", "tools-b"}.issubset(namespaces)
+    secrets = {
+        (item["metadata"]["namespace"], item["metadata"]["name"])
+        for item in resources["items"]
+        if item["kind"] == "Secret"
+    }
+    assert ("tools-a", "mcp-server-credentials") in secrets
+    assert ("runtime-a", "runtime-mcp-credentials") in secrets
+    policy = next(
+        item
+        for item in resources["items"]
+        if item["kind"] == "NetworkPolicy"
+        and item["metadata"] == {
+            "name": "mcp-integration",
+            "namespace": "tools-a",
+        }
+    )
+    peer = policy["spec"]["ingress"][0]["from"][0]
+    assert peer["namespaceSelector"]["matchLabels"] == {
+        "kubernetes.io/metadata.name": "runtime-a"
+    }
+    assert peer["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/component": "runtime"
+    }
+    assert policy["spec"]["egress"] == []
+
+    for tenant in ("a", "b"):
+        for suffix in ("mcp-server.env", "mcp-runtime.env"):
+            path = output / f"tenant-{tenant}-rotated-{suffix}"
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    private_document = (output / "support-resources.json").read_text()
+    assert "Bearer " in private_document
+    assert stat.S_IMODE((output / "support-resources.json").stat().st_mode) == 0o600
+
+    with pytest.raises(ValueError, match="mcp_server_source_missing"):
+        fixture.prepare(
+            MCP_PROFILE,
+            tmp_path / "missing-server",
+            PROBE_PATH,
+            "prometa-runtime-host:topology-test",
+            "0.18.0",
         )
 
 
@@ -551,6 +710,69 @@ def test_topology_report_includes_only_validated_live_receipt_evidence(tmp_path)
         )
 
 
+def test_mcp_topology_report_is_payload_free_and_requires_observations(tmp_path):
+    fixture = _load_module("topology_fixture_mcp_report", FIXTURE_PATH)
+    report = tmp_path / "mcp-report.json"
+
+    fixture.write_report(
+        MCP_PROFILE,
+        report,
+        "v1.34.8+k3s1",
+        1,
+        1,
+        2,
+        2,
+        mcp_audit_count_a=42,
+        mcp_audit_count_b=40,
+        mcp_indeterminate_count_a=1,
+        mcp_indeterminate_count_b=1,
+    )
+
+    evidence = json.loads(report.read_text())
+    assert evidence["workload"] == "mcp-read-only"
+    assert evidence["mcpToolSideEffects"] == "read-only"
+    assert evidence["mcpAuditRows"] == {"tenantA": 42, "tenantB": 40}
+    assert evidence["mcpIndeterminateRowsPerTenant"] == 1
+    assert "taskStatusSurvivedPodReplacement" not in evidence
+    for key in (
+        "officialStreamableHttpTransport",
+        "signedMcpReleaseBinding",
+        "separateMcpSecretProjection",
+        "crossReplicaMcpIdempotency",
+        "crossTenantMcpIngressIsolation",
+        "crossTenantMcpEgressIsolation",
+        "mcpAuditPersistedAcrossPodReplacement",
+        "mcpCredentialRotationRequiresRollout",
+        "mcpIndeterminateQuarantine",
+    ):
+        assert evidence[key] is True
+    lowered = report.read_text(encoding="utf-8").lower()
+    for forbidden in (
+        '"question"',
+        '"answer"',
+        '"token"',
+        '"password"',
+        '"signedpayload"',
+        '"signature"',
+    ):
+        assert forbidden not in lowered
+
+    with pytest.raises(ValueError, match="mcp_topology_observation_invalid"):
+        fixture.write_report(
+            MCP_PROFILE,
+            tmp_path / "invalid-mcp-report.json",
+            "v1.34.8+k3s1",
+            1,
+            1,
+            2,
+            2,
+            mcp_audit_count_a=42,
+            mcp_audit_count_b=40,
+            mcp_indeterminate_count_a=0,
+            mcp_indeterminate_count_b=1,
+        )
+
+
 def test_topology_probe_rejects_ambiguous_json_and_invalid_urls():
     probe = _load_module("topology_probe_contract", PROBE_PATH)
 
@@ -561,4 +783,40 @@ def test_topology_probe_rejects_ambiguous_json_and_invalid_urls():
     assert probe._urls("http://10.42.0.1:8080,http://10.42.1.1:8080") == (
         "http://10.42.0.1:8080",
         "http://10.42.1.1:8080",
+    )
+
+
+def test_topology_probe_dispatches_mcp_duplicate_mode(monkeypatch):
+    probe = _load_module("topology_probe_mcp_dispatch", PROBE_PATH)
+    observed = {}
+
+    def capture(*args):
+        observed["args"] = args
+
+    monkeypatch.setattr(probe, "duplicate_probe", capture)
+
+    assert (
+        probe.main(
+            [
+                "duplicates",
+                "--urls",
+                "http://10.42.0.1:8080,http://10.42.1.1:8080",
+                "--request-id",
+                "duplicate-a",
+                "--attempts",
+                "8",
+                "--expect-answer",
+                "tenant-a",
+                "--mcp",
+            ]
+        )
+        == 0
+    )
+    assert observed["args"] == (
+        ("http://10.42.0.1:8080", "http://10.42.1.1:8080"),
+        "duplicate-a",
+        8,
+        "tenant-a",
+        12,
+        True,
     )

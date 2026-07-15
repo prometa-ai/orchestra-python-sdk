@@ -171,6 +171,7 @@ def duplicate_probe(
     attempts: int,
     expected_answer: str,
     timeout: float,
+    mcp: bool = False,
 ) -> None:
     if len(urls) < 2 or attempts < 2:
         raise ProbeError("duplicate_parameters_invalid")
@@ -183,7 +184,8 @@ def duplicate_probe(
     with ThreadPoolExecutor(max_workers=attempts) as executor:
         outcomes = list(executor.map(invoke, range(attempts)))
     winners = [body for status, body in outcomes if status == 200]
-    conflicts = [body for status, body in outcomes if status == 409]
+    conflict_statuses = {409, 500} if mcp else {409}
+    conflicts = [body for status, body in outcomes if status in conflict_statuses]
     if len(winners) != 1 or len(conflicts) != attempts - 1:
         raise ProbeError("duplicate_winner_count_invalid")
     if winners[0].get("output") != {"answer": expected_answer}:
@@ -193,6 +195,10 @@ def duplicate_probe(
         "task_in_progress",
         "task_already_completed",
     }
+    if mcp:
+        allowed_errors.update(
+            {"mcp_tool_call_in_progress", "mcp_duplicate_tool_call"}
+        )
     if any(body.get("error", {}).get("code") not in allowed_errors for body in conflicts):
         raise ProbeError("duplicate_conflict_invalid")
     _print(
@@ -252,7 +258,7 @@ class _ModelState:
         self.lock = threading.Lock()
 
 
-def serve_model_gateway(tenant: str, port: int) -> None:
+def serve_model_gateway(tenant: str, port: int, *, mcp: bool = False) -> None:
     state = _ModelState(tenant)
 
     class Handler(BaseHTTPRequestHandler):
@@ -295,6 +301,22 @@ def serve_model_gateway(tenant: str, port: int) -> None:
                     or not request_id
                 ):
                     raise ValueError("invalid request")
+                messages = document.get("messages")
+                tools = document.get("tools", [])
+                if not isinstance(messages, list):
+                    raise ValueError("invalid messages")
+                tool_completed = any(
+                    isinstance(message, Mapping) and message.get("role") == "tool"
+                    for message in messages
+                )
+                if mcp and (
+                    not isinstance(tools, list)
+                    or len(tools) != 1
+                    or not isinstance(tools[0], Mapping)
+                    or not isinstance(tools[0].get("function"), Mapping)
+                    or tools[0].get("function", {}).get("name") != "lookup_tenant"
+                ):
+                    raise ValueError("invalid tools")
             except (ValueError, UnicodeError, json.JSONDecodeError):
                 self._send(400, {"error": {"code": "request_invalid"}})
                 return
@@ -302,6 +324,36 @@ def serve_model_gateway(tenant: str, port: int) -> None:
                 state.count += 1
             if "duplicate" in request_id:
                 time.sleep(0.8)
+            if mcp and not tool_completed:
+                self._send(
+                    200,
+                    {
+                        "model": "golden-model",
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call-%s" % request_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": "lookup_tenant",
+                                                "arguments": json.dumps(
+                                                    {"requestId": request_id},
+                                                    sort_keys=True,
+                                                    separators=(",", ":"),
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    },
+                )
+                return
             self._send(
                 200,
                 {
@@ -342,6 +394,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model = subparsers.add_parser("model-gateway")
     model.add_argument("--tenant", required=True)
     model.add_argument("--port", type=int, default=8000)
+    model.add_argument("--mcp", action="store_true")
 
     subparsers.add_parser("sleep")
 
@@ -371,6 +424,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     duplicate.add_argument("--attempts", type=int, required=True)
     duplicate.add_argument("--expect-answer", required=True)
     duplicate.add_argument("--timeout", type=float, default=12)
+    duplicate.add_argument("--mcp", action="store_true")
 
     task = subparsers.add_parser("task-status")
     task.add_argument("--url", required=True)
@@ -387,11 +441,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     count = subparsers.add_parser("model-count")
     count.add_argument("--url", required=True)
     count.add_argument("--timeout", type=float, default=3)
+    mcp_count = subparsers.add_parser("mcp-count")
+    mcp_count.add_argument("--url", required=True)
+    mcp_count.add_argument("--timeout", type=float, default=3)
 
     args = parser.parse_args(argv)
     try:
         if args.command == "model-gateway":
-            serve_model_gateway(args.tenant, args.port)
+            serve_model_gateway(args.tenant, args.port, mcp=args.mcp)
         elif args.command == "sleep":
             while True:
                 time.sleep(3600)
@@ -422,6 +479,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.attempts,
                 args.expect_answer,
                 args.timeout,
+                args.mcp,
             )
         elif args.command == "task-status":
             task_status_probe(
@@ -432,7 +490,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         elif args.command == "socket":
             socket_probe(args.host, args.port, args.expect, args.timeout)
-        elif args.command == "model-count":
+        elif args.command in {"model-count", "mcp-count"}:
             model_count_probe(args.url, args.timeout)
     except (ProbeError, OSError, TimeoutError, urllib.error.URLError) as exc:
         code = str(exc) if isinstance(exc, ProbeError) else "probe_transport_failed"

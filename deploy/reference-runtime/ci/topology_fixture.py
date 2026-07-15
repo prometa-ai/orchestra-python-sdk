@@ -18,8 +18,11 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-PROFILE_NAME = "k3d-k3s-kube-router-v1"
 TENANTS = ("a", "b")
+PROFILE_WORKLOADS = {
+    "k3d-k3s-kube-router-v1": "model-only",
+    "k3d-k3s-kube-router-mcp-v1": "mcp-read-only",
+}
 
 
 def _canonical(value: Any) -> str:
@@ -57,12 +60,14 @@ def _load_profile(path: Path) -> Mapping[str, Any]:
         or not isinstance(profiles, list)
         or len(profiles) != 1
         or not isinstance(profiles[0], Mapping)
-        or profiles[0].get("name") != PROFILE_NAME
+        or PROFILE_WORKLOADS.get(profiles[0].get("name"))
+        != profiles[0].get("workload")
     ):
         raise ValueError("topology_profile_invalid")
     profile = profiles[0]
     required_strings = (
         "evidenceStatus",
+        "workload",
         "networkPolicyController",
         "runtimeVersion",
         "chartVersion",
@@ -109,7 +114,7 @@ def _sign(private_key: Any, payload: str) -> str:
     )
 
 
-def _runtime_content(tenant: str) -> Mapping[str, Any]:
+def _runtime_content(tenant: str, workload: str) -> Mapping[str, Any]:
     primary = {
         "name": "Primary",
         "provider": "inference-engine",
@@ -119,6 +124,33 @@ def _runtime_content(tenant: str) -> Mapping[str, Any]:
         "maxOutputTokens": 128,
         "structuredOutput": True,
     }
+    mcp_enabled = workload == "mcp-read-only"
+    tool = {
+        "name": "Tenant lookup",
+        "source": "mcp",
+        "operation": "lookup_tenant",
+        "inputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"requestId": {"type": "string", "minLength": 1}},
+            "required": ["requestId"],
+            "additionalProperties": False,
+        },
+        "mcpServer": "Tenant Tools",
+        "sideEffects": "read-only",
+        "riskLevel": "low",
+        "authBinding": "api-key",
+        "scopes": ["tools:read"],
+        "approvalRequired": False,
+        "requiredGuardrails": [],
+    }
+    required_capabilities = [
+        "evidence.emit.v1",
+        "model.invoke.v1",
+        "schema.validate.v1",
+    ]
+    if mcp_enabled:
+        required_capabilities.append("tool.broker.v1")
     return {
         "schemaVersion": 1,
         "manifest": {
@@ -132,11 +164,16 @@ def _runtime_content(tenant: str) -> Mapping[str, Any]:
             "solutionName": "Topology Certification",
             "deployable": True,
         },
-        "systemPrompt": "Return the isolated tenant identifier.",
+        "systemPrompt": (
+            "Use the signed tenant lookup tool, then return the isolated tenant "
+            "identifier."
+            if mcp_enabled
+            else "Return the isolated tenant identifier."
+        ),
         "models": [primary],
         "primaryModel": primary,
         "topology": {"pattern": "single-react", "maxIterations": 1},
-        "tools": [],
+        "tools": [tool] if mcp_enabled else [],
         "skills": [],
         "knowledge": [],
         "memory": [],
@@ -146,9 +183,9 @@ def _runtime_content(tenant: str) -> Mapping[str, Any]:
         "identity": None,
         "triggers": [],
         "evaluation": [],
-        "mcpServers": [],
-        "requiredScopes": [],
-        "grantedScopes": [],
+        "mcpServers": ["Tenant Tools"] if mcp_enabled else [],
+        "requiredScopes": ["tools:read"] if mcp_enabled else [],
+        "grantedScopes": ["tools:read"] if mcp_enabled else [],
         "readiness": {
             "quality": 100,
             "security": 100,
@@ -157,11 +194,7 @@ def _runtime_content(tenant: str) -> Mapping[str, Any]:
         },
         "runtimeContract": {
             "contractVersion": 1,
-            "requiredCapabilities": [
-                "evidence.emit.v1",
-                "model.invoke.v1",
-                "schema.validate.v1",
-            ],
+            "requiredCapabilities": required_capabilities,
             "inputSchema": {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
@@ -182,13 +215,15 @@ def _runtime_content(tenant: str) -> Mapping[str, Any]:
     }
 
 
-def _signed_release(tenant: str, now: datetime) -> Mapping[str, Any]:
+def _signed_release(
+    tenant: str, now: datetime, workload: str = "model-only"
+) -> Mapping[str, Any]:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     bundle_key = Ed25519PrivateKey.generate()
     promotion_key = Ed25519PrivateKey.generate()
     org_id = "org-topology-%s" % tenant
-    content = _runtime_content(tenant)
+    content = _runtime_content(tenant, workload)
     content_canonical = _canonical(content)
     digest = "sha256:" + hashlib.sha256(
         content_canonical.encode("utf-8")
@@ -313,6 +348,7 @@ def _runtime_config(
     release: Mapping[str, Any],
     runtime_version: str,
     receipt_base_url: Optional[str] = None,
+    workload: str = "model-only",
 ) -> Mapping[str, Any]:
     config: Dict[str, Any] = {
         "configVersion": 1,
@@ -339,12 +375,67 @@ def _runtime_config(
         "apiTokenEnv": "PROMETA_RUNTIME_API_TOKEN",
         "requestTimeoutSeconds": 8,
         "maxRequestBytes": 65536,
-        "taskRecovery": {
+    }
+    if workload == "model-only":
+        config["taskRecovery"] = {
             "leaseSeconds": 15,
             "maxAttempts": 3,
             "historyLimit": 50,
-        },
-    }
+        }
+    else:
+        config["mcpBroker"] = {
+            "servers": [
+                {
+                    "name": "Tenant Tools",
+                    "connectionId": "tenant-tools-%s" % tenant,
+                    "transport": "streamable-http",
+                    "environment": "production",
+                    "authMode": "api-key",
+                    "scopes": ["tools:read"],
+                    "riskLevel": "low",
+                    "endpoint": (
+                        "http://mcp-integration.tools-%s.svc.cluster.local:8000/mcp"
+                        % tenant
+                    ),
+                    "allowInsecureHttp": True,
+                    "timeoutSeconds": 3,
+                    "maxResponseBytes": 65536,
+                }
+            ],
+            "grants": [
+                {
+                    "toolName": "lookup_tenant",
+                    "agentIds": ["agent-topology-%s" % tenant],
+                    "permission": "read",
+                    "riskLevel": "low",
+                    "serverConnectionId": "tenant-tools-%s" % tenant,
+                }
+            ],
+            "policy": {
+                "maxRiskLevel": "low",
+                "requireApprovalFor": ["write", "destructive"],
+                "requireIdempotencyFor": ["write", "destructive"],
+            },
+            "egress": {
+                "allowedHttpOrigins": [
+                    "http://mcp-integration.tools-%s.svc.cluster.local:8000"
+                    % tenant
+                ],
+                "allowedStdioCommands": [],
+            },
+            "credentialBindings": [
+                {
+                    "serverName": "Tenant Tools",
+                    "authMode": "api-key",
+                    "httpHeaders": {
+                        "Authorization": "MCP_TOPOLOGY_AUTHORIZATION"
+                    },
+                    "stdioEnvironment": {},
+                }
+            ],
+            "toolTimeoutSeconds": 5,
+            "reservationTimeoutSeconds": 15,
+        }
     if receipt_base_url is not None:
         config["receiptDelivery"] = {
             "baseUrl": receipt_base_url,
@@ -498,16 +589,19 @@ def _postgres_resources(
 
 
 def _model_resources(
-    tenant: str, image: str, source: str
+    tenant: str, image: str, source: str, workload: str
 ) -> Tuple[Mapping[str, Any], ...]:
     namespace = "models-%s" % tenant
     labels = {"app.kubernetes.io/name": "model-gateway"}
+    arguments = ["model-gateway", "--tenant", "tenant-%s" % tenant]
+    if workload == "mcp-read-only":
+        arguments.append("--mcp")
     container = {
         "name": "model-gateway",
         "image": image,
         "imagePullPolicy": "Never",
         "command": ["python", "/opt/topology/topology_probe.py"],
-        "args": ["model-gateway", "--tenant", "tenant-%s" % tenant],
+        "args": arguments,
         "ports": [{"name": "http", "containerPort": 8000}],
         "securityContext": _restricted_container_security(),
         "readinessProbe": {
@@ -548,6 +642,142 @@ def _model_resources(
             "spec": {
                 "selector": labels,
                 "ports": [{"name": "http", "port": 8000, "targetPort": 8000}],
+            },
+        },
+    )
+
+
+def _mcp_resources(
+    tenant: str,
+    image: str,
+    source: str,
+    token: str,
+) -> Tuple[Mapping[str, Any], ...]:
+    namespace = "tools-%s" % tenant
+    labels = {"app.kubernetes.io/name": "mcp-integration"}
+    return (
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "topology-mcp-server", "namespace": namespace},
+            "data": {"topology_mcp_server.py": source},
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "mcp-server-credentials", "namespace": namespace},
+            "stringData": {"token": token},
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "runtime-mcp-credentials",
+                "namespace": "runtime-%s" % tenant,
+            },
+            "stringData": {"authorization": "Bearer %s" % token},
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "mcp-integration", "namespace": namespace},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "securityContext": _restricted_pod_security(),
+                        "containers": [
+                            {
+                                "name": "mcp-integration",
+                                "image": image,
+                                "imagePullPolicy": "Never",
+                                "command": [
+                                    "python",
+                                    "/opt/topology/topology_mcp_server.py",
+                                ],
+                                "args": ["--tenant", tenant, "--port", "8000"],
+                                "ports": [{"name": "http", "containerPort": 8000}],
+                                "securityContext": _restricted_container_security(),
+                                "readinessProbe": {
+                                    "httpGet": {"path": "/healthz", "port": "http"},
+                                    "periodSeconds": 2,
+                                    "timeoutSeconds": 2,
+                                    "failureThreshold": 45,
+                                },
+                                "resources": {
+                                    "requests": {"cpu": "25m", "memory": "64Mi"},
+                                    "limits": {"cpu": "500m", "memory": "256Mi"},
+                                },
+                                "volumeMounts": [
+                                    {
+                                        "name": "support",
+                                        "mountPath": "/opt/topology",
+                                        "readOnly": True,
+                                    },
+                                    {
+                                        "name": "credentials",
+                                        "mountPath": "/var/run/secrets/prometa-mcp",
+                                        "readOnly": True,
+                                    },
+                                    {"name": "tmp", "mountPath": "/tmp"},
+                                ],
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "support",
+                                "configMap": {"name": "topology-mcp-server"},
+                            },
+                            {
+                                "name": "credentials",
+                                "secret": {"secretName": "mcp-server-credentials"},
+                            },
+                            {"name": "tmp", "emptyDir": {"sizeLimit": "32Mi"}},
+                        ],
+                    },
+                },
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "mcp-integration", "namespace": namespace},
+            "spec": {
+                "selector": labels,
+                "ports": [{"name": "http", "port": 8000, "targetPort": 8000}],
+            },
+        },
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "mcp-integration", "namespace": namespace},
+            "spec": {
+                "podSelector": {"matchLabels": labels},
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [
+                    {
+                        "from": [
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {
+                                        "kubernetes.io/metadata.name": "runtime-%s"
+                                        % tenant
+                                    }
+                                },
+                                "podSelector": {
+                                    "matchLabels": {
+                                        "app.kubernetes.io/component": "runtime"
+                                    }
+                                },
+                            }
+                        ],
+                        "ports": [{"protocol": "TCP", "port": 8000}],
+                    }
+                ],
+                "egress": [],
             },
         },
     )
@@ -636,6 +866,8 @@ def _chart_values(
     runtime_image: str,
     replicas: int,
     receipt_endpoint_cidr: Optional[str] = None,
+    workload: str = "model-only",
+    profile_name: str = "k3d-k3s-kube-router-v1",
 ) -> Mapping[str, Any]:
     repository, tag = runtime_image.rsplit(":", 1)
     runtime_namespace = "runtime-%s" % tenant
@@ -804,10 +1036,41 @@ def _chart_values(
         "service": {"port": 8080},
         "serviceAccount": {"automountServiceAccountToken": False},
         "podAnnotations": {
-            "topology.prometa.io/profile": PROFILE_NAME,
+            "topology.prometa.io/profile": profile_name,
             "topology.prometa.io/runtime-namespace": runtime_namespace,
         },
     }
+    if workload == "mcp-read-only":
+        values["extraEnv"] = [
+            {
+                "name": "MCP_TOPOLOGY_AUTHORIZATION",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "runtime-mcp-credentials",
+                        "key": "authorization",
+                    }
+                },
+            }
+        ]
+        values["networkPolicy"]["egress"].append(
+            {
+                "to": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": "tools-%s" % tenant
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": "mcp-integration"
+                            }
+                        },
+                    }
+                ],
+                "ports": [{"protocol": "TCP", "port": 8000}],
+            }
+        )
     if receipt_endpoint_cidr is not None:
         values["credentials"]["receiptApiKeyOptional"] = False
         values["networkPolicy"]["egress"].append(
@@ -861,8 +1124,11 @@ def prepare(
     runtime_version: str,
     receipt_base_url: Optional[str] = None,
     receipt_endpoint_cidr: Optional[str] = None,
+    mcp_server_source_path: Optional[Path] = None,
 ) -> None:
     profile = _load_profile(profile_path)
+    workload = str(profile["workload"])
+    mcp_enabled = workload == "mcp-read-only"
     if ":" not in runtime_image or len(runtime_image) > 256:
         raise ValueError("runtime_image_invalid")
     if runtime_version != profile["runtimeVersion"]:
@@ -870,21 +1136,33 @@ def prepare(
     receipt_base_url, receipt_endpoint_cidr = _validated_receipt_endpoint(
         receipt_base_url, receipt_endpoint_cidr
     )
+    if mcp_enabled and receipt_base_url is not None:
+        raise ValueError("mcp_receipt_combination_not_certified")
+    if mcp_enabled and mcp_server_source_path is None:
+        raise ValueError("mcp_server_source_missing")
     source = probe_source_path.read_text(encoding="utf-8")
+    mcp_source = (
+        mcp_server_source_path.read_text(encoding="utf-8")
+        if mcp_server_source_path is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir.chmod(0o700)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     resources = []
     platform_tenants = []
+    namespace_profiles = [
+        ("runtime", "restricted"),
+        ("gateway", "restricted"),
+        ("models", "restricted"),
+        ("data", "baseline"),
+    ]
+    if mcp_enabled:
+        namespace_profiles.append(("tools", "restricted"))
     for tenant in TENANTS:
-        for prefix, policy in (
-            ("runtime", "restricted"),
-            ("gateway", "restricted"),
-            ("models", "restricted"),
-            ("data", "baseline"),
-        ):
+        for prefix, policy in namespace_profiles:
             resources.append(_namespace("%s-%s" % (prefix, tenant), tenant, policy))
-        release = _signed_release(tenant, now)
+        release = _signed_release(tenant, now, workload)
         api_token = secrets.token_urlsafe(36)
         receipt_write_key = "pk_topology_" + secrets.token_urlsafe(36)
         receipt_read_key = "pk_topology_" + secrets.token_urlsafe(36)
@@ -900,6 +1178,7 @@ def prepare(
                 release,
                 runtime_version,
                 receipt_base_url=receipt_base_url,
+                workload=workload,
             ),
             private=True,
         )
@@ -925,6 +1204,8 @@ def prepare(
                 runtime_image,
                 int(profile["runtimeReplicasPerTenant"]),
                 receipt_endpoint_cidr=receipt_endpoint_cidr,
+                workload=workload,
+                profile_name=str(profile["name"]),
             ),
         )
         if receipt_base_url is not None:
@@ -950,8 +1231,24 @@ def prepare(
                 postgres_password,
             )
         )
-        resources.extend(_model_resources(tenant, runtime_image, source))
+        resources.extend(_model_resources(tenant, runtime_image, source, workload))
         resources.extend(_gateway_resources(tenant, runtime_image, source, api_token))
+        if mcp_enabled:
+            mcp_token = secrets.token_urlsafe(36)
+            rotated_mcp_token = secrets.token_urlsafe(36)
+            resources.extend(
+                _mcp_resources(tenant, runtime_image, mcp_source or "", mcp_token)
+            )
+            for suffix, value in (
+                ("mcp-server.env", "token=%s\n" % rotated_mcp_token),
+                (
+                    "mcp-runtime.env",
+                    "authorization=Bearer %s\n" % rotated_mcp_token,
+                ),
+            ):
+                path = output_dir / ("tenant-%s-rotated-%s" % (tenant, suffix))
+                path.write_text(value, encoding="utf-8")
+                path.chmod(0o600)
     _write_json(
         output_dir / "support-resources.json",
         {"apiVersion": "v1", "kind": "List", "items": resources},
@@ -1366,6 +1663,10 @@ def write_report(
     receipt_proof_path: Optional[Path] = None,
     receipt_outbox_delivered_a: Optional[int] = None,
     receipt_outbox_delivered_b: Optional[int] = None,
+    mcp_audit_count_a: Optional[int] = None,
+    mcp_audit_count_b: Optional[int] = None,
+    mcp_indeterminate_count_a: Optional[int] = None,
+    mcp_indeterminate_count_b: Optional[int] = None,
 ) -> None:
     profile = _load_profile(profile_path)
     expected_replicas = int(profile["runtimeReplicasPerTenant"])
@@ -1380,6 +1681,7 @@ def write_report(
     report = {
         "contractVersion": 1,
         "profile": profile["name"],
+        "workload": profile["workload"],
         "evidenceStatus": profile["evidenceStatus"],
         "passed": True,
         "kubernetesVersion": kubernetes_version,
@@ -1403,9 +1705,38 @@ def write_report(
         "databasePartitionDeniedBeforeModel": True,
         "databasePartitionRecovery": True,
         "podReplacementJoinedActivation": True,
-        "taskStatusSurvivedPodReplacement": True,
         "synchronousControlPlaneCalls": 0,
     }
+    if profile["workload"] == "model-only":
+        report["taskStatusSurvivedPodReplacement"] = True
+    else:
+        audit_counts = (mcp_audit_count_a, mcp_audit_count_b)
+        indeterminate_counts = (
+            mcp_indeterminate_count_a,
+            mcp_indeterminate_count_b,
+        )
+        if (
+            any(type(value) is not int or value < 1 for value in audit_counts)
+            or indeterminate_counts != (1, 1)
+            or receipt_proof_path is not None
+        ):
+            raise ValueError("mcp_topology_observation_invalid")
+        report.update(
+            {
+                "mcpToolSideEffects": "read-only",
+                "officialStreamableHttpTransport": True,
+                "signedMcpReleaseBinding": True,
+                "separateMcpSecretProjection": True,
+                "crossReplicaMcpIdempotency": True,
+                "crossTenantMcpIngressIsolation": True,
+                "crossTenantMcpEgressIsolation": True,
+                "mcpAuditPersistedAcrossPodReplacement": True,
+                "mcpCredentialRotationRequiresRollout": True,
+                "mcpIndeterminateQuarantine": True,
+                "mcpAuditRows": {"tenantA": audit_counts[0], "tenantB": audit_counts[1]},
+                "mcpIndeterminateRowsPerTenant": 1,
+            }
+        )
     if receipt_proof_path is not None:
         proof = _read_json(receipt_proof_path)
         expected = {
@@ -1467,6 +1798,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prepare_parser.add_argument("--runtime-version", required=True)
     prepare_parser.add_argument("--receipt-base-url")
     prepare_parser.add_argument("--receipt-endpoint-cidr")
+    prepare_parser.add_argument("--mcp-server-source", type=Path)
 
     verify_platform = subparsers.add_parser("verify-platform-receipts")
     verify_platform.add_argument("--fixture", type=Path, required=True)
@@ -1514,6 +1846,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_parser.add_argument("--receipt-proof", type=Path)
     report_parser.add_argument("--receipt-outbox-delivered-a", type=int)
     report_parser.add_argument("--receipt-outbox-delivered-b", type=int)
+    report_parser.add_argument("--mcp-audit-count-a", type=int)
+    report_parser.add_argument("--mcp-audit-count-b", type=int)
+    report_parser.add_argument("--mcp-indeterminate-count-a", type=int)
+    report_parser.add_argument("--mcp-indeterminate-count-b", type=int)
 
     args = parser.parse_args(argv)
     if args.command == "profile-value":
@@ -1531,6 +1867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.runtime_version,
             args.receipt_base_url,
             args.receipt_endpoint_cidr,
+            args.mcp_server_source,
         )
     elif args.command == "verify-platform-receipts":
         verify_platform_receipts(
@@ -1585,6 +1922,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.receipt_proof,
             args.receipt_outbox_delivered_a,
             args.receipt_outbox_delivered_b,
+            args.mcp_audit_count_a,
+            args.mcp_audit_count_b,
+            args.mcp_indeterminate_count_a,
+            args.mcp_indeterminate_count_b,
         )
     return 0
 

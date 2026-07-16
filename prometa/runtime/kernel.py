@@ -360,6 +360,7 @@ def runtime_release_identity_attributes(
     attributes: Dict[str, Any] = {
         "prometa.agent_id": config.manifest.agent_id,
         "gen_ai.agent.name": config.manifest.name,
+        "prometa.artifact.type": "agent-bundle",
         "prometa.artifact.digest": admission.artifact_digest,
         "prometa.bundle.digest": admission.artifact_digest,
         "prometa.bundle.jti": admission.bundle.jti,

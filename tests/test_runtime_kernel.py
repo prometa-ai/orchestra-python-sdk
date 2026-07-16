@@ -275,6 +275,7 @@ def test_successful_execution_validates_schemas_and_emits_joinable_identity() ->
     assert completed.outcome == "completed"
     for key in (
         "prometa.agent_id",
+        "prometa.artifact.type",
         "prometa.artifact.digest",
         "prometa.bundle.digest",
         "prometa.bundle.jti",
@@ -290,6 +291,7 @@ def test_successful_execution_validates_schemas_and_emits_joinable_identity() ->
     assert completed.attributes["prometa.artifact.digest"] == completed.attributes[
         "prometa.bundle.digest"
     ]
+    assert completed.attributes["prometa.artifact.type"] == "agent-bundle"
     assert "prometa.policy.digest" not in completed.attributes
     assert "prometa.configuration.digest" not in completed.attributes
 
@@ -303,6 +305,7 @@ def test_runtime_contract_v2_stamps_signed_projection_digests() -> None:
     assert admitted_event.attributes["prometa.artifact.digest"] == (
         admitted.artifact_digest
     )
+    assert admitted_event.attributes["prometa.artifact.type"] == "agent-bundle"
     assert admitted_event.attributes["prometa.policy.digest"] == (
         admitted.config.contract.policy_digest
     )

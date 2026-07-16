@@ -1426,6 +1426,7 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
         ]
         assert identity_events
         for event in identity_events:
+            assert event.attributes["prometa.artifact.type"] == "agent-bundle"
             assert event.attributes["prometa.artifact.digest"] == (
                 vector["bundle"]["artifactDigest"]
             )

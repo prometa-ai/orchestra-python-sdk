@@ -218,11 +218,11 @@ patterns fail admission until their execution contracts exist. It emits
 identity-only decision evidence by default, not raw prompts or tool payloads.
 Every event carries the verified bundle, attestation, policy decision, release,
 deployment, runtime, environment, manifest, solution, and agent identities.
-`prometa.artifact.digest` is the canonical artifact join and
-`prometa.bundle.digest` remains its compatibility alias. Runtime contract v2
-also adds `prometa.policy.digest` and `prometa.configuration.digest`; lifecycle
-receipts carry the same digest pair. Contract v1 evidence omits the pair rather
-than inventing values.
+`prometa.artifact.type=agent-bundle` disambiguates the canonical
+`prometa.artifact.digest` join, and `prometa.bundle.digest` remains its
+compatibility alias. Runtime contract v2 also adds `prometa.policy.digest` and
+`prometa.configuration.digest`; lifecycle receipts carry the same digest pair.
+Contract v1 evidence omits the pair rather than inventing values.
 
 The verifier ignores the public key embedded in the transport bundle and
 resolves `(issuer, keyId)` from the tenant-controlled trust store. Combined

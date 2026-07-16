@@ -363,7 +363,7 @@ jobs:
           grep -qF 'prometa.io/production-profile-id: "orchestra-ocp-4.20-amd64-v1"' runtime-chart-openshift.yaml
           grep -qF 'image: "registry.example.test/orchestra/prometa-runtime-host-ubi9@sha256:aaaaaaaa' runtime-chart-openshift.yaml
           grep -qF 'prometa.io/runtime-config-rollout-id: "deployment-prod-v1"' runtime-chart-openshift.yaml
-          grep -qF 'name: orchestra-runtime-release-prod-v1' runtime-chart-openshift.yaml
+          grep -qF 'secretName: "orchestra-runtime-release-prod-v1"' runtime-chart-openshift.yaml
           grep -qF 'name: orchestra-runtime-credentials' runtime-chart-openshift.yaml
           grep -qF 'name: orchestra-runtime-migration-credentials' runtime-chart-openshift.yaml
           test "$(grep -c '^kind: NetworkPolicy$' runtime-chart-openshift.yaml)" = "2"

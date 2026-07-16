@@ -199,6 +199,15 @@ Guard-transformed values are checked again, and server-declared tool guard
 requirements cannot be skipped merely because the bundle has no local guard
 block.
 
+Bundle schema/runtime contract v2 adds exact capability-version ranges,
+deterministic policy and execution-configuration digests, and typed logical
+secret references. Admission recomputes both digests and cross-checks the range
+form against the exact `name.vN` compatibility mirror. Secret references name a
+tenant-resolved provider and purpose only; credential values never enter the
+signed artifact. Runtime contract v1 remains admissible during the production
+profile transition, and bundles without a runtime contract remain
+integrity-verifiable but non-executable by default.
+
 The kernel bounds model/tool timeouts, retries, exponential backoff, circuit
 breaking, topology steps, cancellation, and deterministic fallback. It refuses
 model retry or fallback after a tool call and rejects duplicate tool-call IDs.

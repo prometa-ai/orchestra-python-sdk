@@ -37,12 +37,18 @@ from prometa.runtime import (
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v1.json"
+V2_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v2.json"
 LEGACY_BUNDLE_PATH = Path(__file__).parent / "fixtures" / "bundle-envelope-v1.json"
 
 
 @pytest.fixture()
 def vector():
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.fixture()
+def vector_v2():
+    return json.loads(V2_FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 def _instant(value: str) -> datetime:
@@ -225,6 +231,91 @@ def test_missing_or_unsupported_capabilities_fail_before_replay(vector) -> None:
         ),
     )
     assert _admit(vector, replay_store=replay).config.contract.contract_version == 1
+
+
+def test_v2_contract_admits_with_ranges_digests_and_secret_refs(vector_v2) -> None:
+    admitted = _admit(vector_v2)
+    contract = admitted.config.contract
+    assert contract.contract_version == 2
+    assert [requirement.name for requirement in contract.capability_requirements] == [
+        "evidence.emit",
+        "model.invoke",
+        "schema.validate",
+    ]
+    assert contract.policy_digest.startswith("sha256:")
+    assert contract.configuration_digest.startswith("sha256:")
+    assert contract.secret_references == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "code"),
+    [
+        ("policyDigest", "runtime_policy_digest_mismatch"),
+        ("configurationDigest", "runtime_configuration_digest_mismatch"),
+    ],
+)
+def test_v2_contract_recomputes_signed_projection_digests(vector_v2, field, code) -> None:
+    changed = _mutated_verified(
+        vector_v2,
+        lambda content: content["runtimeContract"].update(
+            {field: "sha256:" + "0" * 64}
+        ),
+    )
+    _assert_code(
+        code,
+        lambda: parse_runtime_bundle(
+            changed,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+            },
+        ),
+    )
+
+
+def test_v2_contract_rejects_range_mirror_and_secret_reference_drift(vector_v2) -> None:
+    mismatched_range = _mutated_verified(
+        vector_v2,
+        lambda content: content["runtimeContract"]["capabilityRequirements"][0].update(
+            {"minVersion": 2, "maxVersion": 2}
+        ),
+    )
+    _assert_code(
+        "runtime_capability_requirement_mismatch",
+        lambda: parse_runtime_bundle(
+            mismatched_range,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+            },
+        ),
+    )
+
+    invalid_secret = _mutated_verified(
+        vector_v2,
+        lambda content: content["runtimeContract"].update(
+            {
+                "secretReferences": [
+                    {
+                        "reference": "identity:agent",
+                        "purpose": "agent-identity",
+                        "provider": "inline",
+                        "required": True,
+                    }
+                ]
+            }
+        ),
+    )
+    _assert_code(
+        "invalid_runtime_secret_references",
+        lambda: parse_runtime_bundle(
+            invalid_secret,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+            },
+        ),
+    )
 
 
 def test_runtime_contract_downgrade_and_remote_refs_fail_closed(vector) -> None:

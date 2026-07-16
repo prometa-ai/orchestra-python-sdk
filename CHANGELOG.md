@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Runtime contract v2 admission with exact capability-version ranges,
+  independently recomputed policy/configuration digests, and typed logical
+  secret references that never carry credential values.
+- A signed cross-language `runtime-kernel-v2.json` conformance vector shared
+  with the Orchestra platform while runtime contract v1 remains admissible.
 - An optional `runtime-mcp` extra and governed tenant-side `ToolBroker` with
   official stdio and Streamable HTTP transports, exact egress allowlists,
   late-bound credentials, server/agent-specific permission projection, signed

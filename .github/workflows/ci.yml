@@ -29,6 +29,7 @@ jobs:
       - name: Ruff
         run: >-
           ruff check prometa tests
+          .github/ci/verify_core_package_boundary.py
           deploy/reference-runtime/ci/topology_fixture.py
           deploy/reference-runtime/ci/topology_probe.py
           deploy/reference-runtime/ci/topology_mcp_server.py
@@ -38,6 +39,32 @@ jobs:
 
       - name: Dependency-free import smoke test
         run: python -c "from prometa import Prometa; import prometa.runtime; assert Prometa.__name__ == 'Prometa'"
+
+  core-package-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build core wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir dist
+
+      - name: Install core wheel without dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/prometa-core-boundary"
+          "$RUNNER_TEMP/prometa-core-boundary/bin/pip" install --no-deps dist/prometa_sdk-*.whl
+
+      - name: Verify optional runtime package boundary
+        run: >-
+          PYTHONNOUSERSITE=1
+          "$RUNNER_TEMP/prometa-core-boundary/bin/python" -I
+          .github/ci/verify_core_package_boundary.py
 
   runtime-contract:
     runs-on: ubuntu-latest

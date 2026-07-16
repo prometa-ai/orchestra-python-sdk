@@ -20,6 +20,7 @@ from typing import Any, Dict, FrozenSet, Iterable, Mapping, MutableSet, Optional
 
 ENVELOPE_VERSION = 1
 ENVELOPE_CANONICALIZATION = "signed-payload-json-v1"
+SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2})
 PROMOTION_ATTESTATION_VERSION = 1
 PROMOTION_ATTESTATION_TYPE = "orchestra.promotion-attestation"
 PROMOTION_ATTESTATION_CANONICALIZATION = "signed-payload-json-v1"
@@ -392,7 +393,7 @@ def verify_bundle_envelope(
         raise BundleVerificationError("artifact_digest_mismatch")
 
     content = _parse_json_object(content_canonical, "malformed_bundle_content")
-    if content.get("schemaVersion") != 1:
+    if content.get("schemaVersion") not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS:
         raise BundleVerificationError("unsupported_bundle_schema")
     manifest = content.get("manifest")
     if not isinstance(manifest, dict):
@@ -872,6 +873,7 @@ def verify_promotion_attestation(
 
 
 __all__ = [
+    "SUPPORTED_BUNDLE_SCHEMA_VERSIONS",
     "BundleTrustEntry",
     "BundleTrustStore",
     "BundleVerificationError",

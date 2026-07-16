@@ -13,6 +13,7 @@ the Orchestra control plane. Install ``prometa-sdk[runtime-mcp]`` on Python
 """
 
 from .trust import (
+    SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
     BundleTrustEntry,
     BundleTrustStore,
     BundleVerificationError,
@@ -49,6 +50,7 @@ from .tasks import (
 )
 from .admission import (
     RUNTIME_CONTRACT_VERSION,
+    SUPPORTED_RUNTIME_CONTRACT_VERSIONS,
     CAPABILITY_MODEL_INVOKE,
     CAPABILITY_EVIDENCE_EMIT,
     CAPABILITY_SCHEMA_VALIDATE,
@@ -61,6 +63,8 @@ from .admission import (
     RuntimeModel,
     RuntimeTool,
     RuntimeGuardrail,
+    RuntimeCapabilityRequirement,
+    RuntimeSecretReference,
     RuntimeContract,
     RuntimeBundleConfig,
     RuntimeAdmissionPolicy,
@@ -184,6 +188,7 @@ from .host import (
 from .host_conformance import ReferenceHostConformanceDriver
 
 __all__ = [
+    "SUPPORTED_BUNDLE_SCHEMA_VERSIONS",
     "BundleTrustEntry",
     "BundleTrustStore",
     "BundleVerificationError",
@@ -212,6 +217,7 @@ __all__ = [
     "InMemoryRuntimeTaskStore",
     "canonical_payload_digest",
     "RUNTIME_CONTRACT_VERSION",
+    "SUPPORTED_RUNTIME_CONTRACT_VERSIONS",
     "CAPABILITY_MODEL_INVOKE",
     "CAPABILITY_EVIDENCE_EMIT",
     "CAPABILITY_SCHEMA_VALIDATE",
@@ -224,6 +230,8 @@ __all__ = [
     "RuntimeModel",
     "RuntimeTool",
     "RuntimeGuardrail",
+    "RuntimeCapabilityRequirement",
+    "RuntimeSecretReference",
     "RuntimeContract",
     "RuntimeBundleConfig",
     "RuntimeAdmissionPolicy",

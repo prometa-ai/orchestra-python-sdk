@@ -9,6 +9,8 @@ It performs no network call to the Orchestra control plane.
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,7 +34,8 @@ from .trust import (
 )
 
 
-RUNTIME_CONTRACT_VERSION = 1
+RUNTIME_CONTRACT_VERSION = 2
+SUPPORTED_RUNTIME_CONTRACT_VERSIONS = frozenset({1, RUNTIME_CONTRACT_VERSION})
 CAPABILITY_MODEL_INVOKE = "model.invoke.v1"
 CAPABILITY_EVIDENCE_EMIT = "evidence.emit.v1"
 CAPABILITY_SCHEMA_VALIDATE = "schema.validate.v1"
@@ -98,11 +101,30 @@ class RuntimeGuardrail:
 
 
 @dataclass(frozen=True)
+class RuntimeCapabilityRequirement:
+    name: str
+    min_version: int
+    max_version: int
+
+
+@dataclass(frozen=True)
+class RuntimeSecretReference:
+    reference: str
+    purpose: str
+    provider: str
+    required: bool
+
+
+@dataclass(frozen=True)
 class RuntimeContract:
     contract_version: int
     required_capabilities: FrozenSet[str]
     input_schema: Optional[Mapping[str, Any]]
     output_schema: Optional[Mapping[str, Any]]
+    capability_requirements: Tuple[RuntimeCapabilityRequirement, ...] = ()
+    policy_digest: Optional[str] = None
+    configuration_digest: Optional[str] = None
+    secret_references: Tuple[RuntimeSecretReference, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -327,6 +349,172 @@ def _json_copy(value: Mapping[str, Any], code: str) -> Mapping[str, Any]:
         )
     except (TypeError, ValueError) as exc:
         raise BundleVerificationError(code) from exc
+
+
+def _canonical_digest(value: Any) -> str:
+    try:
+        canonical = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise BundleVerificationError("invalid_runtime_digest_projection") from exc
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _selected(value: Mapping[str, Any], keys: Sequence[str]) -> Mapping[str, Any]:
+    return {key: value[key] for key in keys if key in value}
+
+
+_CAPABILITY_PATTERN = re.compile(r"^(.*)\.v([1-9][0-9]*)$")
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TOOL_POLICY_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "sideEffects",
+    "riskLevel",
+    "authBinding",
+    "scopes",
+    "approvalRequired",
+    "requiredGuardrails",
+)
+_TOOL_CONFIGURATION_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "inputSchema",
+    "rateLimitPerMin",
+)
+
+
+def _capability_parts(value: str) -> Tuple[str, int]:
+    match = _CAPABILITY_PATTERN.fullmatch(value)
+    if match is None or not match.group(1):
+        raise BundleVerificationError("invalid_runtime_capabilities")
+    return match.group(1), int(match.group(2))
+
+
+def _parse_capability_requirements(
+    value: Any, required_capabilities: FrozenSet[str]
+) -> Tuple[RuntimeCapabilityRequirement, ...]:
+    entries = _sequence(value, "invalid_runtime_capability_requirements", 64)
+    parsed = []
+    for entry in entries:
+        requirement = _mapping(entry, "invalid_runtime_capability_requirements")
+        name = _string(requirement, "name", "invalid_runtime_capability_requirements")
+        minimum = requirement.get("minVersion")
+        maximum = requirement.get("maxVersion")
+        if (
+            type(minimum) is not int
+            or type(maximum) is not int
+            or minimum < 1
+            or maximum < minimum
+        ):
+            raise BundleVerificationError("invalid_runtime_capability_requirements")
+        parsed.append(RuntimeCapabilityRequirement(name, minimum, maximum))
+    if len({requirement.name for requirement in parsed}) != len(parsed):
+        raise BundleVerificationError("invalid_runtime_capability_requirements")
+
+    exact_by_name = {}
+    for capability in required_capabilities:
+        name, version = _capability_parts(capability)
+        if name in exact_by_name:
+            raise BundleVerificationError("invalid_runtime_capability_requirements")
+        exact_by_name[name] = version
+    ranges_by_name = {requirement.name: requirement for requirement in parsed}
+    if set(exact_by_name) != set(ranges_by_name):
+        raise BundleVerificationError("runtime_capability_requirement_mismatch")
+    for name, version in exact_by_name.items():
+        requirement = ranges_by_name[name]
+        if not requirement.min_version <= version <= requirement.max_version:
+            raise BundleVerificationError("runtime_capability_requirement_mismatch")
+    return tuple(parsed)
+
+
+def _parse_secret_references(value: Any) -> Tuple[RuntimeSecretReference, ...]:
+    entries = _sequence(value, "invalid_runtime_secret_references", 64)
+    parsed = []
+    for entry in entries:
+        secret = _mapping(entry, "invalid_runtime_secret_references")
+        reference = _string(secret, "reference", "invalid_runtime_secret_references")
+        purpose = _string(secret, "purpose", "invalid_runtime_secret_references")
+        provider = _string(secret, "provider", "invalid_runtime_secret_references")
+        required = secret.get("required")
+        if (
+            purpose != "agent-identity"
+            or provider not in {"platform-vault", "environment", "external-vault"}
+            or required is not True
+        ):
+            raise BundleVerificationError("invalid_runtime_secret_references")
+        parsed.append(RuntimeSecretReference(reference, purpose, provider, True))
+    if len({secret.reference for secret in parsed}) != len(parsed):
+        raise BundleVerificationError("invalid_runtime_secret_references")
+    return tuple(parsed)
+
+
+def _verify_runtime_contract_digests(
+    content: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    input_schema: Optional[Mapping[str, Any]],
+    output_schema: Optional[Mapping[str, Any]],
+) -> Tuple[str, str]:
+    policy_digest = contract.get("policyDigest")
+    configuration_digest = contract.get("configurationDigest")
+    if (
+        not isinstance(policy_digest, str)
+        or _DIGEST_PATTERN.fullmatch(policy_digest) is None
+        or not isinstance(configuration_digest, str)
+        or _DIGEST_PATTERN.fullmatch(configuration_digest) is None
+    ):
+        raise BundleVerificationError("invalid_runtime_contract_digest")
+
+    raw_tools = _sequence(content.get("tools", []), "invalid_runtime_tools", 128)
+    tool_mappings = [
+        _mapping(tool, "invalid_runtime_tool") for tool in raw_tools
+    ]
+    expected_policy = _canonical_digest(
+        {
+            "guardrails": content.get("guardrails", []),
+            "identity": content.get("identity"),
+            "tools": [_selected(tool, _TOOL_POLICY_KEYS) for tool in tool_mappings],
+            "requiredScopes": content.get("requiredScopes", []),
+            "grantedScopes": content.get("grantedScopes", []),
+        }
+    )
+    if policy_digest != expected_policy:
+        raise BundleVerificationError("runtime_policy_digest_mismatch")
+
+    expected_configuration = _canonical_digest(
+        {
+            "manifest": content.get("manifest"),
+            "systemPrompt": content.get("systemPrompt"),
+            "models": content.get("models"),
+            "primaryModel": content.get("primaryModel"),
+            "topology": content.get("topology"),
+            "tools": [
+                _selected(tool, _TOOL_CONFIGURATION_KEYS) for tool in tool_mappings
+            ],
+            "skills": content.get("skills", []),
+            "knowledge": content.get("knowledge", []),
+            "memory": content.get("memory", []),
+            "subAgents": content.get("subAgents", []),
+            "workflows": content.get("workflows", []),
+            "triggers": content.get("triggers", []),
+            "evaluation": content.get("evaluation", []),
+            "inputSchema": input_schema,
+            "outputSchema": output_schema,
+            "mcpServers": content.get("mcpServers", []),
+        }
+    )
+    if configuration_digest != expected_configuration:
+        raise BundleVerificationError("runtime_configuration_digest_mismatch")
+    return policy_digest, configuration_digest
 
 
 def _reject_remote_refs(value: Any) -> None:
@@ -560,7 +748,8 @@ def parse_runtime_bundle(
         )
     else:
         contract_value = _mapping(raw_contract, "invalid_runtime_contract")
-        if contract_value.get("contractVersion") != RUNTIME_CONTRACT_VERSION:
+        contract_version = contract_value.get("contractVersion")
+        if contract_version not in SUPPORTED_RUNTIME_CONTRACT_VERSIONS:
             raise BundleVerificationError("unsupported_runtime_contract")
         requirements = _string_tuple(
             contract_value.get("requiredCapabilities"),
@@ -591,11 +780,32 @@ def parse_runtime_bundle(
             inferred.add(CAPABILITY_HUMAN_ESCALATION)
         if not inferred.issubset(required):
             raise BundleVerificationError("runtime_capability_downgrade")
+        capability_requirements = ()
+        policy_digest = None
+        configuration_digest = None
+        secret_references = ()
+        if contract_version == RUNTIME_CONTRACT_VERSION:
+            capability_requirements = _parse_capability_requirements(
+                contract_value.get("capabilityRequirements"), required
+            )
+            secret_references = _parse_secret_references(
+                contract_value.get("secretReferences")
+            )
+            policy_digest, configuration_digest = _verify_runtime_contract_digests(
+                content,
+                contract_value,
+                input_schema,
+                output_schema,
+            )
         contract = RuntimeContract(
-            contract_version=RUNTIME_CONTRACT_VERSION,
+            contract_version=contract_version,
             required_capabilities=required,
             input_schema=input_schema,
             output_schema=output_schema,
+            capability_requirements=capability_requirements,
+            policy_digest=policy_digest,
+            configuration_digest=configuration_digest,
+            secret_references=secret_references,
         )
 
     supported = frozenset(supported_capabilities)
@@ -603,11 +813,30 @@ def parse_runtime_bundle(
     if unknown_supported:
         raise BundleVerificationError("unknown_local_runtime_capability")
     missing = contract.required_capabilities - supported
-    if missing:
+    if contract.contract_version < RUNTIME_CONTRACT_VERSION and missing:
         raise BundleVerificationError(
             "unsupported_runtime_capability",
             "Unsupported runtime capabilities: %s" % ", ".join(sorted(missing)),
         )
+    if contract.contract_version == RUNTIME_CONTRACT_VERSION:
+        supported_versions = {}
+        for capability in supported:
+            name, version = _capability_parts(capability)
+            supported_versions.setdefault(name, set()).add(version)
+        missing_requirements = [
+            requirement.name
+            for requirement in contract.capability_requirements
+            if not any(
+                requirement.min_version <= version <= requirement.max_version
+                for version in supported_versions.get(requirement.name, set())
+            )
+        ]
+        if missing_requirements:
+            raise BundleVerificationError(
+                "unsupported_runtime_capability",
+                "Unsupported runtime capabilities: %s"
+                % ", ".join(sorted(missing_requirements)),
+            )
 
     return RuntimeBundleConfig(
         manifest=manifest,
@@ -795,6 +1024,7 @@ def activate_runtime_release(
 
 __all__ = [
     "RUNTIME_CONTRACT_VERSION",
+    "SUPPORTED_RUNTIME_CONTRACT_VERSIONS",
     "CAPABILITY_MODEL_INVOKE",
     "CAPABILITY_EVIDENCE_EMIT",
     "CAPABILITY_SCHEMA_VALIDATE",
@@ -807,6 +1037,8 @@ __all__ = [
     "RuntimeModel",
     "RuntimeTool",
     "RuntimeGuardrail",
+    "RuntimeCapabilityRequirement",
+    "RuntimeSecretReference",
     "RuntimeContract",
     "RuntimeBundleConfig",
     "RuntimeAdmissionPolicy",

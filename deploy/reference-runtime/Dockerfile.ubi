@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+# Orchestra reference tenant runtime - Red Hat UBI9 image.
+#
+# UBI is an image-family choice, not Red Hat certification or a blanket FIPS
+# claim. The final stage is compatible with OpenShift restricted-v2 and an
+# arbitrary non-root UID in GID 0; CI verifies that contract explicitly.
+
+ARG UBI_BUILD_IMAGE=registry.access.redhat.com/ubi9/python-312@sha256:88277e9671092de1c89e562e920823e82a70b75a6b02db9ba8ad78dcfaf6b591
+ARG UBI_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/python-312-minimal@sha256:2eef57a47c201792a5c6188800c88660a4dcc57b2d60f8874f618e694067d4f9
+
+FROM ${UBI_BUILD_IMAGE} AS builder
+USER 0
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY prometa ./prometa
+RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host,runtime-mcp]" \
+ && python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --no-index --find-links=/wheels \
+      "prometa-sdk[runtime-host,runtime-mcp]==0.18.0"
+
+FROM ${UBI_RUNTIME_IMAGE} AS runtime
+USER 0
+
+ARG VCS_REF=unknown
+ARG IMAGE_VERSION=0.18.0
+
+LABEL org.opencontainers.image.title="Prometa reference tenant runtime (UBI9)" \
+      org.opencontainers.image.description="Tenant-deployed host for signed Orchestra runtime releases" \
+      org.opencontainers.image.source="https://github.com/prometa-ai/orchestra-python-sdk" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      io.prometa.image.variant="ubi9"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/opt/venv/bin:$PATH \
+    HOME=/tmp \
+    TMPDIR=/tmp \
+    PORT=8080 \
+    PROMETA_RUNTIME_CONFIG=/etc/prometa-runtime/config.json
+
+WORKDIR /app
+COPY --from=builder --chown=1001:0 /opt/venv /opt/venv
+
+# The image writes only to mounted /tmp and tenant-provided stores. The venv is
+# read/execute-only for an arbitrary SCC-assigned UID; runtime code is not made
+# group-writable even though OpenShift assigns the process to GID 0.
+
+USER 1001
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8080'), timeout=2).read()"]
+
+ENTRYPOINT ["prometa-runtime-host"]

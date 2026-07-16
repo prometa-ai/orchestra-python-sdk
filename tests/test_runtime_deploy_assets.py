@@ -23,6 +23,9 @@ def test_runtime_deploy_assets_follow_package_version():
     dockerfile = (ROOT / "deploy/reference-runtime/Dockerfile").read_text(
         encoding="utf-8"
     )
+    ubi_dockerfile = (ROOT / "deploy/reference-runtime/Dockerfile.ubi").read_text(
+        encoding="utf-8"
+    )
     compose = (ROOT / "deploy/reference-runtime/compose.yaml").read_text(
         encoding="utf-8"
     )
@@ -30,7 +33,50 @@ def test_runtime_deploy_assets_follow_package_version():
     assert 'appVersion: "%s"' % version in chart
     assert 'org.opencontainers.image.version="%s"' % version in dockerfile
     assert '"prometa-sdk[runtime-host,runtime-mcp]==%s"' % version in dockerfile
+    assert "ARG IMAGE_VERSION=%s" % version in ubi_dockerfile
+    assert '"prometa-sdk[runtime-host,runtime-mcp]==%s"' % version in ubi_dockerfile
     assert "prometa-runtime-host:%s" % version in compose
+
+
+def test_runtime_ubi_image_and_openshift_profile_are_explicitly_bounded():
+    root = ROOT / "deploy/reference-runtime"
+    dockerfile = (root / "Dockerfile.ubi").read_text(encoding="utf-8")
+    chart = root / "chart"
+    values = (chart / "values.yaml").read_text(encoding="utf-8")
+    profile = (chart / "values.openshift-production.yaml").read_text(
+        encoding="utf-8"
+    )
+    helpers = (chart / "templates/_helpers.tpl").read_text(encoding="utf-8")
+    deployment = (chart / "templates/deployment.yaml").read_text(encoding="utf-8")
+
+    assert "registry.access.redhat.com/ubi9/python-312@sha256:" in dockerfile
+    assert "registry.access.redhat.com/ubi9/python-312-minimal@sha256:" in dockerfile
+    assert 'io.prometa.image.variant="ubi9"' in dockerfile
+    assert "HOME=/tmp" in dockerfile
+    assert "USER 1001" in dockerfile
+    assert "UBI is an image-family choice" in dockerfile
+
+    assert 'digest: ""' in values
+    assert "productionProfile:" in values
+    assert "profileId: orchestra-ocp-4.20-amd64-v1" in profile
+    assert "namespaceDefaultDenyAcknowledged: false" in profile
+    assert "modelGatewayApiKeyOptional: false" in profile
+    assert "receiptApiKeyOptional: false" in profile
+    assert "backup:\n  enabled: false" in profile
+    assert "the OpenShift runtime profile requires" in helpers
+    assert "a separate migration credential Secret" in helpers
+    assert "prometa.io/production-profile-id" in deployment
+
+
+def test_runtime_topology_profiles_follow_current_chart_version():
+    root = ROOT / "deploy/reference-runtime"
+    chart = (root / "chart/Chart.yaml").read_text(encoding="utf-8")
+    match = re.search(r"^version: ([^ ]+)$", chart, re.MULTILINE)
+    assert match is not None
+
+    for name in ("topology-profiles.json", "topology-profiles.mcp.json"):
+        profile = json.loads((root / name).read_text(encoding="utf-8"))
+        assert profile["profiles"][0]["chartVersion"] == match.group(1)
 
 
 def test_runtime_chart_references_external_sensitive_objects():

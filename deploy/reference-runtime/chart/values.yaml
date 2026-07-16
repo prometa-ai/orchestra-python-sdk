@@ -8,8 +8,20 @@ image:
   repository: prometa-runtime-host
   # Defaults to Chart.appVersion when empty.
   tag: ""
+  # Immutable digest wins over tag. Required by the declared OpenShift profile.
+  digest: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
+
+# Fail-closed declaration for the tenant-owned OpenShift runtime profile.
+# Certification remains external to this chart and requires environment drills.
+productionProfile:
+  enabled: false
+  profileId: ""
+  imageFlavor: ""  # the pinned profile requires ubi9
+  # The hook-weighted migration policy supplies its own scoped allow rules, but
+  # a namespace-wide default deny must exist before Helm starts pre-install hooks.
+  namespaceDefaultDenyAcknowledged: false
 
 serviceAccount:
   create: true

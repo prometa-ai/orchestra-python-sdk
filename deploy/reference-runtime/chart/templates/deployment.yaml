@@ -19,10 +19,13 @@ spec:
       app.kubernetes.io/component: runtime
   template:
     metadata:
-      {{- if or .Values.runtimeConfig.rolloutId .Values.podAnnotations }}
+      {{- if or .Values.runtimeConfig.rolloutId .Values.productionProfile.enabled .Values.podAnnotations }}
       annotations:
         {{- with .Values.runtimeConfig.rolloutId }}
         prometa.io/runtime-config-rollout-id: {{ . | quote }}
+        {{- end }}
+        {{- if .Values.productionProfile.enabled }}
+        prometa.io/production-profile-id: {{ .Values.productionProfile.profileId | quote }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}

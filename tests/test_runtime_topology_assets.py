@@ -50,7 +50,7 @@ def test_topology_profile_is_pinned_and_explicitly_non_production():
         "evidenceStatus": "reference-profile-not-production-certification",
         "networkPolicyController": "k3s-kube-router",
         "runtimeVersion": "0.18.0",
-        "chartVersion": "0.3.0",
+        "chartVersion": "0.3.1",
         "k3dVersion": "v5.8.3",
         "k3dChecksums": {
             "darwin-amd64": (
@@ -623,7 +623,7 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
         "reference-profile-not-production-certification"
     )
     assert evidence["runtimeVersion"] == "0.18.0"
-    assert evidence["chartVersion"] == "0.3.0"
+    assert evidence["chartVersion"] == "0.3.1"
     assert evidence["duplicateWinnersPerTenant"] == 1
     assert evidence["activationRowsPerTenant"] == 1
     assert evidence["synchronousControlPlaneCalls"] == 0

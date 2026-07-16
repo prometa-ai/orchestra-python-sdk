@@ -232,6 +232,51 @@ jobs:
           name: runtime-host-conformance
           path: runtime-host-conformance.json
 
+  runtime-host-ubi-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host conformance runner
+        run: pip install ".[dev,runtime-host]"
+
+      - name: Build restricted-v2 UBI9 host image
+        run: >-
+          docker build
+          -f deploy/reference-runtime/Dockerfile.ubi
+          -t prometa-runtime-host:ubi9-${{ github.sha }}
+          .
+
+      - name: Verify default and arbitrary UID contracts
+        run: |
+          set -euo pipefail
+          image="prometa-runtime-host:ubi9-${{ github.sha }}"
+          test "$(docker run --rm --entrypoint id "$image" -u)" = "1001"
+          test "$(docker inspect "$image" --format '{{ index .Config.Labels "io.prometa.image.variant" }}')" = "ubi9"
+          test "$(docker run --rm --user 12345:0 --read-only --tmpfs /tmp --entrypoint id "$image" -u)" = "12345"
+          docker run --rm --user 12345:0 --read-only --tmpfs /tmp \
+            --entrypoint python "$image" \
+            -c "import prometa; import prometa.runtime; assert prometa.__version__ == '0.18.0'"
+
+      - name: Run deployment profile as an arbitrary UID
+        run: >-
+          prometa-runtime-conformance
+          --profile deployment
+          --driver-name reference-host-container-ubi9
+          --command "docker run --rm -i --user 12345:0 --read-only --tmpfs /tmp --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:ubi9-${{ github.sha }}"
+          --compact
+          --output runtime-host-conformance-ubi9.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-host-conformance-ubi9
+          path: runtime-host-conformance-ubi9.json
+
   runtime-host-chart:
     runs-on: ubuntu-latest
     steps:
@@ -257,6 +302,7 @@ jobs:
           chart=deploy/reference-runtime/chart
           example=$chart/values.production.example.yaml
           mcp_example=$chart/values.mcp.example.yaml
+          openshift=$chart/values.openshift-production.yaml
 
           if helm template missing-inputs "$chart" >/dev/null 2>&1; then
             echo "chart rendered without external config and credential references" >&2
@@ -281,6 +327,82 @@ jobs:
           if helm template unacknowledged-backup "$chart" -f "$example" \
             --set backup.acknowledgeSensitiveData=false >/dev/null 2>&1; then
             echo "chart enabled sensitive backups without acknowledgement" >&2
+            exit 1
+          fi
+
+          if helm template openshift-incomplete "$chart" -f "$openshift" \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile rendered without tenant inputs" >&2
+            exit 1
+          fi
+
+          OPENSHIFT_ARGS=(
+            --set productionProfile.namespaceDefaultDenyAcknowledged=true
+            --set image.repository=registry.example.test/orchestra/prometa-runtime-host-ubi9
+            --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            --set runtimeConfig.existingSecret=orchestra-runtime-release-prod-v1
+            --set runtimeConfig.rolloutId=deployment-prod-v1
+            --set credentials.existingSecret=orchestra-runtime-credentials
+            --set migration.existingSecret=orchestra-runtime-migration-credentials
+            --set 'networkPolicy.ingress[0].from[0].ipBlock.cidr=10.10.0.0/16'
+            --set 'networkPolicy.ingress[0].ports[0].protocol=TCP'
+            --set 'networkPolicy.ingress[0].ports[0].port=8080'
+            --set 'networkPolicy.egress[0].to[0].ipBlock.cidr=10.20.0.0/16'
+            --set 'networkPolicy.egress[0].ports[0].protocol=TCP'
+            --set 'networkPolicy.egress[0].ports[0].port=5432'
+            --set 'networkPolicy.egress[1].to[0].ipBlock.cidr=10.30.0.0/16'
+            --set 'networkPolicy.egress[1].ports[0].protocol=TCP'
+            --set 'networkPolicy.egress[1].ports[0].port=8443'
+            --set 'migration.networkPolicy.egress[0].to[0].ipBlock.cidr=10.20.0.0/16'
+            --set 'migration.networkPolicy.egress[0].ports[0].protocol=TCP'
+            --set 'migration.networkPolicy.egress[0].ports[0].port=5432'
+          )
+          helm lint --strict "$chart" -f "$openshift" "${OPENSHIFT_ARGS[@]}"
+          helm template openshift-runtime "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" >runtime-chart-openshift.yaml
+          grep -qF 'prometa.io/production-profile-id: "orchestra-ocp-4.20-amd64-v1"' runtime-chart-openshift.yaml
+          grep -qF 'image: "registry.example.test/orchestra/prometa-runtime-host-ubi9@sha256:aaaaaaaa' runtime-chart-openshift.yaml
+          grep -qF 'prometa.io/runtime-config-rollout-id: "deployment-prod-v1"' runtime-chart-openshift.yaml
+          grep -qF 'secretName: "orchestra-runtime-release-prod-v1"' runtime-chart-openshift.yaml
+          grep -qF 'name: "orchestra-runtime-credentials"' runtime-chart-openshift.yaml
+          grep -qF 'name: "orchestra-runtime-migration-credentials"' runtime-chart-openshift.yaml
+          test "$(grep -c '^kind: NetworkPolicy$' runtime-chart-openshift.yaml)" = "2"
+          test "$(grep -c '^kind: Job$' runtime-chart-openshift.yaml)" = "2"
+          grep -q '^kind: HorizontalPodAutoscaler$' runtime-chart-openshift.yaml
+          grep -q '^kind: PodDisruptionBudget$' runtime-chart-openshift.yaml
+          grep -q 'automountServiceAccountToken: false' runtime-chart-openshift.yaml
+          grep -q 'readOnlyRootFilesystem: true' runtime-chart-openshift.yaml
+          if grep -Eq '^kind: (Secret|ConfigMap|CronJob|StatefulSet|PersistentVolumeClaim|Ingress|Route)$' runtime-chart-openshift.yaml; then
+            echo "OpenShift runtime profile rendered a tenant-external or public-edge resource" >&2
+            exit 1
+          fi
+          if grep -Eq '^[[:space:]]+(runAsUser|runAsGroup|fsGroup):' runtime-chart-openshift.yaml; then
+            echo "OpenShift runtime profile pinned an SCC-assigned identity" >&2
+            exit 1
+          fi
+          if helm template openshift-configmap "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" --set runtimeConfig.existingSecret= \
+            --set runtimeConfig.existingConfigMap=runtime-config >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted ConfigMap release material" >&2
+            exit 1
+          fi
+          if helm template openshift-shared-db-identity "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" \
+            --set migration.existingSecret=orchestra-runtime-credentials \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted shared runtime/migration credentials" >&2
+            exit 1
+          fi
+          if helm template openshift-optional-receipts "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" --set credentials.receiptApiKeyOptional=true \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted optional receipt credentials" >&2
+            exit 1
+          fi
+          if helm template openshift-invalid-digest "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" --set image.digest=sha256:ABC \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted a mutable or invalid image identity" >&2
             exit 1
           fi
 

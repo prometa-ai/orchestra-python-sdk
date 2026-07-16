@@ -210,6 +210,46 @@ helm upgrade --install tenant-runtime deploy/reference-runtime/chart \
   -f deploy/reference-runtime/chart/values.production.example.yaml
 ```
 
+### Declared OpenShift runtime profile
+
+`chart/values.openshift-production.yaml` is the fail-closed tenant-runtime
+overlay for profile `orchestra-ocp-4.20-amd64-v1`. It is intentionally not
+installable unchanged. A tenant overlay must provide the immutable UBI9 image
+digest, one immutable signed-release config Secret per deployment, separate
+runtime and migration credential Secrets, the release rollout ID, and exact
+gateway/dependency NetworkPolicy rules.
+
+Before Helm runs, the tenant operator must create the namespace-wide
+default-deny policy and the dedicated `migration.serviceAccountName`. The chart
+creates a hook-weighted allow policy for the migration and compatibility Jobs,
+but it does not create that pre-install ServiceAccount or any Secret. The
+profile keeps the runtime behind an internal ClusterIP; the tenant gateway owns
+the request edge. Asynchronous receipt delivery may call Orchestra, but
+Orchestra remains outside the synchronous production request path.
+
+Build the UBI variant with the pinned build/runtime bases:
+
+```bash
+docker build -f deploy/reference-runtime/Dockerfile.ubi \
+  -t registry.example.com/orchestra/prometa-runtime-host-ubi9:0.18.0 .
+```
+
+Then render with customer-owned values:
+
+```bash
+helm template orchestra-runtime deploy/reference-runtime/chart \
+  --namespace orchestra-runtime \
+  -f deploy/reference-runtime/chart/values.openshift-production.yaml \
+  -f customer-orchestra-runtime.yaml
+```
+
+The chart verifies immutable digest selection and declared security inputs. It
+cannot verify image signatures, SBOMs, provenance, registry mirroring, the
+actual contents of referenced objects, or cluster policy enforcement. Those,
+plus OpenShift fault, restore, overload, upgrade/rollback, and soak evidence,
+remain separate certification gates. This profile is therefore a deployment
+contract, not a production-certification claim.
+
 For the MCP example, mount `config.mcp.example.json` through the referenced
 runtime config Secret, replace all placeholders with one admitted release, and
 provision the separately referenced MCP credential Secret. The chart never

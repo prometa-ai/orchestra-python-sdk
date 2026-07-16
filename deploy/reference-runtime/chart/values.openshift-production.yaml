@@ -1,0 +1,114 @@
+# Declared tenant-runtime values for orchestra-ocp-4.20-amd64-v1.
+#
+# This file intentionally fails unchanged. The tenant overlay must supply exact
+# image identity, immutable signed-release config, credential object names, and
+# namespace-specific ingress/egress. Rendering is not OpenShift certification.
+
+productionProfile:
+  enabled: true
+  profileId: orchestra-ocp-4.20-amd64-v1
+  imageFlavor: ubi9
+  # Set true only after namespace-wide default deny exists before Helm hooks.
+  namespaceDefaultDenyAcknowledged: false
+
+fullnameOverride: orchestra-runtime
+
+image:
+  repository: registry.example.com/orchestra/prometa-runtime-host-ubi9
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: orchestra-registry
+
+replicaCount: 2
+
+# Tenant CI/CD creates an immutable Secret for each authorized deployment.
+runtimeConfig:
+  existingSecret: ""
+  existingConfigMap: ""
+  key: config.json
+  targetFile: config.json
+  rolloutId: ""
+
+# Runtime and migration identities are intentionally separate. Receipt
+# delivery is asynchronous and never puts Orchestra in the request path.
+credentials:
+  existingSecret: ""
+  databaseUrlKey: database-url
+  apiTokenKey: api-token
+  modelGatewayApiKeyKey: model-gateway-api-key
+  modelGatewayApiKeyOptional: false
+  controlPlaneApiKeyKey: control-plane-api-key
+  controlPlaneApiKeyOptional: true
+  receiptApiKeyKey: receipt-api-key
+  receiptApiKeyOptional: false
+
+serviceAccount:
+  create: true
+  name: orchestra-runtime
+  annotations: {}
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 8080
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/component: runtime
+
+# The migration ServiceAccount and credential Secret must exist before Helm's
+# pre-install hooks. Only PostgreSQL egress belongs in this rule set.
+migration:
+  enabled: true
+  compatibilityCheck: true
+  serviceAccountName: orchestra-runtime-migration
+  existingSecret: ""
+  databaseUrlKey: migration-database-url
+  networkPolicy:
+    enabled: true
+    allowDNS: true
+    dnsNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openshift-dns
+    egress: []
+
+# External PostgreSQL operators own PITR, replication, and restore drills.
+backup:
+  enabled: false
+
+# Supply only tenant-gateway ingress and PostgreSQL, model-gateway, telemetry,
+# receipt, and approved read-only MCP destinations actually used by the release.
+networkPolicy:
+  enabled: true
+  allowDNS: true
+  dnsNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-dns
+  ingress: []
+  egress: []

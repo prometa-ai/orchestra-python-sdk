@@ -33,8 +33,15 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 
 {{- define "prometa-runtime.image" -}}
+{{- if .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
+{{- fail "image.digest must be lowercase sha256:<64 hex>" -}}
+{{- end -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "prometa-runtime.serviceAccountName" -}}
@@ -67,6 +74,9 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- if hasKey .Values.podAnnotations "prometa.io/runtime-config-rollout-id" -}}
 {{- fail "podAnnotations cannot override prometa.io/runtime-config-rollout-id" -}}
+{{- end -}}
+{{- if hasKey .Values.podAnnotations "prometa.io/production-profile-id" -}}
+{{- fail "podAnnotations cannot override prometa.io/production-profile-id" -}}
 {{- end -}}
 {{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.controlPlaneApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) -}}
 {{- fail "all credentials key names must be non-empty" -}}
@@ -111,6 +121,67 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- if le (int .Values.gracefulShutdown.terminationGracePeriodSeconds) (int .Values.gracefulShutdown.preStopSleepSeconds) -}}
 {{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds" -}}
+{{- end -}}
+{{- if .Values.productionProfile.enabled -}}
+{{- $profileId := required "productionProfile.profileId is required" .Values.productionProfile.profileId -}}
+{{- if ne .Values.productionProfile.imageFlavor "ubi9" -}}
+{{- fail "productionProfile.imageFlavor must be ubi9" -}}
+{{- end -}}
+{{- if not .Values.productionProfile.namespaceDefaultDenyAcknowledged -}}
+{{- fail "the OpenShift runtime profile requires acknowledgement of a pre-created namespace-wide default-deny policy" -}}
+{{- end -}}
+{{- if or (empty .Values.image.repository) (empty .Values.image.digest) -}}
+{{- fail "the OpenShift runtime profile requires an immutable image repository and digest" -}}
+{{- end -}}
+{{- if or (empty .Values.runtimeConfig.existingSecret) (not (empty .Values.runtimeConfig.existingConfigMap)) (empty .Values.runtimeConfig.rolloutId) -}}
+{{- fail "the OpenShift runtime profile requires an immutable Secret-backed runtime config and rolloutId" -}}
+{{- end -}}
+{{- if or (empty .Values.migration.existingSecret) (eq .Values.migration.existingSecret .Values.credentials.existingSecret) -}}
+{{- fail "the OpenShift runtime profile requires a separate migration credential Secret" -}}
+{{- end -}}
+{{- if or (not .Values.migration.enabled) (not .Values.migration.compatibilityCheck) (eq .Values.migration.serviceAccountName "default") -}}
+{{- fail "the OpenShift runtime profile requires migration, compatibility checking, and a dedicated pre-created migration ServiceAccount" -}}
+{{- end -}}
+{{- if or (not .Values.migration.networkPolicy.enabled) (empty .Values.migration.networkPolicy.egress) -}}
+{{- fail "the OpenShift runtime profile requires scoped migration NetworkPolicy egress" -}}
+{{- end -}}
+{{- if or (not .Values.networkPolicy.enabled) (empty .Values.networkPolicy.ingress) (empty .Values.networkPolicy.egress) -}}
+{{- fail "the OpenShift runtime profile requires explicit runtime ingress and egress policies" -}}
+{{- end -}}
+{{- if .Values.autoscaling.enabled -}}
+{{- if lt (int .Values.autoscaling.minReplicas) 2 -}}
+{{- fail "the OpenShift runtime profile requires autoscaling.minReplicas >= 2" -}}
+{{- end -}}
+{{- else if lt (int .Values.replicaCount) 2 -}}
+{{- fail "the OpenShift runtime profile requires replicaCount >= 2" -}}
+{{- end -}}
+{{- if not .Values.podDisruptionBudget.enabled -}}
+{{- fail "the OpenShift runtime profile requires a PodDisruptionBudget" -}}
+{{- end -}}
+{{- if empty .Values.topologySpreadConstraints -}}
+{{- fail "the OpenShift runtime profile requires topology spread constraints" -}}
+{{- end -}}
+{{- if .Values.backup.enabled -}}
+{{- fail "the OpenShift runtime profile delegates PostgreSQL backup and restore to the external database operator" -}}
+{{- end -}}
+{{- if ne .Values.service.type "ClusterIP" -}}
+{{- fail "the OpenShift runtime profile exposes only an internal ClusterIP service to the tenant gateway" -}}
+{{- end -}}
+{{- if .Values.serviceAccount.automountServiceAccountToken -}}
+{{- fail "the OpenShift runtime profile forbids service-account token automount" -}}
+{{- end -}}
+{{- if or (hasKey .Values.podSecurityContext "runAsUser") (hasKey .Values.podSecurityContext "runAsGroup") (hasKey .Values.podSecurityContext "fsGroup") -}}
+{{- fail "the OpenShift runtime profile delegates UID/GID allocation to restricted-v2" -}}
+{{- end -}}
+{{- if or (not .Values.podSecurityContext.runAsNonRoot) (ne .Values.podSecurityContext.seccompProfile.type "RuntimeDefault") -}}
+{{- fail "the OpenShift runtime profile requires runAsNonRoot and RuntimeDefault seccomp" -}}
+{{- end -}}
+{{- if or .Values.containerSecurityContext.allowPrivilegeEscalation (not .Values.containerSecurityContext.readOnlyRootFilesystem) (not (has "ALL" .Values.containerSecurityContext.capabilities.drop)) -}}
+{{- fail "the OpenShift runtime profile requires read-only root, no privilege escalation, and dropped capabilities" -}}
+{{- end -}}
+{{- if or .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional -}}
+{{- fail "the OpenShift runtime profile requires model-gateway and asynchronous receipt credentials" -}}
+{{- end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
 {{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}

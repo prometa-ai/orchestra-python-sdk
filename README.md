@@ -262,6 +262,24 @@ change telemetry behavior. Cryptographic and JSON Schema enforcement are
 installed only through the `runtime` extra, and the official MCP transport SDK
 is installed only through `runtime-mcp` on Python 3.10 or newer.
 
+This package boundary is a compatibility contract:
+
+- the default wheel declares no unconditional third-party dependency;
+- `import prometa` does not import `prometa.runtime` or any runtime-only library;
+- `import prometa.runtime` exposes contracts without importing optional
+  libraries, while use of an unavailable capability fails explicitly; and
+- PostgreSQL, MCP, cryptographic verification, and JSON Schema execution stay
+  behind their named extras.
+
+CI verifies these invariants from a clean wheel installed with `--no-deps`.
+A separate `prometa-runtime` distribution requires an ADR when any one of these
+objective triggers occurs: the runtime needs a different Python floor or an
+unconditional dependency, telemetry and runtime dependency bounds become
+unsatisfiable, two runtime security fixes in a rolling 12 months require a
+release independent of the telemetry SDK, or runtime sources make the core
+wheel exceed 5 MiB for two consecutive releases. Until then, the optional
+extras and `prometa.runtime` import path remain stable.
+
 #### Governed tenant-side MCP adapter
 
 Install the transport adapter only in a tenant-owned executor:

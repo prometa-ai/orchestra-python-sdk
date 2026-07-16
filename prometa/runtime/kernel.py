@@ -344,6 +344,53 @@ def available_runtime_capabilities(
     return frozenset(capabilities)
 
 
+def runtime_release_identity_attributes(
+    admission: AdmittedRuntimeRelease,
+    *,
+    runtime_id: str,
+    runtime_version: str,
+    request_id: Optional[str] = None,
+    release_source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the payload-free release identity shared by runtime evidence."""
+
+    config = admission.config
+    bundle_claims = admission.bundle.claims
+    promotion_claims = admission.promotion.claims
+    attributes: Dict[str, Any] = {
+        "prometa.agent_id": config.manifest.agent_id,
+        "gen_ai.agent.name": config.manifest.name,
+        "prometa.artifact.digest": admission.artifact_digest,
+        "prometa.bundle.digest": admission.artifact_digest,
+        "prometa.bundle.jti": admission.bundle.jti,
+        "prometa.environment": bundle_claims["targetEnvironment"],
+        "prometa.attestation.id": admission.promotion.attestation_id,
+        "prometa.attestation.jti": admission.promotion.jti,
+        "prometa.policy.decision_id": promotion_claims["decisionId"],
+        "prometa.policy.set_digest": promotion_claims["policySetDigest"],
+        "prometa.release.id": promotion_claims["releaseId"],
+        "prometa.deployment.id": promotion_claims["deploymentId"],
+        "prometa.runtime.target": promotion_claims["requestedRuntime"],
+        "prometa.runtime.id": runtime_id,
+        "prometa.runtime.version": runtime_version,
+        "prometa.manifest.id": config.manifest.manifest_id,
+        "prometa.manifest.version": config.manifest.version,
+    }
+    if config.contract.policy_digest is not None:
+        attributes["prometa.policy.digest"] = config.contract.policy_digest
+    if config.contract.configuration_digest is not None:
+        attributes["prometa.configuration.digest"] = (
+            config.contract.configuration_digest
+        )
+    if config.manifest.solution_name:
+        attributes["prometa.solution_id"] = config.manifest.solution_name
+    if request_id:
+        attributes["prometa.runtime.request_id"] = request_id
+    if release_source:
+        attributes["prometa.release.source"] = release_source
+    return attributes
+
+
 class RuntimeKernel:
     """Bounded executor for one already-admitted runtime release."""
 
@@ -428,32 +475,12 @@ class RuntimeKernel:
         return tuple(ordered)
 
     def _identity_attributes(self, request_id: Optional[str]) -> Dict[str, Any]:
-        config = self.admission.config
-        bundle_claims = self.admission.bundle.claims
-        promotion_claims = self.admission.promotion.claims
-        attributes: Dict[str, Any] = {
-            "prometa.agent_id": config.manifest.agent_id,
-            "gen_ai.agent.name": config.manifest.name,
-            "prometa.bundle.digest": self.admission.bundle.artifact_digest,
-            "prometa.bundle.jti": self.admission.bundle.jti,
-            "prometa.environment": bundle_claims["targetEnvironment"],
-            "prometa.attestation.id": self.admission.promotion.attestation_id,
-            "prometa.attestation.jti": self.admission.promotion.jti,
-            "prometa.policy.decision_id": promotion_claims["decisionId"],
-            "prometa.policy.set_digest": promotion_claims["policySetDigest"],
-            "prometa.release.id": promotion_claims["releaseId"],
-            "prometa.deployment.id": promotion_claims["deploymentId"],
-            "prometa.runtime.target": promotion_claims["requestedRuntime"],
-            "prometa.runtime.id": self.runtime_id,
-            "prometa.runtime.version": self.runtime_version,
-            "prometa.manifest.id": config.manifest.manifest_id,
-            "prometa.manifest.version": config.manifest.version,
-        }
-        if config.manifest.solution_name:
-            attributes["prometa.solution_id"] = config.manifest.solution_name
-        if request_id:
-            attributes["prometa.runtime.request_id"] = request_id
-        return attributes
+        return runtime_release_identity_attributes(
+            self.admission,
+            runtime_id=self.runtime_id,
+            runtime_version=self.runtime_version,
+            request_id=request_id,
+        )
 
     def _emit(
         self,

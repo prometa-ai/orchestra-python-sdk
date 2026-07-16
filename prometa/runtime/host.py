@@ -47,6 +47,7 @@ from .kernel import (
     RuntimeExecutionResult,
     RuntimeKernel,
     available_runtime_capabilities,
+    runtime_release_identity_attributes,
 )
 from .model_gateway import OpenAICompatibleModelAdapter
 from .mcp import (
@@ -1722,16 +1723,12 @@ def build_reference_runtime_host(
             dsn,
             tenant_id=config.tenant_id,
         )
-        identity_attributes = {
-            "prometa.bundle.digest": admitted.artifact_digest,
-            "prometa.attestation.id": admitted.promotion.attestation_id,
-            "prometa.release.id": config.release_id,
-            "prometa.deployment.id": config.deployment_id,
-            "prometa.runtime.target": config.runtime_target,
-            "prometa.runtime.id": config.runtime_id,
-            "prometa.runtime.version": config.runtime_version,
-            "prometa.release.source": material.source,
-        }
+        identity_attributes = runtime_release_identity_attributes(
+            admitted,
+            runtime_id=config.runtime_id,
+            runtime_version=config.runtime_version,
+            release_source=material.source,
+        )
 
         def receipt_status(outcome: str, details: Mapping[str, str]) -> None:
             attributes = dict(identity_attributes)
@@ -1800,16 +1797,12 @@ def build_reference_runtime_host(
             occurred_at=datetime.now(timezone.utc)
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"),
-            attributes={
-                "prometa.bundle.digest": admitted.artifact_digest,
-                "prometa.attestation.id": admitted.promotion.attestation_id,
-                "prometa.release.id": config.release_id,
-                "prometa.deployment.id": config.deployment_id,
-                "prometa.runtime.target": config.runtime_target,
-                "prometa.runtime.id": config.runtime_id,
-                "prometa.runtime.version": config.runtime_version,
-                "prometa.release.source": material.source,
-            },
+            attributes=runtime_release_identity_attributes(
+                admitted,
+                runtime_id=config.runtime_id,
+                runtime_version=config.runtime_version,
+                release_source=material.source,
+            ),
         )
     )
     host = ReferenceRuntimeHost(
@@ -1845,6 +1838,8 @@ def build_reference_runtime_host(
             runtime_version=config.runtime_version,
             transition="admitted",
             outcome="accepted",
+            policy_digest=admitted.config.contract.policy_digest,
+            configuration_digest=admitted.config.contract.configuration_digest,
             receipt_id=_lifecycle_receipt_id(
                 config, admitted.promotion.attestation_id, "admitted"
             ),
@@ -1861,6 +1856,8 @@ def build_reference_runtime_host(
             runtime_version=config.runtime_version,
             transition="active",
             outcome="succeeded",
+            policy_digest=admitted.config.contract.policy_digest,
+            configuration_digest=admitted.config.contract.configuration_digest,
             receipt_id=_lifecycle_receipt_id(
                 config, admitted.promotion.attestation_id, "active"
             ),

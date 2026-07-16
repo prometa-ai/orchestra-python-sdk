@@ -116,6 +116,8 @@ def build_runtime_receipt(
     runtime_version: str,
     transition: str,
     outcome: str,
+    policy_digest: Optional[str] = None,
+    configuration_digest: Optional[str] = None,
     receipt_id: Optional[str] = None,
     event_at: Optional[datetime] = None,
     reason: Optional[str] = None,
@@ -130,6 +132,17 @@ def build_runtime_receipt(
         raise RuntimeReceiptError("unsupported target_environment")
     if _DIGEST.fullmatch(artifact_digest) is None:
         raise RuntimeReceiptError("artifact_digest must be sha256:<hex>")
+    if (policy_digest is None) != (configuration_digest is None):
+        raise RuntimeReceiptError(
+            "policy_digest and configuration_digest must be supplied together"
+        )
+    if policy_digest is not None and (
+        _DIGEST.fullmatch(policy_digest) is None
+        or _DIGEST.fullmatch(configuration_digest or "") is None
+    ):
+        raise RuntimeReceiptError(
+            "policy_digest and configuration_digest must be sha256:<hex>"
+        )
     allowed_outcomes = _OUTCOME_BY_TRANSITION.get(transition)
     if allowed_outcomes is None:
         raise RuntimeReceiptError("unsupported transition")
@@ -138,7 +151,7 @@ def build_runtime_receipt(
     if reason is not None and (not isinstance(reason, str) or len(reason) > 1000):
         raise RuntimeReceiptError("reason must be at most 1000 characters")
 
-    return {
+    receipt = {
         "receiptId": _identifier("receipt_id", receipt_id or str(uuid.uuid4())),
         "attestationId": _identifier("attestation_id", attestation_id),
         "artifactDigest": artifact_digest,
@@ -153,6 +166,10 @@ def build_runtime_receipt(
         "reason": reason,
         "eventAt": _instant(event_at),
     }
+    if policy_digest is not None and configuration_digest is not None:
+        receipt["policyDigest"] = policy_digest
+        receipt["configurationDigest"] = configuration_digest
+    return receipt
 
 
 class RuntimeReceiptClient:

@@ -43,6 +43,7 @@ from prometa.runtime import (
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v1.json"
+V2_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v2.json"
 
 
 def _instant(value: str) -> datetime:
@@ -61,8 +62,8 @@ def _trust(value) -> BundleTrustStore:
     )
 
 
-def _admitted():
-    vector = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+def _admitted(fixture_path=FIXTURE_PATH):
+    vector = json.loads(fixture_path.read_text(encoding="utf-8"))
     verification = vector["verification"]
     policy = RuntimeAdmissionPolicy(
         expected_org_id=verification["expectedOrgId"],
@@ -274,6 +275,7 @@ def test_successful_execution_validates_schemas_and_emits_joinable_identity() ->
     assert completed.outcome == "completed"
     for key in (
         "prometa.agent_id",
+        "prometa.artifact.digest",
         "prometa.bundle.digest",
         "prometa.bundle.jti",
         "prometa.attestation.id",
@@ -285,6 +287,28 @@ def test_successful_execution_validates_schemas_and_emits_joinable_identity() ->
         "prometa.runtime.version",
     ):
         assert completed.attributes[key]
+    assert completed.attributes["prometa.artifact.digest"] == completed.attributes[
+        "prometa.bundle.digest"
+    ]
+    assert "prometa.policy.digest" not in completed.attributes
+    assert "prometa.configuration.digest" not in completed.attributes
+
+
+def test_runtime_contract_v2_stamps_signed_projection_digests() -> None:
+    _, admitted = _admitted(V2_FIXTURE_PATH)
+    kernel, emitter = _kernel(admitted, SequenceModelAdapter())
+
+    admitted_event = emitter.events[0]
+    assert kernel.admission.config.contract.contract_version == 2
+    assert admitted_event.attributes["prometa.artifact.digest"] == (
+        admitted.artifact_digest
+    )
+    assert admitted_event.attributes["prometa.policy.digest"] == (
+        admitted.config.contract.policy_digest
+    )
+    assert admitted_event.attributes["prometa.configuration.digest"] == (
+        admitted.config.contract.configuration_digest
+    )
 
 
 def test_invalid_input_and_output_fail_before_downstream_work() -> None:

@@ -183,6 +183,8 @@ receipt = build_runtime_receipt(
     runtime_version="1.0.0",
     transition="admitted",
     outcome="accepted",
+    policy_digest=admitted.config.contract.policy_digest,
+    configuration_digest=admitted.config.contract.configuration_digest,
 )
 RuntimeReceiptClient(
     "https://orchestra.example.com",
@@ -216,6 +218,11 @@ patterns fail admission until their execution contracts exist. It emits
 identity-only decision evidence by default, not raw prompts or tool payloads.
 Every event carries the verified bundle, attestation, policy decision, release,
 deployment, runtime, environment, manifest, solution, and agent identities.
+`prometa.artifact.digest` is the canonical artifact join and
+`prometa.bundle.digest` remains its compatibility alias. Runtime contract v2
+also adds `prometa.policy.digest` and `prometa.configuration.digest`; lifecycle
+receipts carry the same digest pair. Contract v1 evidence omits the pair rather
+than inventing values.
 
 The verifier ignores the public key embedded in the transport bundle and
 resolves `(issuer, keyId)` from the tenant-controlled trust store. Combined
@@ -247,7 +254,8 @@ telemetry.
 Receipt submission requires an API key carrying the platform's explicit
 `runtime:write` scope and is safe to retry with the same `receiptId` and
 semantic payload. A receipt is an authenticated runtime assertion, not an
-independent proof of cluster state.
+independent proof of cluster state. Policy and configuration digests are
+optional for legacy receipts, but must be supplied together when present.
 
 Importing `prometa.runtime` does not add dependencies to `import prometa` or
 change telemetry behavior. Cryptographic and JSON Schema enforcement are

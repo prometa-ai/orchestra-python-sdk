@@ -19,6 +19,8 @@ from prometa.runtime import (
 
 
 DIGEST = "sha256:" + "a" * 64
+POLICY_DIGEST = "sha256:" + "b" * 64
+CONFIGURATION_DIGEST = "sha256:" + "c" * 64
 
 
 def _receipt(**overrides):
@@ -65,6 +67,25 @@ def test_accepts_semver_build_metadata_and_digest_style_runtime_ids() -> None:
         runtime_version="1.2.3+build.7",
     )
     assert receipt["runtimeVersion"] == "1.2.3+build.7"
+
+
+def test_adds_runtime_contract_v2_digests_as_an_optional_pair() -> None:
+    receipt = _receipt(
+        policy_digest=POLICY_DIGEST,
+        configuration_digest=CONFIGURATION_DIGEST,
+    )
+    assert receipt["policyDigest"] == POLICY_DIGEST
+    assert receipt["configurationDigest"] == CONFIGURATION_DIGEST
+
+
+def test_rejects_partial_or_malformed_runtime_contract_digest_pairs() -> None:
+    with pytest.raises(RuntimeReceiptError, match="supplied together"):
+        _receipt(policy_digest=POLICY_DIGEST)
+    with pytest.raises(RuntimeReceiptError, match="sha256"):
+        _receipt(
+            policy_digest=POLICY_DIGEST,
+            configuration_digest="sha256:not-a-digest",
+        )
 
 
 def test_rejects_unsafe_local_receipts_before_network_io() -> None:

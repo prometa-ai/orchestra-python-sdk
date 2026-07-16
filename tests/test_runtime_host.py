@@ -56,6 +56,7 @@ from prometa.runtime.host import _RuntimeHttpServer
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v1.json"
+V2_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v2.json"
 API_TOKEN = "runtime-test-token-0123456789abcdef"
 
 
@@ -75,12 +76,12 @@ def _trust(value) -> BundleTrustStore:
     )
 
 
-def _vector():
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+def _vector(fixture_path=FIXTURE_PATH):
+    return json.loads(fixture_path.read_text(encoding="utf-8"))
 
 
-def _admitted():
-    vector = _vector()
+def _admitted(fixture_path=FIXTURE_PATH):
+    vector = _vector(fixture_path)
     verification = vector["verification"]
     admitted = admit_runtime_release(
         vector["bundle"],
@@ -1236,7 +1237,7 @@ def test_reference_host_rejects_short_api_tokens() -> None:
 def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() -> None:
     dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
     install_postgres_runtime_schema(dsn)
-    vector = _vector()
+    vector = _vector(V2_FIXTURE_PATH)
 
     class GatewayHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -1381,6 +1382,13 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             "active",
         ]
         assert len({item["receiptId"] for item in received_receipts}) == 2
+        contract = json.loads(
+            json.loads(vector["bundle"]["signedPayload"])["contentCanonical"]
+        )["runtimeContract"]
+        assert {
+            (item["policyDigest"], item["configurationDigest"])
+            for item in received_receipts
+        } == {(contract["policyDigest"], contract["configurationDigest"])}
 
         second, joined_created = build_reference_runtime_host(
             config,
@@ -1411,6 +1419,23 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             if event.name == "runtime.receipt.delivery"
         ]
         assert {event.outcome for event in delivery_events} == {"delivered"}
+        identity_events = [
+            event
+            for event in first_evidence.events
+            if event.name in {"runtime.release.material", "runtime.receipt.delivery"}
+        ]
+        assert identity_events
+        for event in identity_events:
+            assert event.attributes["prometa.artifact.type"] == "agent-bundle"
+            assert event.attributes["prometa.artifact.digest"] == (
+                vector["bundle"]["artifactDigest"]
+            )
+            assert event.attributes["prometa.policy.digest"] == contract[
+                "policyDigest"
+            ]
+            assert event.attributes["prometa.configuration.digest"] == contract[
+                "configurationDigest"
+            ]
         assert "runtime-receipt-key" not in repr(delivery_events)
     finally:
         release_receipts.set()

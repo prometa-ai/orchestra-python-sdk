@@ -10,6 +10,7 @@ profile=${PROMETA_RUNTIME_TOPOLOGY_PROFILE:-"$root/deploy/reference-runtime/topo
 fixture="$root/deploy/reference-runtime/ci/topology_fixture.py"
 probe_source="$root/deploy/reference-runtime/ci/topology_probe.py"
 mcp_server_source="$root/deploy/reference-runtime/ci/topology_mcp_server.py"
+image_importer="$root/deploy/reference-runtime/ci/verified-k3d-image-import.sh"
 chart="$root/deploy/reference-runtime/chart"
 runtime_image=${PROMETA_RUNTIME_TOPOLOGY_IMAGE:-prometa-runtime-host:topology-cert}
 cluster=${PROMETA_RUNTIME_TOPOLOGY_CLUSTER:-prometa-runtime-topology}
@@ -242,22 +243,8 @@ wait_database_scalar() {
   return 2
 }
 
-verify_node_image() {
-  node=$1
-  image=$2
-  found=false
-  while IFS= read -r reference; do
-    case "$reference" in
-      "$image"|"docker.io/library/$image") found=true ;;
-    esac
-  done < <(docker exec "$node" ctr --namespace k8s.io images list -q)
-  if [ "$found" != true ]; then
-    echo "Imported image is absent from node $node: $image" >&2
-    exit 2
-  fi
-}
-
-for required in docker "$python_command" "$kubectl_command" "$helm_command" "$k3d_command"; do
+for required in docker "$python_command" "$kubectl_command" "$helm_command" \
+  "$k3d_command" "$image_importer"; do
   require_command "$required"
 done
 
@@ -399,16 +386,9 @@ if [ "$receipt_proof" = true ]; then
     --fixture "$assets/platform-receipt-fixture.json"
 fi
 
-"$k3d_command" image import --cluster "$cluster" \
+K3D="$k3d_command" "$image_importer" \
+  "$cluster" "$server_nodes" "$agent_nodes" \
   "$runtime_image" "$postgres_node_image"
-for ((index = 0; index < server_nodes; index++)); do
-  verify_node_image "k3d-$cluster-server-$index" "$runtime_image"
-  verify_node_image "k3d-$cluster-server-$index" "$postgres_node_image"
-done
-for ((index = 0; index < agent_nodes; index++)); do
-  verify_node_image "k3d-$cluster-agent-$index" "$runtime_image"
-  verify_node_image "k3d-$cluster-agent-$index" "$postgres_node_image"
-done
 KUBECONFIG="$kubeconfig" "$kubectl_command" wait --for=condition=Ready nodes \
   --all --timeout=180s
 KUBECONFIG="$kubeconfig" "$kubectl_command" rollout status \

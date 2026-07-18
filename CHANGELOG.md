@@ -14,6 +14,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   secret references that never carry credential values.
 - A signed cross-language `runtime-kernel-v2.json` conformance vector shared
   with the Orchestra platform while runtime contract v1 remains admissible.
+- The pinned model-only and read-only MCP K3s topology profiles now activate
+  runtime contract v2 releases. Their payload-free evidence records capability
+  range admission and policy/configuration digest binding; live platform
+  receipt proof requires the same digest pair on every lifecycle assertion.
 - An optional `runtime-mcp` extra and governed tenant-side `ToolBroker` with
   official stdio and Streamable HTTP transports, exact egress allowlists,
   late-bound credentials, server/agent-specific permission projection, signed

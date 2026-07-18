@@ -354,6 +354,8 @@ same K3d, K3s, PostgreSQL, runtime, and chart pins.
   NetworkPolicy controller;
 - one server plus one agent node;
 - two isolated tenant topologies with two runtime replicas each;
+- signed bundle schema/runtime contract v2 admission with exact capability
+  ranges and independently recomputed policy/configuration digests;
 - the real chart migration and target-image compatibility hooks;
 - restricted pod security for runtime, gateway, and model fixtures;
 - authorized gateway ingress, same-namespace pod-label denial, cross-tenant
@@ -412,9 +414,10 @@ This profile certifies only the stock host's read-only MCP contract. It does
 not certify write/destructive tools, resumable approval, tool-result replay,
 or exactly-once execution.
 
-The resulting report contains profile/version identifiers, counts, and boolean
-checks only. Ephemeral bundle signatures, API tokens, database credentials,
-request bodies, and model outputs are never retained in the report. The
+The resulting report contains profile/version identifiers, runtime contract
+and bundle schema versions, digest-binding booleans, counts, and boolean checks
+only. Ephemeral bundle signatures, API tokens, database credentials, request
+bodies, and model outputs are never retained in the report. The
 profile makes no claim about OpenShift, managed Kubernetes CNIs, managed
 PostgreSQL failover/PITR, production ingress/TLS, autoscaling, overload
 fairness, storage durability, air-gap installation, or a tenant-specific
@@ -438,8 +441,9 @@ The harness connects only that container to the ephemeral K3d network, adds its
 exact IPv4 `/32` and port `3000` to each runtime NetworkPolicy, provisions
 separate `runtime:write` and `release:read` keys per tenant, and removes the
 fixture on exit. It requires two delivered outbox rows per tenant, the complete
-`admitted`/`active` platform projection, a rejected binding mismatch, and both
-read- and write-side tenant isolation. The retained report still records zero
+`admitted`/`active` platform projection, exact contract-v2 policy/configuration
+digest binding on every receipt, a rejected binding mismatch, and both read-
+and write-side tenant isolation. The retained report still records zero
 synchronous control-plane calls and never includes keys or signed payloads.
 
 ## Request API

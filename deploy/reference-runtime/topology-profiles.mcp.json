@@ -2,7 +2,7 @@
   "contractVersion": 1,
   "profiles": [
     {
-      "name": "k3d-k3s-kube-router-mcp-v1",
+      "name": "k3d-k3s-kube-router-mcp-v2",
       "workload": "mcp-read-only",
       "evidenceStatus": "reference-profile-not-production-certification",
       "networkPolicyController": "k3s-kube-router",

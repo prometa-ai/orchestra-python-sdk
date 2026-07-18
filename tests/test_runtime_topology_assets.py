@@ -45,7 +45,7 @@ def test_topology_profile_is_pinned_and_explicitly_non_production():
     assert document["contractVersion"] == 1
     assert len(document["profiles"]) == 1
     assert _profile() == {
-        "name": "k3d-k3s-kube-router-v1",
+        "name": "k3d-k3s-kube-router-v2",
         "workload": "model-only",
         "evidenceStatus": "reference-profile-not-production-certification",
         "networkPolicyController": "k3s-kube-router",
@@ -109,7 +109,7 @@ def test_mcp_topology_profile_reuses_pins_but_has_an_explicit_workload():
     model = _profile()
     mcp = json.loads(MCP_PROFILE.read_text(encoding="utf-8"))["profiles"][0]
 
-    assert mcp["name"] == "k3d-k3s-kube-router-mcp-v1"
+    assert mcp["name"] == "k3d-k3s-kube-router-mcp-v2"
     assert mcp["workload"] == "mcp-read-only"
     assert mcp["evidenceStatus"] == (
         "reference-profile-not-production-certification"
@@ -170,6 +170,24 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
     assert config_a["releaseId"] != config_b["releaseId"]
     assert config_a["deploymentId"] != config_b["deploymentId"]
     assert config_a["bundle"]["artifactDigest"] != config_b["bundle"]["artifactDigest"]
+    content_a = config_a["bundle"]["content"]
+    content_b = config_b["bundle"]["content"]
+    contract_a = content_a["runtimeContract"]
+    contract_b = content_b["runtimeContract"]
+    assert content_a["schemaVersion"] == 2
+    assert contract_a["contractVersion"] == 2
+    assert contract_a["capabilityRequirements"] == [
+        {"name": "evidence.emit", "minVersion": 1, "maxVersion": 1},
+        {"name": "model.invoke", "minVersion": 1, "maxVersion": 1},
+        {"name": "schema.validate", "minVersion": 1, "maxVersion": 1},
+    ]
+    assert contract_a["secretReferences"] == []
+    assert fixture._runtime_contract_digests(config_a["bundle"]) == (
+        contract_a["policyDigest"],
+        contract_a["configurationDigest"],
+    )
+    assert contract_a["policyDigest"] == contract_b["policyDigest"]
+    assert contract_a["configurationDigest"] != contract_b["configurationDigest"]
     assert config_a["modelGateway"]["baseUrl"].startswith(
         "http://model-gateway.models-a."
     )
@@ -271,6 +289,13 @@ def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
         "schema.validate.v1",
         "tool.broker.v1",
     ]
+    assert content["schemaVersion"] == 2
+    assert content["runtimeContract"]["contractVersion"] == 2
+    assert content["runtimeContract"]["capabilityRequirements"][-1] == {
+        "name": "tool.broker",
+        "minVersion": 1,
+        "maxVersion": 1,
+    }
     assert content["mcpServers"] == ["Tenant Tools"]
     assert content["requiredScopes"] == ["tools:read"]
     assert content["grantedScopes"] == ["tools:read"]
@@ -442,6 +467,7 @@ def test_topology_live_platform_verifier_checks_projection_and_isolation(
     def document(tenant):
         authorization = tenant["promotionAttestation"]["authorization"]
         attestation_id = tenant["promotionAttestation"]["attestationId"]
+        contract = tenant["bundle"]["content"]["runtimeContract"]
         payloads = []
         for transition, outcome, instant in (
             ("admitted", "accepted", "2026-07-13T00:00:00.000Z"),
@@ -458,6 +484,8 @@ def test_topology_live_platform_verifier_checks_projection_and_isolation(
                     "runtimeTarget": "tenant-runtime",
                     "runtimeId": tenant["runtimeId"],
                     "runtimeVersion": tenant["runtimeVersion"],
+                    "policyDigest": contract["policyDigest"],
+                    "configurationDigest": contract["configurationDigest"],
                     "transition": transition,
                     "outcome": outcome,
                     "reason": None,
@@ -511,13 +539,22 @@ def test_topology_live_platform_verifier_checks_projection_and_isolation(
     assert json.loads(proof.read_text()) == {
         "contractVersion": 1,
         "mode": "live-platform",
+        "runtimeContractVersion": 2,
         "runtimeReceiptsPerTenant": 2,
         "asynchronousReceiptDelivery": True,
+        "policyConfigurationDigestBinding": True,
+        "platformProjectionDigestBinding": True,
         "platformBindingValidation": True,
         "platformProjectionVisible": True,
         "receiptReadTenantIsolation": True,
         "receiptWriteTenantIsolation": True,
     }
+
+    first = tenants[0]
+    invalid = document(first)
+    invalid["receipts"][0]["payload"]["policyDigest"] = "sha256:" + "d" * 64
+    with pytest.raises(ValueError, match="platform_receipt_projection_invalid"):
+        fixture._validate_platform_projection(invalid, first)
 
 
 def test_topology_partition_removes_only_database_egress(tmp_path):
@@ -624,6 +661,11 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
     )
     assert evidence["runtimeVersion"] == "0.18.0"
     assert evidence["chartVersion"] == "0.3.1"
+    assert evidence["bundleSchemaVersion"] == 2
+    assert evidence["runtimeContractVersion"] == 2
+    assert evidence["capabilityRangeAdmission"] is True
+    assert evidence["policyConfigurationDigestBinding"] is True
+    assert evidence["typedSecretReferenceFieldPresent"] is True
     assert evidence["duplicateWinnersPerTenant"] == 1
     assert evidence["activationRowsPerTenant"] == 1
     assert evidence["synchronousControlPlaneCalls"] == 0
@@ -661,8 +703,11 @@ def test_topology_report_includes_only_validated_live_receipt_evidence(tmp_path)
             {
                 "contractVersion": 1,
                 "mode": "live-platform",
+                "runtimeContractVersion": 2,
                 "runtimeReceiptsPerTenant": 2,
                 "asynchronousReceiptDelivery": True,
+                "policyConfigurationDigestBinding": True,
+                "platformProjectionDigestBinding": True,
                 "platformBindingValidation": True,
                 "platformProjectionVisible": True,
                 "receiptReadTenantIsolation": True,
@@ -689,6 +734,7 @@ def test_topology_report_includes_only_validated_live_receipt_evidence(tmp_path)
     assert evidence["runtimeReceiptsPerTenant"] == 2
     assert evidence["receiptOutboxDeliveredPerTenant"] == 2
     assert evidence["asynchronousReceiptDelivery"] is True
+    assert evidence["platformProjectionDigestBinding"] is True
     assert evidence["platformBindingValidation"] is True
     assert evidence["platformProjectionVisible"] is True
     assert evidence["receiptReadTenantIsolation"] is True

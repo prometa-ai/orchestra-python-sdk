@@ -75,6 +75,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   cross-replica PostgreSQL call admission, payload-free audit persistence,
   tenant-isolated credential rotation, and indeterminate replay quarantine.
 
+### Fixed
+
+- K3d topology certification now uses verified direct image imports with
+  bounded retries, preventing a successful K3d exit from masking a transient
+  missing tarball or an image absent from any server or agent node.
+
 ### Security
 
 - MCP HTTP redirects and ambient proxy discovery are disabled, public plain

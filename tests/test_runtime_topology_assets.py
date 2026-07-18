@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import stat
+import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -14,6 +15,7 @@ MCP_PROFILE = DEPLOY / "topology-profiles.mcp.json"
 FIXTURE_PATH = DEPLOY / "ci/topology_fixture.py"
 PROBE_PATH = DEPLOY / "ci/topology_probe.py"
 MCP_SERVER_PATH = DEPLOY / "ci/topology_mcp_server.py"
+IMAGE_IMPORTER = DEPLOY / "ci/verified-k3d-image-import.sh"
 
 
 def _load_module(name: str, path: Path):
@@ -91,6 +93,7 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
 
     assert installer.stat().st_mode & stat.S_IXUSR
     assert harness.stat().st_mode & stat.S_IXUSR
+    assert IMAGE_IMPORTER.stat().st_mode & stat.S_IXUSR
     assert "reference-profile-not-production-certification" in harness_text
     assert "topology_fixture.py" in harness_text
     assert "topology_probe.py" in harness_text
@@ -103,6 +106,97 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "mcp_tool_call_indeterminate" in harness_text
     assert "runtime-mcp-credentials" in harness_text
     assert "verify-platform-receipts" in harness_text
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _image_import_fakes(tmp_path: Path, succeed_on: int):
+    state = tmp_path / "state"
+    state.mkdir()
+    k3d = tmp_path / "k3d"
+    docker = tmp_path / "docker"
+    _write_executable(
+        k3d,
+        """#!/usr/bin/env bash
+set -euo pipefail
+count_file="$FAKE_IMPORT_STATE/count"
+count=0
+if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+printf '%s\n' "$((count + 1))" >"$count_file"
+printf '%s\n' "$*" >>"$FAKE_IMPORT_STATE/calls"
+""",
+    )
+    _write_executable(
+        docker,
+        """#!/usr/bin/env bash
+set -euo pipefail
+count=$(cat "$FAKE_IMPORT_STATE/count")
+if [ "$count" -ge "$FAKE_IMPORT_SUCCEEDS_ON" ]; then
+  printf '%s\n' 'docker.io/library/runtime:test' 'postgres:test'
+fi
+""",
+    )
+    return state, k3d, docker, {
+        "FAKE_IMPORT_STATE": str(state),
+        "FAKE_IMPORT_SUCCEEDS_ON": str(succeed_on),
+    }
+
+
+def test_verified_image_import_retries_successful_but_incomplete_k3d_load(
+    tmp_path, monkeypatch
+):
+    state, k3d, docker, environment = _image_import_fakes(tmp_path, succeed_on=2)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("K3D", str(k3d))
+    monkeypatch.setenv("DOCKER", str(docker))
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_RETRY_SECONDS", "0")
+
+    result = subprocess.run(
+        [
+            str(IMAGE_IMPORTER),
+            "test-cluster",
+            "1",
+            "1",
+            "runtime:test",
+            "postgres:test",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert (state / "count").read_text(encoding="utf-8").strip() == "2"
+    calls = (state / "calls").read_text(encoding="utf-8").splitlines()
+    assert all("image import --mode direct --cluster test-cluster" in call for call in calls)
+    assert "attempt 1/3 incomplete" in result.stderr
+
+
+def test_verified_image_import_fails_closed_when_images_never_appear(
+    tmp_path, monkeypatch
+):
+    state, k3d, docker, environment = _image_import_fakes(tmp_path, succeed_on=9)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("K3D", str(k3d))
+    monkeypatch.setenv("DOCKER", str(docker))
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_ATTEMPTS", "2")
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_RETRY_SECONDS", "0")
+
+    result = subprocess.run(
+        [str(IMAGE_IMPORTER), "test-cluster", "1", "0", "runtime:test"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert (state / "count").read_text(encoding="utf-8").strip() == "2"
+    assert "did not converge after 2 attempts" in result.stderr
 
 
 def test_mcp_topology_profile_reuses_pins_but_has_an_explicit_workload():

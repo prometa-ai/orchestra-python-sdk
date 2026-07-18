@@ -1,4 +1,4 @@
-ARG PYTHON_IMAGE=python:3.12-slim
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 FROM ${PYTHON_IMAGE} AS builder
 
 WORKDIR /src
@@ -8,9 +8,15 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host,runti
 
 FROM ${PYTHON_IMAGE}
 
+ARG VCS_REF=unknown
+ARG IMAGE_VERSION=0.18.0
+
 LABEL org.opencontainers.image.title="Prometa reference tenant runtime" \
       org.opencontainers.image.description="Tenant-deployed host for signed Orchestra runtime releases" \
-      org.opencontainers.image.version="0.18.0"
+      org.opencontainers.image.source="https://github.com/prometa-ai/orchestra-python-sdk" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      io.prometa.image.variant="debian"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

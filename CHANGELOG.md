@@ -92,8 +92,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - The Debian runtime base is digest-pinned, and release automation builds from
   an exact SDK tag while taking workflow controls from the protected default
-  branch. Existing tags can be backfilled without moving or rebuilding a tag
-  from mutable branch source.
+  branch. The immutable `v0.18.0` tag has a narrowly bounded compatibility rule
+  for its literal Debian image version so it can be backfilled without moving
+  the tag or rebuilding from mutable branch source; later tags require the
+  build-injected metadata contract.
 - MCP HTTP redirects and ambient proxy discovery are disabled, public plain
   HTTP is rejected, credential-controlled protocol headers are forbidden, and
   every declared origin or stdio command requires an explicit tenant egress

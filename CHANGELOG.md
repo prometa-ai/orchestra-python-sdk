@@ -20,6 +20,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   publication run, checks its requested tag binding, and re-verifies signatures,
   attestations, AMD64 manifests, and chart pullability without rebuilding or
   retagging artifacts.
+- Digest-checked GitHub Release evidence for each runtime tag, including both
+  image metadata documents, the packaged chart, and CycloneDX/SPDX SBOMs. A
+  retry may add missing assets but fails closed if an existing asset differs.
+- Exact-ref CI dispatch and release gating, so future publication starts only
+  after the full matrix passes against the source tag rather than merely the
+  preceding feature or version-bump commit.
 - Runtime contract v2 admission with exact capability-version ranges,
   independently recomputed policy/configuration digests, and typed logical
   secret references that never carry credential values.

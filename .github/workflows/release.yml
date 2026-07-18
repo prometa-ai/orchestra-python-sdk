@@ -48,9 +48,11 @@ name: Release
 #      Compose defaults, and chart application version.
 #   5. (Skipped if there's no diff.) Commits the bump to `main` and
 #      pushes.
-#   6. Always pushes the `v<version>` tag and dispatches both publication
-#      workflows: Trusted Publishing to PyPI, plus signed runtime images and
-#      the OCI Helm chart from that exact tag.
+#   6. Always pushes the `v<version>` tag and runs the full CI matrix against
+#      that exact tag.
+#   7. Only after exact-tag CI passes, dispatches both publication workflows:
+#      Trusted Publishing to PyPI, plus signed runtime images and the OCI Helm
+#      chart from that exact tag.
 #
 # NOTES
 # - Requires `contents: write` so the bot can push the version-bump
@@ -276,6 +278,46 @@ jobs:
           git tag "v$NEW"
           git push origin "v$NEW"
 
+      - name: Certify exact tagged source before publication
+        id: release_ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.bump.outputs.new_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_ref="v$NEW"
+          title="CI for $source_ref"
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run ci.yml --ref main -f source_ref="$source_ref"
+
+          run_id=""
+          for _ in $(seq 1 24); do
+            run_id=$(
+              gh run list \
+                --workflow ci.yml \
+                --event workflow_dispatch \
+                --limit 30 \
+                --json databaseId,displayTitle,createdAt \
+                | jq -r \
+                  --arg title "$title" \
+                  --arg started "$started_at" \
+                  '[.[] | select(.displayTitle == $title and .createdAt >= $started)]
+                   | sort_by(.createdAt) | last | .databaseId // empty'
+            )
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "Could not resolve exact-tag CI run for $source_ref" >&2
+            exit 1
+          fi
+
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          gh run watch "$run_id" --interval 20 --exit-status
+
       - name: Trigger Publish on the new tag
         # GitHub's anti-loop guard blocks pushes made by GITHUB_TOKEN
         # from triggering further workflows, so the tag we just pushed
@@ -317,6 +359,7 @@ jobs:
             echo "- **Version:** \`$NEW\`"
             echo "- **Tag:** \`v$NEW\`"
             echo "- **Chart:** \`$NEW_CHART\`"
+            echo "- **Exact-tag CI:** \`${{ steps.release_ci.outputs.run_id }}\`"
             echo ""
             echo "The package workflow is publishing to PyPI and the runtime-artifact workflow is publishing signed images and the OCI chart."
             echo "Watch them here: [PyPI](../../actions/workflows/publish.yml) | [runtime artifacts](../../actions/workflows/publish-runtime-artifacts.yml)"

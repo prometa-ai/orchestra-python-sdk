@@ -10,6 +10,7 @@ ROOT = Path(__file__).parent.parent
 VERIFIER = ROOT / "scripts/verify_runtime_release_contract.sh"
 SYNCHRONIZER = ROOT / "scripts/sync_runtime_release_version.py"
 ARTIFACT_WORKFLOW = ROOT / ".github/workflows/publish-runtime-artifacts.yml"
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 PUBLISHED_INSTALL_WORKFLOW = ROOT / ".github/workflows/runtime-published-install.yml"
 PUBLISHED_UPGRADE_WORKFLOW = (
     ROOT / ".github/workflows/runtime-published-upgrade-rollback.yml"
@@ -243,12 +244,28 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert "exact PyPI package was unavailable after 10 minutes" in workflow
     assert "verify_run_id:" in workflow
     assert "actions: read" in workflow
-    assert workflow.count("run-id: ${{ inputs.verify_run_id }}") == 2
+    assert workflow.count("run-id: ${{ inputs.verify_run_id }}") == 4
     assert "inputs.verify_run_id != '' && needs.publish.result == 'skipped'" in workflow
     assert 'expected_tag="${{ inputs.source_tag || github.ref_name }}"' in workflow
     assert 'mkdir -p "$RUNNER_TEMP/pulled-chart"' in workflow
     assert "helm pull" in workflow
     assert "verify signed artifact set" in workflow
+    assert "publish immutable GitHub release evidence" in workflow
+    assert "contents: write" in workflow
+    assert 'gh release create "$RELEASE_TAG"' in workflow
+    assert 'gh release upload "$RELEASE_TAG"' in workflow
+    assert "Existing release asset digest differs" in workflow
+    assert "GitHub release asset digests did not converge" in workflow
+
+
+def test_ci_can_certify_an_exact_release_ref():
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "source_ref:" in workflow
+    assert "CI for {0}" in workflow
+    assert "CI_SOURCE_REF: ${{ inputs.source_ref || github.sha }}" in workflow
+    assert workflow.count("ref: ${{ env.CI_SOURCE_REF }}") == 10
 
 
 def test_published_install_workflow_consumes_immutable_release_artifacts():
@@ -296,5 +313,8 @@ def test_release_dispatches_package_and_runtime_artifacts_from_same_tag():
     assert 'echo "chart_version=$NEW_CHART_VERSION"' in workflow
     assert "deploy/reference-runtime/topology-profiles.json \\" in workflow
     assert 'scripts/verify_runtime_release_contract.sh "v$NEW"' in workflow
+    assert 'gh workflow run ci.yml --ref main -f source_ref="$source_ref"' in workflow
+    assert 'gh run watch "$run_id" --interval 20 --exit-status' in workflow
+    assert "Certify exact tagged source before publication" in workflow
     assert "gh workflow run publish-runtime-artifacts.yml" in workflow
     assert '--ref main \\\n            -f source_tag="v$NEW"' in workflow

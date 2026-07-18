@@ -1,13 +1,24 @@
 name: CI
+run-name: ${{ inputs.source_ref != '' && format('CI for {0}', inputs.source_ref) || format('CI {0}', github.ref_name) }}
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Exact tag or commit to certify; defaults to the triggering SHA"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+
+env:
+  CI_SOURCE_REF: ${{ inputs.source_ref || github.sha }}
 
 jobs:
   lint-and-test:
@@ -18,6 +29,8 @@ jobs:
         python-version: ["3.9", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -46,6 +59,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -88,6 +103,8 @@ jobs:
         postgresql://runtime_test:runtime_test@localhost:5432/runtime_test
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -123,6 +140,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -170,6 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CI_SOURCE_REF }}
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -192,6 +212,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -240,6 +262,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -285,6 +309,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: azure/setup-helm@v4
 
@@ -490,6 +516,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:
@@ -525,6 +553,8 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: actions/setup-python@v5
         with:

@@ -105,6 +105,8 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "PROMETA_RUNTIME_TOPOLOGY_PROFILE" in harness_text
     assert "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE" in harness_text
     assert "PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256" in harness_text
+    assert "PROMETA_RUNTIME_TOPOLOGY_REGISTRY_CONFIG" in harness_text
+    assert "kubernetes.io/dockerconfigjson" in harness_text
     assert "--artifact-mode published-release" in harness_text
     assert "mcp_tool_call_indeterminate" in harness_text
     assert "runtime-mcp-credentials" in harness_text
@@ -369,6 +371,7 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
         "support-resources.json",
     ):
         assert stat.S_IMODE((output / name).stat().st_mode) == 0o600
+    assert stat.S_IMODE((output / "support-namespaces.json").stat().st_mode) == 0o644
 
     with pytest.raises(ValueError, match="runtime_version_mismatch"):
         fixture.prepare(
@@ -387,15 +390,42 @@ def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
     digest = "sha256:" + "a" * 64
     image = "ghcr.io/prometa-ai/orchestra-python-sdk/runtime@" + digest
 
-    fixture.prepare(PROFILE, output, PROBE_PATH, image, "0.18.0")
+    fixture.prepare(
+        PROFILE,
+        output,
+        PROBE_PATH,
+        image,
+        "0.18.0",
+        runtime_image_pull_policy="IfNotPresent",
+        runtime_image_pull_secret="topology-registry",
+    )
 
     values = json.loads((output / "tenant-a-values.json").read_text())
     assert values["image"] == {
         "repository": "ghcr.io/prometa-ai/orchestra-python-sdk/runtime",
         "digest": digest,
-        "pullPolicy": "Never",
+        "pullPolicy": "IfNotPresent",
+        "pullSecrets": [{"name": "topology-registry"}],
     }
     assert "tag" not in values["image"]
+    resources = json.loads((output / "support-resources.json").read_text())
+    runtime_backed_pods = []
+    for item in resources["items"]:
+        if item["kind"] == "Deployment" and item["metadata"]["name"] == "model-gateway":
+            runtime_backed_pods.append(item["spec"]["template"]["spec"])
+        if item["kind"] == "Pod" and item["metadata"]["namespace"].startswith(
+            "gateway-"
+        ):
+            runtime_backed_pods.append(item["spec"])
+    assert len(runtime_backed_pods) == 6
+    for pod in runtime_backed_pods:
+        assert pod["imagePullSecrets"] == [{"name": "topology-registry"}]
+        assert pod["containers"][0]["image"] == image
+        assert pod["containers"][0]["imagePullPolicy"] == "IfNotPresent"
+
+    namespaces = json.loads((output / "support-namespaces.json").read_text())
+    assert all(item["kind"] == "Namespace" for item in namespaces["items"])
+    assert len(namespaces["items"]) == 8
 
     for invalid in (
         "runtime-without-tag",
@@ -410,6 +440,17 @@ def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
                 invalid,
                 "0.18.0",
             )
+
+    with pytest.raises(ValueError, match="runtime_image_pull_invalid"):
+        fixture.prepare(
+            PROFILE,
+            tmp_path / "invalid-pull-secret",
+            PROBE_PATH,
+            image,
+            "0.18.0",
+            runtime_image_pull_policy="IfNotPresent",
+            runtime_image_pull_secret="Invalid Secret",
+        )
 
 
 def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(

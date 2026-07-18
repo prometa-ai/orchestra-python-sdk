@@ -243,6 +243,28 @@ def test_topology_profile_name_is_bound_to_its_workload(tmp_path):
         fixture._load_profile(mismatched)
 
 
+@pytest.mark.parametrize(
+    ("profile_path", "legacy_name", "workload"),
+    (
+        (PROFILE, "k3d-k3s-kube-router-v1", "model-only"),
+        (MCP_PROFILE, "k3d-k3s-kube-router-mcp-v1", "mcp-read-only"),
+    ),
+)
+def test_topology_fixture_accepts_immutable_v1_profile_names(
+    tmp_path, profile_path, legacy_name, workload
+):
+    fixture = _load_module("topology_fixture_legacy_" + workload, FIXTURE_PATH)
+    document = json.loads(profile_path.read_text(encoding="utf-8"))
+    document["profiles"][0]["name"] = legacy_name
+    legacy = tmp_path / (legacy_name + ".json")
+    legacy.write_text(json.dumps(document), encoding="utf-8")
+
+    loaded = fixture._load_profile(legacy)
+
+    assert loaded["name"] == legacy_name
+    assert loaded["workload"] == workload
+
+
 def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
     pytest.importorskip("cryptography")
     fixture = _load_module("topology_fixture_prepare", FIXTURE_PATH)

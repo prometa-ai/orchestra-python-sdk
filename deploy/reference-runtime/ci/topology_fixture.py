@@ -23,6 +23,8 @@ TENANTS = ("a", "b")
 RUNTIME_BUNDLE_SCHEMA_VERSION = 2
 RUNTIME_CONTRACT_VERSION = 2
 PROFILE_WORKLOADS = {
+    "k3d-k3s-kube-router-v1": "model-only",
+    "k3d-k3s-kube-router-mcp-v1": "mcp-read-only",
     "k3d-k3s-kube-router-v2": "model-only",
     "k3d-k3s-kube-router-mcp-v2": "mcp-read-only",
 }

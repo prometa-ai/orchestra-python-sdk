@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from prometa import __version__ as RUNTIME_VERSION
+
 
 ROOT = Path(__file__).parent.parent
 DEPLOY = ROOT / "deploy/reference-runtime"
@@ -16,6 +18,11 @@ FIXTURE_PATH = DEPLOY / "ci/topology_fixture.py"
 PROBE_PATH = DEPLOY / "ci/topology_probe.py"
 MCP_SERVER_PATH = DEPLOY / "ci/topology_mcp_server.py"
 IMAGE_IMPORTER = DEPLOY / "ci/verified-k3d-image-import.sh"
+CHART_VERSION = next(
+    line.split(":", 1)[1].strip()
+    for line in (DEPLOY / "chart/Chart.yaml").read_text(encoding="utf-8").splitlines()
+    if line.startswith("version:")
+)
 
 
 def _load_module(name: str, path: Path):
@@ -51,8 +58,8 @@ def test_topology_profile_is_pinned_and_explicitly_non_production():
         "workload": "model-only",
         "evidenceStatus": "reference-profile-not-production-certification",
         "networkPolicyController": "k3s-kube-router",
-        "runtimeVersion": "0.18.0",
-        "chartVersion": "0.3.1",
+        "runtimeVersion": RUNTIME_VERSION,
+        "chartVersion": CHART_VERSION,
         "k3dVersion": "v5.8.3",
         "k3dChecksums": {
             "darwin-amd64": (
@@ -144,10 +151,15 @@ if [ "$count" -ge "$FAKE_IMPORT_SUCCEEDS_ON" ]; then
 fi
 """,
     )
-    return state, k3d, docker, {
-        "FAKE_IMPORT_STATE": str(state),
-        "FAKE_IMPORT_SUCCEEDS_ON": str(succeed_on),
-    }
+    return (
+        state,
+        k3d,
+        docker,
+        {
+            "FAKE_IMPORT_STATE": str(state),
+            "FAKE_IMPORT_SUCCEEDS_ON": str(succeed_on),
+        },
+    )
 
 
 def test_verified_image_import_retries_successful_but_incomplete_k3d_load(
@@ -177,7 +189,9 @@ def test_verified_image_import_retries_successful_but_incomplete_k3d_load(
     assert result.returncode == 0
     assert (state / "count").read_text(encoding="utf-8").strip() == "2"
     calls = (state / "calls").read_text(encoding="utf-8").splitlines()
-    assert all("image import --mode direct --cluster test-cluster" in call for call in calls)
+    assert all(
+        "image import --mode direct --cluster test-cluster" in call for call in calls
+    )
     assert "attempt 1/3 incomplete" in result.stderr
 
 
@@ -210,9 +224,7 @@ def test_mcp_topology_profile_reuses_pins_but_has_an_explicit_workload():
 
     assert mcp["name"] == "k3d-k3s-kube-router-mcp-v2"
     assert mcp["workload"] == "mcp-read-only"
-    assert mcp["evidenceStatus"] == (
-        "reference-profile-not-production-certification"
-    )
+    assert mcp["evidenceStatus"] == ("reference-profile-not-production-certification")
     for key in (
         "networkPolicyController",
         "runtimeVersion",
@@ -277,7 +289,7 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
         output,
         PROBE_PATH,
         "prometa-runtime-host:topology-test",
-        "0.18.0",
+        RUNTIME_VERSION,
     )
 
     config_a = json.loads((output / "tenant-a-config.json").read_text())
@@ -395,7 +407,7 @@ def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
         output,
         PROBE_PATH,
         image,
-        "0.18.0",
+        RUNTIME_VERSION,
         runtime_image_pull_policy="IfNotPresent",
         runtime_image_pull_secret="topology-registry",
     )
@@ -438,7 +450,7 @@ def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
                 tmp_path / ("invalid-" + str(len(invalid))),
                 PROBE_PATH,
                 invalid,
-                "0.18.0",
+                RUNTIME_VERSION,
             )
 
     with pytest.raises(ValueError, match="runtime_image_pull_invalid"):
@@ -447,7 +459,7 @@ def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
             tmp_path / "invalid-pull-secret",
             PROBE_PATH,
             image,
-            "0.18.0",
+            RUNTIME_VERSION,
             runtime_image_pull_policy="IfNotPresent",
             runtime_image_pull_secret="Invalid Secret",
         )
@@ -465,7 +477,7 @@ def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
         output,
         PROBE_PATH,
         "prometa-runtime-host:topology-test",
-        "0.18.0",
+        RUNTIME_VERSION,
         mcp_server_source_path=MCP_SERVER_PATH,
     )
 
@@ -499,9 +511,7 @@ def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
         {
             "serverName": "Tenant Tools",
             "authMode": "api-key",
-            "httpHeaders": {
-                "Authorization": "MCP_TOPOLOGY_AUTHORIZATION"
-            },
+            "httpHeaders": {"Authorization": "MCP_TOPOLOGY_AUTHORIZATION"},
             "stdioEnvironment": {},
         }
     ]
@@ -540,7 +550,8 @@ def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
         item
         for item in resources["items"]
         if item["kind"] == "NetworkPolicy"
-        and item["metadata"] == {
+        and item["metadata"]
+        == {
             "name": "mcp-integration",
             "namespace": "tools-a",
         }
@@ -568,7 +579,7 @@ def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
             tmp_path / "missing-server",
             PROBE_PATH,
             "prometa-runtime-host:topology-test",
-            "0.18.0",
+            RUNTIME_VERSION,
         )
 
 
@@ -582,7 +593,7 @@ def test_topology_fixture_optionally_wires_live_platform_receipts(tmp_path):
         output,
         PROBE_PATH,
         "prometa-runtime-host:topology-test",
-        "0.18.0",
+        RUNTIME_VERSION,
         "http://172.22.0.9:3000",
         "172.22.0.9/32",
     )
@@ -623,7 +634,7 @@ def test_topology_fixture_optionally_wires_live_platform_receipts(tmp_path):
             tmp_path / "incomplete",
             PROBE_PATH,
             "prometa-runtime-host:topology-test",
-            "0.18.0",
+            RUNTIME_VERSION,
             "http://172.22.0.9:3000",
         )
     with pytest.raises(ValueError, match="receipt_endpoint_invalid"):
@@ -632,7 +643,7 @@ def test_topology_fixture_optionally_wires_live_platform_receipts(tmp_path):
             tmp_path / "broad-cidr",
             PROBE_PATH,
             "prometa-runtime-host:topology-test",
-            "0.18.0",
+            RUNTIME_VERSION,
             "http://172.22.0.9:3000",
             "172.22.0.0/24",
         )
@@ -649,7 +660,7 @@ def test_topology_live_platform_verifier_checks_projection_and_isolation(
         assets,
         PROBE_PATH,
         "prometa-runtime-host:topology-test",
-        "0.18.0",
+        RUNTIME_VERSION,
         "http://172.22.0.9:3000",
         "172.22.0.9/32",
     )
@@ -851,8 +862,8 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
     assert evidence["evidenceStatus"] == (
         "reference-profile-not-production-certification"
     )
-    assert evidence["runtimeVersion"] == "0.18.0"
-    assert evidence["chartVersion"] == "0.3.1"
+    assert evidence["runtimeVersion"] == RUNTIME_VERSION
+    assert evidence["chartVersion"] == CHART_VERSION
     assert evidence["artifactSource"] == {"mode": "source-build"}
     assert evidence["bundleSchemaVersion"] == 2
     assert evidence["runtimeContractVersion"] == 2

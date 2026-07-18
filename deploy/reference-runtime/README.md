@@ -445,8 +445,42 @@ gh workflow run runtime-published-install.yml \
 
 This is release-channel installation and K3d behavioral evidence. It remains
 `reference-profile-not-production-certification`: it does not prove OpenShift,
-customer registry mirroring, managed dependencies, upgrade/rollback between two
-separately published compatible releases, fault recovery, RPO/RTO, or soak.
+customer registry mirroring, managed dependencies, fault recovery, RPO/RTO, or
+soak.
+
+### Published-artifact upgrade and rollback proof
+
+The manual `Verify published runtime upgrade and rollback` workflow accepts an
+older baseline tag and a newer target tag. It verifies both signed release sets,
+establishes the exact baseline K3d topology, then executes three forward Helm
+deployments:
+
+1. the baseline chart/image with release A;
+2. the target chart/image with release B, including target-image migration and
+   compatibility hooks; and
+3. the baseline chart/image with release A's exact bundle bytes, a fresh
+   promotion attestation, and a new deployment identity.
+
+Every stage must serve both tenants from two ready replicas and create exactly
+one matching activation row per tenant. The evidence binds both source tags and
+revisions, image digests, chart OCI digests, chart-package hashes, deployment
+identities, artifact digests, and promotion JTIs without retaining signed
+payloads or credentials.
+
+```bash
+gh workflow run runtime-published-upgrade-rollback.yml \
+  --repo prometa-ai/orchestra-python-sdk \
+  --ref main \
+  -f baseline_tag=v0.18.0 \
+  -f target_tag=v0.18.1
+```
+
+This closes the separately published release-channel transition gap only for
+the pinned K3d reference profile. It is not OpenShift, managed-database,
+customer-registry, disaster-recovery, RPO/RTO, or soak certification. The SDK
+release workflow advances the independently versioned chart patch whenever the
+runtime version advances, preventing an immutable chart version from being
+republished for a new runtime release.
 
 ### Read-only MCP profile
 

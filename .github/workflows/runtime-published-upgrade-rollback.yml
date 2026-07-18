@@ -1,0 +1,196 @@
+name: Verify published runtime upgrade and rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_tag:
+        description: Exact immutable SDK release tag to upgrade from
+        required: true
+        default: v0.18.0
+        type: string
+      target_tag:
+        description: Exact immutable SDK release tag to upgrade to
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: runtime-published-upgrade-${{ inputs.baseline_tag }}-${{ inputs.target_tag }}
+  cancel-in-progress: false
+
+jobs:
+  published-upgrade-rollback:
+    name: published charts and UBI images on K3d
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Check out release verification controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-control
+
+      - name: Check out exact baseline source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.baseline_tag }}
+          fetch-depth: 0
+          path: baseline-source
+
+      - name: Check out exact target source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_tag }}
+          fetch-depth: 0
+          path: target-source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.8
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Isolate Docker registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/docker-config"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker-config" >>"$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify both immutable release sets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$BASELINE_TAG" "$TARGET_TAG" <<'PY'
+          import re
+          import sys
+
+          values = []
+          for value in sys.argv[1:]:
+              if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", value):
+                  raise SystemExit("release tag is invalid: %s" % value)
+              values.append(tuple(int(part) for part in value[1:].split(".")))
+          if values[1] <= values[0]:
+              raise SystemExit("target release must be newer than baseline")
+          PY
+          resolver=release-control/deploy/reference-runtime/ci/resolve-published-release.sh
+          "$resolver" "$BASELINE_TAG" baseline-source \
+            "$RUNNER_TEMP/baseline-release" "$RUNNER_TEMP/baseline.json"
+          "$resolver" "$TARGET_TAG" target-source \
+            "$RUNNER_TEMP/target-release" "$RUNNER_TEMP/target.json"
+
+      - name: Install baseline runtime package and checksum-verified K3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install './baseline-source[dev,runtime-host]'
+          release-control/deploy/reference-runtime/ci/install-k3d.sh "$RUNNER_TEMP/k3d"
+          echo "K3D=$RUNNER_TEMP/k3d" >>"$GITHUB_ENV"
+
+      - name: Establish the exact published baseline topology
+        env:
+          PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE: published
+          PROMETA_RUNTIME_TOPOLOGY_SOURCE_ROOT: ${{ github.workspace }}/baseline-source
+          PROMETA_RUNTIME_TOPOLOGY_REGISTRY_CONFIG: ${{ runner.temp }}/docker-config/config.json
+          PROMETA_RUNTIME_TOPOLOGY_REPORT: runtime-published-baseline.json
+          PROMETA_RUNTIME_TOPOLOGY_CLUSTER: runtime-published-upgrade
+          PROMETA_RUNTIME_KEEP_TOPOLOGY_CLUSTER: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          descriptor="$RUNNER_TEMP/baseline.json"
+          export PROMETA_RUNTIME_TOPOLOGY_IMAGE
+          export PROMETA_RUNTIME_TOPOLOGY_CHART
+          export PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256
+          export PROMETA_RUNTIME_TOPOLOGY_CHART_OCI_REFERENCE
+          export PROMETA_RUNTIME_TOPOLOGY_RELEASE_TAG
+          export PROMETA_RUNTIME_TOPOLOGY_RELEASE_REVISION
+          PROMETA_RUNTIME_TOPOLOGY_IMAGE=$(jq -r .runtimeImage "$descriptor")
+          PROMETA_RUNTIME_TOPOLOGY_CHART=$(jq -r .chartPackage "$descriptor")
+          PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256=$(jq -r .chartPackageSha256 "$descriptor")
+          PROMETA_RUNTIME_TOPOLOGY_CHART_OCI_REFERENCE=$(jq -r .chartOciReference "$descriptor")
+          PROMETA_RUNTIME_TOPOLOGY_RELEASE_TAG=$(jq -r .releaseTag "$descriptor")
+          PROMETA_RUNTIME_TOPOLOGY_RELEASE_REVISION=$(jq -r .releaseRevision "$descriptor")
+          release-control/deploy/reference-runtime/ci/topology-certification.sh
+
+      - name: Exercise published upgrade and forward rollback
+        env:
+          PROMETA_RUNTIME_PUBLISHED_UPGRADE_CLUSTER: runtime-published-upgrade
+          PROMETA_RUNTIME_PUBLISHED_BASELINE_DESCRIPTOR: ${{ runner.temp }}/baseline.json
+          PROMETA_RUNTIME_PUBLISHED_TARGET_DESCRIPTOR: ${{ runner.temp }}/target.json
+          PROMETA_RUNTIME_PUBLISHED_UPGRADE_REPORT: runtime-published-upgrade-rollback.json
+        shell: bash
+        run: >-
+          release-control/deploy/reference-runtime/ci/published-upgrade-rollback.sh
+
+      - name: Validate payload-free transition evidence
+        env:
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg baseline "$BASELINE_TAG" \
+            --arg target "$TARGET_TAG" \
+            '.passed == true and
+             .evidenceStatus == "reference-profile-not-production-certification" and
+             .proof == "published-runtime-upgrade-forward-rollback" and
+             [.artifactSequence[].releaseTag] == [$baseline, $target, $baseline] and
+             .publishedChartAndImageExecution == true and
+             .helmForwardRollback == true and
+             .targetImageMigrationHookPassed == true and
+             .baselineImageCompatibilityHookPassed == true and
+             .priorBundleDigestReused == true and
+             .freshRollbackPromotionIdentity == true and
+             .synchronousControlPlaneCalls == 0' \
+            runtime-published-upgrade-rollback.json >/dev/null
+          {
+            echo "### Published runtime upgrade and rollback passed"
+            echo "- Sequence: $BASELINE_TAG -> $TARGET_TAG -> $BASELINE_TAG"
+            echo "- Runtime: exact signed UBI image digests"
+            echo "- Deployment: exact signed Helm chart packages"
+            echo "- Scope: K3d reference evidence; not OpenShift production certification"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reference evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-published-upgrade-${{ inputs.baseline_tag }}-${{ inputs.target_tag }}
+          path: |
+            runtime-published-baseline.json
+            runtime-published-upgrade-rollback.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove the ephemeral cluster
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${K3D:-}" ] && [ -x "$K3D" ]; then
+            "$K3D" cluster delete runtime-published-upgrade >/dev/null 2>&1 || true
+          fi

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+from typing import Optional
 
 
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -30,9 +31,13 @@ def _replace_exact(
         path.write_text(updated, encoding="utf-8")
 
 
-def sync_runtime_release_version(root: Path, version: str) -> None:
+def sync_runtime_release_version(
+    root: Path, version: str, chart_version: Optional[str] = None
+) -> None:
     if not SEMVER.fullmatch(version):
         raise ValueError(f"version must be MAJOR.MINOR.PATCH: {version}")
+    if chart_version is not None and not SEMVER.fullmatch(chart_version):
+        raise ValueError(f"chart version must be MAJOR.MINOR.PATCH: {chart_version}")
 
     _replace_exact(
         root,
@@ -52,6 +57,13 @@ def sync_runtime_release_version(root: Path, version: str) -> None:
         r'^appVersion: "[0-9]+\.[0-9]+\.[0-9]+"$',
         f'appVersion: "{version}"',
     )
+    if chart_version is not None:
+        _replace_exact(
+            root,
+            "deploy/reference-runtime/chart/Chart.yaml",
+            r"^version: [0-9]+\.[0-9]+\.[0-9]+$",
+            f"version: {chart_version}",
+        )
 
     package_pattern = (
         r'"prometa-sdk\[runtime-host,runtime-mcp\]=='
@@ -81,18 +93,70 @@ def sync_runtime_release_version(root: Path, version: str) -> None:
         f"prometa-runtime-host:{version}",
         expected=2,
     )
+    for profile in (
+        "deploy/reference-runtime/topology-profiles.json",
+        "deploy/reference-runtime/topology-profiles.mcp.json",
+    ):
+        _replace_exact(
+            root,
+            profile,
+            r'^(\s*)"runtimeVersion": "[0-9]+\.[0-9]+\.[0-9]+",$',
+            rf'\1"runtimeVersion": "{version}",',
+        )
+        if chart_version is not None:
+            _replace_exact(
+                root,
+                profile,
+                r'^(\s*)"chartVersion": "[0-9]+\.[0-9]+\.[0-9]+",$',
+                rf'\1"chartVersion": "{chart_version}",',
+            )
+    for example in (
+        "deploy/reference-runtime/config.example.json",
+        "deploy/reference-runtime/config.mcp.example.json",
+        "deploy/reference-runtime/config.pull.example.json",
+    ):
+        _replace_exact(
+            root,
+            example,
+            r'^(\s*)"runtimeVersion": "[0-9]+\.[0-9]+\.[0-9]+",$',
+            rf'\1"runtimeVersion": "{version}",',
+        )
+    for values_file in (
+        "deploy/reference-runtime/chart/values.production.example.yaml",
+        "deploy/reference-runtime/chart/values.mcp.example.yaml",
+    ):
+        _replace_exact(
+            root,
+            values_file,
+            r'^(\s*)tag: "[0-9]+\.[0-9]+\.[0-9]+"$',
+            rf'\1tag: "{version}"',
+        )
+    _replace_exact(
+        root,
+        "examples/runtime_kernel_quickstart.py",
+        r'(add_argument\("--runtime-version", default=")'
+        r"[0-9]+\.[0-9]+\.[0-9]+"
+        r'("\))',
+        rf"\g<1>{version}\g<2>",
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("version", help="Release version in MAJOR.MINOR.PATCH form")
     parser.add_argument(
+        "--chart-version",
+        help="Independent Helm chart version in MAJOR.MINOR.PATCH form",
+    )
+    parser.add_argument(
         "--repository-root",
         type=Path,
         default=Path(__file__).resolve().parent.parent,
     )
     args = parser.parse_args()
-    sync_runtime_release_version(args.repository_root.resolve(), args.version)
+    sync_runtime_release_version(
+        args.repository_root.resolve(), args.version, args.chart_version
+    )
     return 0
 
 

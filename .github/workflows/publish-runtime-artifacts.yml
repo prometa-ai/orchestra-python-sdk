@@ -98,6 +98,35 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Wait for the exact SDK package on PyPI
+        env:
+          RELEASE_TAG: ${{ inputs.source_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RELEASE_TAG" <<'PY'
+          import json
+          import sys
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import urlopen
+
+          version = sys.argv[1].removeprefix("v")
+          url = "https://pypi.org/pypi/prometa-sdk/%s/json" % version
+          deadline = time.monotonic() + 600
+          while time.monotonic() < deadline:
+              try:
+                  with urlopen(url, timeout=10) as response:
+                      document = json.load(response)
+                  if document.get("info", {}).get("version") == version:
+                      print("Exact PyPI package is available: %s" % version)
+                      raise SystemExit(0)
+              except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+                  pass
+              time.sleep(10)
+          raise SystemExit("exact PyPI package was unavailable after 10 minutes")
+          PY
+
       - name: Install conformance runner from exact source
         run: pip install "./source[dev,runtime-host]"
 

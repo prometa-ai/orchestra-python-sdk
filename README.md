@@ -245,7 +245,10 @@ resumable HITL checkpoints, memory, compression, A2A, rollout automation,
 write/destructive MCP topology evidence, or managed-CNI/database proof. Pinned
 two-node K3s/kube-router reference profiles supply narrower model-only and
 read-only MCP multi-tenant isolation, load, database-partition,
-duplicate-claim, pod-replacement, and credential-rotation evidence.
+duplicate-claim, pod-replacement, and credential-rotation evidence. Both
+profiles now activate signed bundle schema/runtime contract v2, including
+exact capability ranges and independently verified policy/configuration
+digests; the live-platform mode requires those same digests on every receipt.
 
 The human-review protocol receives request or tool context only inside the
 tenant process. The default evidence adapter never copies that payload into
@@ -580,7 +583,7 @@ contracts.
 The non-root container, Compose example, tenant-owned Helm chart, logical
 backup/restore assets, strict configuration shape, and operator commands live in
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
-Chart `0.3.0` runs the target image's compatibility check after migration and
+Chart `0.3.1` runs the target image's compatibility check after migration and
 before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
 tenant-selected immutable config revisions explicit. The CI drill uses a real
 schema-v2 source baseline, upgrades to schema v6 and bundle B, then starts the
@@ -588,8 +591,10 @@ baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
 published-version certification claim. Separate pinned K3s/kube-router
 profiles now prove the chart's model-only and read-only MCP paths in one
-two-node, two-tenant reference topology; they do not generalize to OpenShift,
-managed CNIs/databases, write/destructive MCP, or production.
+two-node, two-tenant reference topology. The current v2 profiles admit runtime
+contract v2 releases and bind capability ranges plus policy/configuration
+digests into emitted evidence; they do not generalize to OpenShift, managed
+CNIs/databases, write/destructive MCP, or production.
 
 #### Runtime conformance
 
@@ -672,11 +677,13 @@ runtime can implement `RuntimeConformanceDriver` and select a factory with
 not certification by the Prometa control plane. The separate
 `deploy/reference-runtime/ci/topology-certification.sh` profiles add retained
 K3s kube-router evidence for two-tenant isolation, load, a database-egress
-partition, and pod replacement. The explicit read-only MCP profile additionally
+partition, pod replacement, and live contract-v2 admission. The explicit
+read-only MCP profile additionally
 proves signed tool binding, exact tools-plane policy, cross-replica call
 admission, payload-free audit, and fail-closed credential rotation. The
 model-only profile's opt-in live-platform mode also verifies asynchronous
-lifecycle receipts and the release-scoped Orchestra projection;
+lifecycle receipts, exact policy/configuration digest binding, and the
+release-scoped Orchestra projection;
 see [`deploy/reference-runtime/README.md`](deploy/reference-runtime/README.md#optional-live-orchestra-receipt-proof).
 Production acceptance still requires the same
 proof against the tenant's actual CNI, ingress, database, storage, and recovery

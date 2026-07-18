@@ -19,10 +19,32 @@ from urllib.request import Request, urlopen
 
 
 TENANTS = ("a", "b")
+RUNTIME_BUNDLE_SCHEMA_VERSION = 2
+RUNTIME_CONTRACT_VERSION = 2
 PROFILE_WORKLOADS = {
-    "k3d-k3s-kube-router-v1": "model-only",
-    "k3d-k3s-kube-router-mcp-v1": "mcp-read-only",
+    "k3d-k3s-kube-router-v2": "model-only",
+    "k3d-k3s-kube-router-mcp-v2": "mcp-read-only",
 }
+_TOOL_POLICY_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "sideEffects",
+    "riskLevel",
+    "authBinding",
+    "scopes",
+    "approvalRequired",
+    "requiredGuardrails",
+)
+_TOOL_CONFIGURATION_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "inputSchema",
+    "rateLimitPerMin",
+)
 
 
 def _canonical(value: Any) -> str:
@@ -39,6 +61,64 @@ def _instant(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _selected(value: Mapping[str, Any], keys: Sequence[str]) -> Dict[str, Any]:
+    return {key: value[key] for key in keys if key in value}
+
+
+def _capability_requirement(capability: str) -> Mapping[str, Any]:
+    name, separator, raw_version = capability.rpartition(".v")
+    if not separator or not name or not raw_version.isdigit() or raw_version == "0":
+        raise ValueError("runtime_capability_invalid")
+    version = int(raw_version)
+    return {"name": name, "minVersion": version, "maxVersion": version}
+
+
+def _runtime_projection_digests(
+    content: Mapping[str, Any], input_schema: Any, output_schema: Any
+) -> Tuple[str, str]:
+    tools = content.get("tools")
+    if not isinstance(tools, list) or any(
+        not isinstance(value, Mapping) for value in tools
+    ):
+        raise ValueError("runtime_projection_invalid")
+    policy_digest = _digest(
+        {
+            "guardrails": content.get("guardrails", []),
+            "identity": content.get("identity"),
+            "tools": [_selected(value, _TOOL_POLICY_KEYS) for value in tools],
+            "requiredScopes": content.get("requiredScopes", []),
+            "grantedScopes": content.get("grantedScopes", []),
+        }
+    )
+    configuration_digest = _digest(
+        {
+            "manifest": content.get("manifest"),
+            "systemPrompt": content.get("systemPrompt"),
+            "models": content.get("models"),
+            "primaryModel": content.get("primaryModel"),
+            "topology": content.get("topology"),
+            "tools": [
+                _selected(value, _TOOL_CONFIGURATION_KEYS) for value in tools
+            ],
+            "skills": content.get("skills", []),
+            "knowledge": content.get("knowledge", []),
+            "memory": content.get("memory", []),
+            "subAgents": content.get("subAgents", []),
+            "workflows": content.get("workflows", []),
+            "triggers": content.get("triggers", []),
+            "evaluation": content.get("evaluation", []),
+            "inputSchema": input_schema,
+            "outputSchema": output_schema,
+            "mcpServers": content.get("mcpServers", []),
+        }
+    )
+    return policy_digest, configuration_digest
 
 
 def _read_json(path: Path) -> Any:
@@ -151,8 +231,22 @@ def _runtime_content(tenant: str, workload: str) -> Mapping[str, Any]:
     ]
     if mcp_enabled:
         required_capabilities.append("tool.broker.v1")
-    return {
-        "schemaVersion": 1,
+    input_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"question": {"type": "string", "minLength": 1}},
+        "required": ["question"],
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"answer": {"type": "string", "minLength": 1}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    content: Dict[str, Any] = {
+        "schemaVersion": RUNTIME_BUNDLE_SCHEMA_VERSION,
         "manifest": {
             "id": "manifest-topology-%s" % tenant,
             "name": "Topology Tenant %s" % tenant.upper(),
@@ -192,27 +286,23 @@ def _runtime_content(tenant: str, workload: str) -> Mapping[str, Any]:
             "maturity": 80,
             "productivity": 60,
         },
-        "runtimeContract": {
-            "contractVersion": 1,
-            "requiredCapabilities": required_capabilities,
-            "inputSchema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "minLength": 1}
-                },
-                "required": ["question"],
-                "additionalProperties": False,
-            },
-            "outputSchema": {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "properties": {"answer": {"type": "string", "minLength": 1}},
-                "required": ["answer"],
-                "additionalProperties": False,
-            },
-        },
     }
+    policy_digest, configuration_digest = _runtime_projection_digests(
+        content, input_schema, output_schema
+    )
+    content["runtimeContract"] = {
+        "contractVersion": RUNTIME_CONTRACT_VERSION,
+        "requiredCapabilities": required_capabilities,
+        "capabilityRequirements": [
+            _capability_requirement(value) for value in required_capabilities
+        ],
+        "inputSchema": input_schema,
+        "outputSchema": output_schema,
+        "policyDigest": policy_digest,
+        "configurationDigest": configuration_digest,
+        "secretReferences": [],
+    }
+    return content
 
 
 def _signed_release(
@@ -867,7 +957,7 @@ def _chart_values(
     replicas: int,
     receipt_endpoint_cidr: Optional[str] = None,
     workload: str = "model-only",
-    profile_name: str = "k3d-k3s-kube-router-v1",
+    profile_name: str = "k3d-k3s-kube-router-v2",
 ) -> Mapping[str, Any]:
     repository, tag = runtime_image.rsplit(":", 1)
     runtime_namespace = "runtime-%s" % tenant
@@ -1415,6 +1505,55 @@ def _strict_json_bytes(payload: bytes) -> Any:
         raise ValueError("platform_receipt_response_invalid") from None
 
 
+def _runtime_contract_digests(bundle: Any) -> Tuple[str, str]:
+    if not isinstance(bundle, Mapping) or not isinstance(
+        bundle.get("signedPayload"), str
+    ):
+        raise ValueError("platform_receipt_runtime_contract_invalid")
+    try:
+        claims = json.loads(str(bundle["signedPayload"]))
+        content_canonical = claims.get("contentCanonical")
+        content = json.loads(content_canonical)
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        raise ValueError("platform_receipt_runtime_contract_invalid") from None
+    contract = (
+        content.get("runtimeContract") if isinstance(content, Mapping) else None
+    )
+    artifact_digest = (
+        "sha256:"
+        + hashlib.sha256(str(content_canonical).encode("utf-8")).hexdigest()
+    )
+    if (
+        not isinstance(content, Mapping)
+        or content_canonical != _canonical(content)
+        or content != bundle.get("content")
+        or not isinstance(claims, Mapping)
+        or claims.get("artifactDigest") != artifact_digest
+        or bundle.get("artifactDigest") != artifact_digest
+        or content.get("schemaVersion") != RUNTIME_BUNDLE_SCHEMA_VERSION
+        or not isinstance(contract, Mapping)
+        or contract.get("contractVersion") != RUNTIME_CONTRACT_VERSION
+        or not isinstance(contract.get("capabilityRequirements"), list)
+        or not isinstance(contract.get("secretReferences"), list)
+    ):
+        raise ValueError("platform_receipt_runtime_contract_invalid")
+    digests = (contract.get("policyDigest"), contract.get("configurationDigest"))
+    for value in digests:
+        if (
+            not isinstance(value, str)
+            or len(value) != 71
+            or not value.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in value[7:])
+        ):
+            raise ValueError("platform_receipt_runtime_contract_invalid")
+    expected = _runtime_projection_digests(
+        content, contract.get("inputSchema"), contract.get("outputSchema")
+    )
+    if digests != expected:
+        raise ValueError("platform_receipt_runtime_contract_invalid")
+    return str(digests[0]), str(digests[1])
+
+
 def _receipt_fixture(path: Path) -> Tuple[Mapping[str, Any], ...]:
     document = _read_json(path)
     tenants = document.get("tenants") if isinstance(document, Mapping) else None
@@ -1455,6 +1594,7 @@ def _receipt_fixture(path: Path) -> Tuple[Mapping[str, Any], ...]:
             or bundle.get("artifactDigest") != authorization.get("artifactDigest")
         ):
             raise ValueError("platform_receipt_fixture_invalid")
+        _runtime_contract_digests(bundle)
         result.append(tenant)
     return tuple(result)
 
@@ -1506,6 +1646,7 @@ def _validate_platform_projection(document: Any, tenant: Mapping[str, Any]) -> N
         raise ValueError("platform_receipt_projection_pending")
     authorization = tenant["promotionAttestation"]["authorization"]
     attestation_id = tenant["promotionAttestation"].get("attestationId")
+    policy_digest, configuration_digest = _runtime_contract_digests(tenant["bundle"])
     transitions = set()
     for receipt in receipts:
         payload = receipt.get("payload") if isinstance(receipt, Mapping) else None
@@ -1518,6 +1659,8 @@ def _validate_platform_projection(document: Any, tenant: Mapping[str, Any]) -> N
             or payload.get("runtimeId") != tenant["runtimeId"]
             or payload.get("runtimeVersion") != tenant["runtimeVersion"]
             or payload.get("runtimeTarget") != "tenant-runtime"
+            or payload.get("policyDigest") != policy_digest
+            or payload.get("configurationDigest") != configuration_digest
         ):
             raise ValueError("platform_receipt_projection_invalid")
         transitions.add(payload.get("transition"))
@@ -1642,8 +1785,11 @@ def verify_platform_receipts(
         {
             "contractVersion": 1,
             "mode": "live-platform",
+            "runtimeContractVersion": RUNTIME_CONTRACT_VERSION,
             "runtimeReceiptsPerTenant": 2,
             "asynchronousReceiptDelivery": True,
+            "policyConfigurationDigestBinding": True,
+            "platformProjectionDigestBinding": True,
             "platformBindingValidation": True,
             "platformProjectionVisible": True,
             "receiptReadTenantIsolation": True,
@@ -1691,6 +1837,11 @@ def write_report(
         "networkPolicyController": profile["networkPolicyController"],
         "runtimeVersion": profile["runtimeVersion"],
         "chartVersion": profile["chartVersion"],
+        "bundleSchemaVersion": RUNTIME_BUNDLE_SCHEMA_VERSION,
+        "runtimeContractVersion": RUNTIME_CONTRACT_VERSION,
+        "capabilityRangeAdmission": True,
+        "policyConfigurationDigestBinding": True,
+        "typedSecretReferenceFieldPresent": True,
         "tenantCount": profile["tenantCount"],
         "runtimeReplicasPerTenant": expected_replicas,
         "runtimeNodesPerTenant": expected_replicas,
@@ -1742,8 +1893,11 @@ def write_report(
         expected = {
             "contractVersion": 1,
             "mode": "live-platform",
+            "runtimeContractVersion": RUNTIME_CONTRACT_VERSION,
             "runtimeReceiptsPerTenant": 2,
             "asynchronousReceiptDelivery": True,
+            "policyConfigurationDigestBinding": True,
+            "platformProjectionDigestBinding": True,
             "platformBindingValidation": True,
             "platformProjectionVisible": True,
             "receiptReadTenantIsolation": True,
@@ -1761,6 +1915,7 @@ def write_report(
                 "runtimeReceiptsPerTenant": 2,
                 "receiptOutboxDeliveredPerTenant": 2,
                 "asynchronousReceiptDelivery": True,
+                "platformProjectionDigestBinding": True,
                 "platformBindingValidation": True,
                 "platformProjectionVisible": True,
                 "receiptReadTenantIsolation": True,

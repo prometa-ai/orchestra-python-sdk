@@ -103,6 +103,9 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "controlPlanePull" not in harness_text
     assert "PROMETA_RUNTIME_TOPOLOGY_RECEIPT_PROOF" in harness_text
     assert "PROMETA_RUNTIME_TOPOLOGY_PROFILE" in harness_text
+    assert "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE" in harness_text
+    assert "PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256" in harness_text
+    assert "--artifact-mode published-release" in harness_text
     assert "mcp_tool_call_indeterminate" in harness_text
     assert "runtime-mcp-credentials" in harness_text
     assert "verify-platform-receipts" in harness_text
@@ -353,6 +356,38 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
             "prometa-runtime-host:topology-test",
             "0.19.0",
         )
+
+
+def test_topology_fixture_pins_published_runtime_image_by_digest(tmp_path):
+    pytest.importorskip("cryptography")
+    fixture = _load_module("topology_fixture_published_image", FIXTURE_PATH)
+    output = tmp_path / "fixture"
+    digest = "sha256:" + "a" * 64
+    image = "ghcr.io/prometa-ai/orchestra-python-sdk/runtime@" + digest
+
+    fixture.prepare(PROFILE, output, PROBE_PATH, image, "0.18.0")
+
+    values = json.loads((output / "tenant-a-values.json").read_text())
+    assert values["image"] == {
+        "repository": "ghcr.io/prometa-ai/orchestra-python-sdk/runtime",
+        "digest": digest,
+        "pullPolicy": "Never",
+    }
+    assert "tag" not in values["image"]
+
+    for invalid in (
+        "runtime-without-tag",
+        "runtime@sha256:short",
+        "runtime:tag@sha256:" + "b" * 64 + "@sha256:" + "c" * 64,
+    ):
+        with pytest.raises(ValueError, match="runtime_image_invalid"):
+            fixture.prepare(
+                PROFILE,
+                tmp_path / ("invalid-" + str(len(invalid))),
+                PROBE_PATH,
+                invalid,
+                "0.18.0",
+            )
 
 
 def test_topology_fixture_builds_read_only_mcp_tenants_with_separate_secrets(
@@ -755,6 +790,7 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
     )
     assert evidence["runtimeVersion"] == "0.18.0"
     assert evidence["chartVersion"] == "0.3.1"
+    assert evidence["artifactSource"] == {"mode": "source-build"}
     assert evidence["bundleSchemaVersion"] == 2
     assert evidence["runtimeContractVersion"] == 2
     assert evidence["capabilityRangeAdmission"] is True
@@ -786,6 +822,57 @@ def test_topology_log_and_report_evidence_is_payload_free(tmp_path):
         '"signature"',
     ):
         assert forbidden not in lowered
+
+
+def test_topology_report_binds_published_release_artifacts(tmp_path):
+    fixture = _load_module("topology_fixture_published_report", FIXTURE_PATH)
+    report = tmp_path / "published-report.json"
+    runtime_digest = "sha256:" + "a" * 64
+    chart_package_digest = "sha256:" + "b" * 64
+    chart_oci_digest = "sha256:" + "c" * 64
+
+    fixture.write_report(
+        PROFILE,
+        report,
+        "v1.34.8+k3s1",
+        1,
+        1,
+        2,
+        2,
+        artifact_mode="published-release",
+        runtime_image_reference="ghcr.io/prometa/runtime@" + runtime_digest,
+        chart_artifact_sha256=chart_package_digest,
+        chart_oci_reference="ghcr.io/prometa/charts/runtime@" + chart_oci_digest,
+        release_tag="v0.18.0",
+        release_revision="d" * 40,
+    )
+
+    evidence = json.loads(report.read_text())
+    assert evidence["artifactSource"] == {
+        "mode": "published-release",
+        "releaseTag": "v0.18.0",
+        "releaseRevision": "d" * 40,
+        "runtimeImage": "ghcr.io/prometa/runtime@" + runtime_digest,
+        "chartPackageSha256": chart_package_digest,
+        "chartOciReference": "ghcr.io/prometa/charts/runtime@" + chart_oci_digest,
+    }
+
+    with pytest.raises(ValueError, match="topology_artifact_evidence_invalid"):
+        fixture.write_report(
+            PROFILE,
+            tmp_path / "invalid-published-report.json",
+            "v1.34.8+k3s1",
+            1,
+            1,
+            2,
+            2,
+            artifact_mode="published-release",
+            runtime_image_reference="ghcr.io/prometa/runtime:mutable",
+            chart_artifact_sha256=chart_package_digest,
+            chart_oci_reference="ghcr.io/prometa/charts/runtime@" + chart_oci_digest,
+            release_tag="v0.18.0",
+            release_revision="d" * 40,
+        )
 
 
 def test_topology_report_includes_only_validated_live_receipt_evidence(tmp_path):

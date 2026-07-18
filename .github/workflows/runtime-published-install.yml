@@ -1,0 +1,217 @@
+name: Verify published runtime install
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Exact immutable SDK release tag to install
+        required: true
+        default: v0.18.0
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: runtime-published-install-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+jobs:
+  published-install:
+    name: published UBI image and chart on K3d
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out release verification controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-control
+
+      - name: Check out exact release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+          path: source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.8
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download exact GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-release"
+          mkdir -p "$directory"
+          gh release download "$SOURCE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$directory" \
+            --pattern release-prometa-runtime-host-ubi9.json \
+            --pattern release-chart.json \
+            --pattern 'prometa-runtime-*.tgz'
+          gh release view "$SOURCE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets >"$directory/github-release.json"
+
+      - name: Bind release metadata, source, and downloaded bytes
+        id: release
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-release"
+          source_sha=$(git -C source rev-parse HEAD)
+          actual_tag=$(git -C source describe --tags --exact-match HEAD)
+          test "$actual_tag" = "$SOURCE_TAG"
+
+          image_metadata="$directory/release-prometa-runtime-host-ubi9.json"
+          chart_metadata="$directory/release-chart.json"
+          jq -e --arg tag "$SOURCE_TAG" --arg revision "$source_sha" \
+            '.schemaVersion == 1 and .tag == $tag and .revision == $revision and
+             .variant == "ubi9" and (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$image_metadata" >/dev/null
+          jq -e --arg tag "$SOURCE_TAG" --arg revision "$source_sha" \
+            '.schemaVersion == 1 and .releaseTag == $tag and .revision == $revision and
+             (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$chart_metadata" >/dev/null
+
+          chart_version=$(jq -r .chartVersion "$chart_metadata")
+          chart_package="$directory/prometa-runtime-$chart_version.tgz"
+          test -f "$chart_package"
+          for path in "$image_metadata" "$chart_metadata" "$chart_package"; do
+            name=$(basename "$path")
+            expected=$(jq -r --arg name "$name" \
+              '.assets[] | select(.name == $name) | .digest' \
+              "$directory/github-release.json")
+            test "$expected" != null
+            test "$expected" != ""
+            actual="sha256:$(sha256sum "$path" | awk '{print $1}')"
+            test "$actual" = "$expected"
+          done
+
+          image_ref="$(jq -r .image "$image_metadata")@$(jq -r .digest "$image_metadata")"
+          chart_ref="$(jq -r .repository "$chart_metadata")@$(jq -r .digest "$chart_metadata")"
+          chart_sha256="sha256:$(sha256sum "$chart_package" | awk '{print $1}')"
+          {
+            echo "source_sha=$source_sha"
+            echo "image_ref=$image_ref"
+            echo "chart_ref=$chart_ref"
+            echo "chart_package=$chart_package"
+            echo "chart_sha256=$chart_sha256"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify signatures and consumed chart contract
+        env:
+          RUNTIME_IMAGE: ${{ steps.release.outputs.image_ref }}
+          CHART_REFERENCE: ${{ steps.release.outputs.chart_ref }}
+          CHART_PACKAGE: ${{ steps.release.outputs.chart_package }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/publish-runtime-artifacts.yml@refs/.*"
+          issuer=https://token.actions.githubusercontent.com
+          for ref in "$RUNTIME_IMAGE" "$CHART_REFERENCE"; do
+            cosign verify \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$ref" >/dev/null
+            cosign verify-attestation \
+              --type cyclonedx \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$ref" >/dev/null
+          done
+          test "$(helm show chart "$CHART_PACKAGE" | awk '$1 == "version:" {print $2; exit}')" = \
+            "$(jq -r .chartVersion "$RUNNER_TEMP/runtime-release/release-chart.json")"
+          test "$(helm show chart "$CHART_PACKAGE" | awk '$1 == "appVersion:" {gsub(/\"/, "", $2); print $2; exit}')" = \
+            "$(jq -r .appVersion "$RUNNER_TEMP/runtime-release/release-chart.json")"
+
+      - name: Install exact runtime package and checksum-verified K3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install './source[dev,runtime-host]'
+          release-control/deploy/reference-runtime/ci/install-k3d.sh "$RUNNER_TEMP/k3d"
+          echo "K3D=$RUNNER_TEMP/k3d" >>"$GITHUB_ENV"
+
+      - name: Exercise the published image and chart in the reference topology
+        env:
+          PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE: published
+          PROMETA_RUNTIME_TOPOLOGY_SOURCE_ROOT: ${{ github.workspace }}/source
+          PROMETA_RUNTIME_TOPOLOGY_IMAGE: ${{ steps.release.outputs.image_ref }}
+          PROMETA_RUNTIME_TOPOLOGY_CHART: ${{ steps.release.outputs.chart_package }}
+          PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256: ${{ steps.release.outputs.chart_sha256 }}
+          PROMETA_RUNTIME_TOPOLOGY_CHART_OCI_REFERENCE: ${{ steps.release.outputs.chart_ref }}
+          PROMETA_RUNTIME_TOPOLOGY_RELEASE_TAG: ${{ inputs.source_tag }}
+          PROMETA_RUNTIME_TOPOLOGY_RELEASE_REVISION: ${{ steps.release.outputs.source_sha }}
+          PROMETA_RUNTIME_TOPOLOGY_REPORT: runtime-published-install.json
+          PROMETA_RUNTIME_TOPOLOGY_CLUSTER: runtime-published-install
+        shell: bash
+        run: release-control/deploy/reference-runtime/ci/topology-certification.sh
+
+      - name: Validate payload-free published-install evidence
+        env:
+          RUNTIME_IMAGE: ${{ steps.release.outputs.image_ref }}
+          CHART_REFERENCE: ${{ steps.release.outputs.chart_ref }}
+          CHART_SHA256: ${{ steps.release.outputs.chart_sha256 }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg image "$RUNTIME_IMAGE" \
+            --arg chart "$CHART_REFERENCE" \
+            --arg chart_sha "$CHART_SHA256" \
+            --arg tag "$SOURCE_TAG" \
+            --arg revision "$SOURCE_SHA" \
+            '.passed == true and
+             .evidenceStatus == "reference-profile-not-production-certification" and
+             .artifactSource == {
+               mode: "published-release",
+               releaseTag: $tag,
+               releaseRevision: $revision,
+               runtimeImage: $image,
+               chartPackageSha256: $chart_sha,
+               chartOciReference: $chart
+             }' runtime-published-install.json >/dev/null
+          {
+            echo "### Published runtime install passed"
+            echo "- Release: $SOURCE_TAG ($SOURCE_SHA)"
+            echo "- Runtime: $RUNTIME_IMAGE"
+            echo "- Chart: $CHART_REFERENCE"
+            echo "- Scope: K3d reference evidence; not OpenShift production certification"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-published-install-${{ inputs.source_tag }}
+          path: runtime-published-install.json
+          if-no-files-found: error
+          retention-days: 30

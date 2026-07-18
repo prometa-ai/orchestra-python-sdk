@@ -419,6 +419,35 @@ then normalizes it to a single-platform local image so Docker Desktop and Linux
 runners import the same OCI content into every K3s node. It verifies both
 imported images on every node before applying any workload.
 
+### Published-artifact install proof
+
+The manual `Verify published runtime install` workflow closes a separate proof
+gap: it exercises the immutable UBI image and packaged chart downloaded from an
+exact GitHub release instead of rebuilding either artifact from the checkout.
+For the selected tag it:
+
+- checks out the exact tagged source and requires an exact tag match;
+- verifies GitHub release asset SHA-256 digests and their embedded source
+  revision;
+- verifies the consumed image and chart signatures plus CycloneDX attestations;
+- installs the chart package using the runtime image's immutable digest; and
+- runs the model-only K3d topology, recording the tag, source revision, runtime
+  digest, chart OCI digest, and chart-package SHA-256 in payload-free evidence.
+
+Dispatch it with an exact release tag:
+
+```bash
+gh workflow run runtime-published-install.yml \
+  --repo prometa-ai/orchestra-python-sdk \
+  --ref main \
+  -f source_tag=v0.18.0
+```
+
+This is release-channel installation and K3d behavioral evidence. It remains
+`reference-profile-not-production-certification`: it does not prove OpenShift,
+customer registry mirroring, managed dependencies, upgrade/rollback between two
+separately published compatible releases, fault recovery, RPO/RTO, or soak.
+
 ### Read-only MCP profile
 
 [`topology-profiles.mcp.json`](topology-profiles.mcp.json) adds a distinct

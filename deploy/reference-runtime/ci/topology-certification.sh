@@ -2,17 +2,23 @@
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+source_root=${PROMETA_RUNTIME_TOPOLOGY_SOURCE_ROOT:-$root}
 python_command=${PYTHON:-python}
 kubectl_command=${KUBECTL:-kubectl}
 helm_command=${HELM:-helm}
 k3d_command=${K3D:-k3d}
-profile=${PROMETA_RUNTIME_TOPOLOGY_PROFILE:-"$root/deploy/reference-runtime/topology-profiles.json"}
+profile=${PROMETA_RUNTIME_TOPOLOGY_PROFILE:-"$source_root/deploy/reference-runtime/topology-profiles.json"}
 fixture="$root/deploy/reference-runtime/ci/topology_fixture.py"
-probe_source="$root/deploy/reference-runtime/ci/topology_probe.py"
-mcp_server_source="$root/deploy/reference-runtime/ci/topology_mcp_server.py"
+probe_source="$source_root/deploy/reference-runtime/ci/topology_probe.py"
+mcp_server_source="$source_root/deploy/reference-runtime/ci/topology_mcp_server.py"
 image_importer="$root/deploy/reference-runtime/ci/verified-k3d-image-import.sh"
-chart="$root/deploy/reference-runtime/chart"
+chart=${PROMETA_RUNTIME_TOPOLOGY_CHART:-"$source_root/deploy/reference-runtime/chart"}
 runtime_image=${PROMETA_RUNTIME_TOPOLOGY_IMAGE:-prometa-runtime-host:topology-cert}
+artifact_mode=${PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE:-source}
+release_tag=${PROMETA_RUNTIME_TOPOLOGY_RELEASE_TAG:-}
+release_revision=${PROMETA_RUNTIME_TOPOLOGY_RELEASE_REVISION:-}
+chart_sha256=${PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256:-}
+chart_oci_reference=${PROMETA_RUNTIME_TOPOLOGY_CHART_OCI_REFERENCE:-}
 cluster=${PROMETA_RUNTIME_TOPOLOGY_CLUSTER:-prometa-runtime-topology}
 report=${PROMETA_RUNTIME_TOPOLOGY_REPORT:-"$root/runtime-topology-certification.json"}
 keep_cluster=${PROMETA_RUNTIME_KEEP_TOPOLOGY_CLUSTER:-false}
@@ -248,6 +254,78 @@ for required in docker "$python_command" "$kubectl_command" "$helm_command" \
   require_command "$required"
 done
 
+if [ ! -f "$profile" ] || [ ! -f "$probe_source" ] || [ ! -f "$mcp_server_source" ]; then
+  echo "Topology source assets are incomplete under $source_root." >&2
+  exit 2
+fi
+if [ ! -e "$chart" ]; then
+  echo "Runtime chart is unavailable: $chart" >&2
+  exit 2
+fi
+
+artifact_report_args=(--artifact-mode source-build)
+case "$artifact_mode" in
+  source)
+    if [ ! -f "$source_root/deploy/reference-runtime/Dockerfile" ]; then
+      echo "Runtime source Dockerfile is unavailable under $source_root." >&2
+      exit 2
+    fi
+    ;;
+  published)
+    if [ ! -f "$chart" ]; then
+      echo "Published topology mode requires a packaged chart file." >&2
+      exit 2
+    fi
+    "$python_command" - \
+      "$runtime_image" "$release_tag" "$release_revision" \
+      "$chart_sha256" "$chart_oci_reference" <<'PY'
+import re
+import sys
+
+image, tag, revision, chart_sha256, chart_oci = sys.argv[1:]
+digest = r"sha256:[0-9a-f]{64}"
+if not re.fullmatch(r"[^\s@]+@" + digest, image):
+    raise SystemExit("published runtime image must be an immutable digest reference")
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9_.-]+)?", tag):
+    raise SystemExit("published release tag is invalid")
+if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
+    raise SystemExit("published release revision is invalid")
+if not re.fullmatch(digest, chart_sha256):
+    raise SystemExit("published chart package SHA-256 is invalid")
+if not re.fullmatch(r"[^\s@]+@" + digest, chart_oci):
+    raise SystemExit("published chart OCI reference is invalid")
+PY
+    actual_chart_sha256=$(
+      "$python_command" - "$chart" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+digest = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
+print("sha256:" + digest)
+PY
+    )
+    if [ "$actual_chart_sha256" != "$chart_sha256" ]; then
+      echo "Published chart package digest mismatch." >&2
+      exit 2
+    fi
+    runtime_digest=${runtime_image##*@}
+    verify_image_digest "$runtime_image" "$runtime_digest"
+    artifact_report_args=(
+      --artifact-mode published-release
+      --runtime-image-reference "$runtime_image"
+      --chart-artifact-sha256 "$chart_sha256"
+      --chart-oci-reference "$chart_oci_reference"
+      --release-tag "$release_tag"
+      --release-revision "$release_revision"
+    )
+    ;;
+  *)
+    echo "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE must be source or published." >&2
+    exit 2
+    ;;
+esac
+
 case "$receipt_proof" in
   false) ;;
   true)
@@ -328,9 +406,11 @@ fi
 verify_image_digest "$k3s_image" "$k3s_digest"
 verify_image_digest "$postgres_image" "$postgres_digest"
 
-docker build --provenance=false --load \
-  -f "$root/deploy/reference-runtime/Dockerfile" \
-  -t "$runtime_image" "$root"
+if [ "$artifact_mode" = source ]; then
+  docker build --provenance=false --load \
+    -f "$source_root/deploy/reference-runtime/Dockerfile" \
+    -t "$runtime_image" "$source_root"
+fi
 printf 'FROM %s@%s\n' "$postgres_image" "$postgres_digest" | \
   docker build --provenance=false --load -t "$postgres_node_image" -
 
@@ -708,6 +788,7 @@ report_args=(
   --activation-count-b "$activation_b"
   --node-count-a "$node_count_a"
   --node-count-b "$node_count_b"
+  "${artifact_report_args[@]}"
 )
 if [ "$receipt_proof" = true ]; then
   "$python_command" "$fixture" verify-platform-receipts \

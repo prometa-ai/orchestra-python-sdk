@@ -203,14 +203,14 @@ def prepare_sequence(
     target_version: str,
     replicas: int = 2,
 ) -> None:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
     if (
         _version_tuple(target_version) <= _version_tuple(baseline_version)
         or type(replicas) is not int
         or replicas < 2
     ):
         raise ValueError("published_upgrade_sequence_invalid")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir.chmod(0o700)
     now = datetime.now(timezone.utc).replace(microsecond=0)

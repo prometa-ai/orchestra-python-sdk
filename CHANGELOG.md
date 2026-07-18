@@ -16,6 +16,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A release-contract verifier that binds the SDK package, runtime package,
   container installation, chart application version, and immutable source tag
   before any runtime artifact is pushed.
+- A verification-only retry path that reuses immutable metadata from a prior
+  publication run, checks its requested tag binding, and re-verifies signatures,
+  attestations, AMD64 manifests, and chart pullability without rebuilding or
+  retagging artifacts.
 - Runtime contract v2 admission with exact capability-version ranges,
   independently recomputed policy/configuration digests, and typed logical
   secret references that never carry credential values.

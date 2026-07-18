@@ -21,8 +21,14 @@ on:
         required: false
         default: ""
         type: string
+      verify_run_id:
+        description: "Verify artifacts from this prior publication run without republishing"
+        required: false
+        default: ""
+        type: string
 
 permissions:
+  actions: read
   attestations: write
   contents: read
   id-token: write
@@ -39,6 +45,7 @@ env:
 jobs:
   verify:
     name: verify ${{ matrix.image }}
+    if: ${{ inputs.verify_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -157,6 +164,7 @@ jobs:
   publish:
     name: publish ${{ matrix.image }}
     needs: verify
+    if: ${{ inputs.verify_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -328,6 +336,7 @@ jobs:
   publish-chart:
     name: publish Helm chart
     needs: [verify, publish]
+    if: ${{ inputs.verify_run_id == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -543,18 +552,52 @@ jobs:
   verify-published:
     name: verify signed artifact set
     needs: [publish, publish-chart]
+    if: >-
+      ${{
+        always() &&
+        (
+          (inputs.verify_run_id == '' && needs.publish.result == 'success' && needs.publish-chart.result == 'success') ||
+          (inputs.verify_run_id != '' && needs.publish.result == 'skipped' && needs.publish-chart.result == 'skipped')
+        )
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download image evidence from this publication run
+        if: ${{ inputs.verify_run_id == '' }}
+        uses: actions/download-artifact@v4
         with:
           pattern: runtime-image-prometa-runtime-host-*
           path: ${{ runner.temp }}/runtime-release
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - name: Download chart evidence from this publication run
+        if: ${{ inputs.verify_run_id == '' }}
+        uses: actions/download-artifact@v4
         with:
+          pattern: runtime-chart-prometa-runtime-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Download image evidence from the prior publication run
+        if: ${{ inputs.verify_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.verify_run_id }}
+          pattern: runtime-image-prometa-runtime-host-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Download chart evidence from the prior publication run
+        if: ${{ inputs.verify_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.verify_run_id }}
           pattern: runtime-chart-prometa-runtime-*
           path: ${{ runner.temp }}/runtime-release
           merge-multiple: true
@@ -595,10 +638,14 @@ jobs:
         run: |
           set -euo pipefail
           directory="$RUNNER_TEMP/runtime-release"
+          expected_tag="${{ inputs.source_tag || github.ref_name }}"
           identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/publish-runtime-artifacts.yml@refs/.*"
           issuer=https://token.actions.githubusercontent.com
           for name in prometa-runtime-host prometa-runtime-host-ubi9; do
             metadata="$directory/release-${name}.json"
+            jq -e --arg tag "$expected_tag" \
+              '.schemaVersion == 1 and .tag == $tag and (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+              "$metadata" >/dev/null
             image=$(jq -r .image "$metadata")
             digest=$(jq -r .digest "$metadata")
             ref="$image@$digest"
@@ -621,6 +668,9 @@ jobs:
           chart=$(jq -r .repository "$directory/release-chart.json")
           chart_digest=$(jq -r .digest "$directory/release-chart.json")
           chart_version=$(jq -r .chartVersion "$directory/release-chart.json")
+          jq -e --arg tag "$expected_tag" \
+            '.schemaVersion == 1 and .releaseTag == $tag and (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$directory/release-chart.json" >/dev/null
           chart_ref="$chart@$chart_digest"
           cosign verify \
             --certificate-identity-regexp "$identity" \
@@ -631,6 +681,7 @@ jobs:
             --certificate-identity-regexp "$identity" \
             --certificate-oidc-issuer "$issuer" \
             "$chart_ref" >/dev/null
+          mkdir -p "$RUNNER_TEMP/pulled-chart"
           helm pull "oci://${chart%/*}/${chart##*/}" \
             --version "$chart_version" \
             --destination "$RUNNER_TEMP/pulled-chart"

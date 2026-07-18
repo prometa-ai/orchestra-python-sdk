@@ -72,8 +72,17 @@ for dockerfile in \
   "$repo_root/deploy/reference-runtime/Dockerfile" \
   "$repo_root/deploy/reference-runtime/Dockerfile.ubi"; do
   if ! grep -Fq "ARG IMAGE_VERSION=$package_version" "$dockerfile"; then
-    echo "ERROR: $dockerfile does not default IMAGE_VERSION to $package_version" >&2
-    exit 2
+    # v0.18.0 is the only runtime release created before the Debian image
+    # gained build-injected OCI metadata. Its immutable source still carries
+    # the exact literal version; publication adds revision/version labels and
+    # the pinned base without changing those source bytes.
+    if [ "$release_tag" != "v0.18.0" ] || \
+       [ "$dockerfile" != "$repo_root/deploy/reference-runtime/Dockerfile" ] || \
+       ! grep -Fq "org.opencontainers.image.version=\"$package_version\"" \
+         "$dockerfile"; then
+      echo "ERROR: $dockerfile does not default IMAGE_VERSION to $package_version" >&2
+      exit 2
+    fi
   fi
   if ! grep -Fq "$package_pin" "$dockerfile"; then
     echo "ERROR: $dockerfile does not install $package_pin" >&2

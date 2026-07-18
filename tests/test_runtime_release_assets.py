@@ -89,6 +89,47 @@ def test_runtime_release_contract_rejects_image_package_drift(tmp_path):
     assert "does not install" in result.stderr
 
 
+def _use_legacy_debian_version_label(root: Path, version: str) -> None:
+    dockerfile = root / "deploy/reference-runtime/Dockerfile"
+    dockerfile.write_text(
+        dockerfile.read_text(encoding="utf-8")
+        .replace(f"ARG IMAGE_VERSION={version}\n", "")
+        .replace(
+            'org.opencontainers.image.version="${IMAGE_VERSION}"',
+            f'org.opencontainers.image.version="{version}"',
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_runtime_release_contract_accepts_only_v0180_legacy_debian_metadata(
+    tmp_path,
+):
+    fixture = _release_fixture(tmp_path)
+    _use_legacy_debian_version_label(fixture, "0.18.0")
+
+    result = _run_verifier("v0.18.0", fixture)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_runtime_release_contract_rejects_legacy_metadata_for_future_tag(tmp_path):
+    fixture = _release_fixture(tmp_path)
+    synchronized = subprocess.run(
+        [str(SYNCHRONIZER), "0.19.0", "--repository-root", str(fixture)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert synchronized.returncode == 0, synchronized.stderr
+    _use_legacy_debian_version_label(fixture, "0.19.0")
+
+    result = _run_verifier("v0.19.0", fixture)
+
+    assert result.returncode == 2
+    assert "does not default IMAGE_VERSION" in result.stderr
+
+
 def test_runtime_release_version_synchronizer_updates_every_bound_surface(tmp_path):
     fixture = _release_fixture(tmp_path)
 

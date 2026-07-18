@@ -1,0 +1,649 @@
+# Publish the optional tenant-runtime host as signed OCI release artifacts.
+#
+# Python package publication remains in publish.yml. This workflow publishes
+# two runtime-host images and the independently versioned Helm chart from an
+# exact SDK tag. A manual run may backfill an existing tag by setting
+# source_tag; it never builds release artifacts from a branch checkout.
+name: Publish runtime artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Exact SDK tag to publish, for example v0.18.0"
+        required: true
+        type: string
+      registry:
+        description: "OCI registry namespace (default: this repository on GHCR)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: runtime-artifacts-${{ inputs.source_tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_IMAGE: python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+  SYFT_VERSION: v1.48.0
+
+jobs:
+  verify:
+    name: verify ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: prometa-runtime-host
+            dockerfile: deploy/reference-runtime/Dockerfile
+            variant: debian
+          - image: prometa-runtime-host-ubi9
+            dockerfile: deploy/reference-runtime/Dockerfile.ubi
+            variant: ubi9
+
+    steps:
+      - name: Check out release controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-control
+
+      - name: Check out exact release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_tag || github.ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Verify immutable source and release contract
+        id: source
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SOURCE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "invalid source tag: $SOURCE_TAG" >&2
+            exit 1
+          fi
+          actual_tag=$(git -C source describe --tags --exact-match HEAD)
+          if [ "$actual_tag" != "$SOURCE_TAG" ]; then
+            echo "source resolved to $actual_tag instead of $SOURCE_TAG" >&2
+            exit 1
+          fi
+          release-control/scripts/verify_runtime_release_contract.sh \
+            "$SOURCE_TAG" "$GITHUB_WORKSPACE/source"
+          source_sha=$(git -C source rev-parse HEAD)
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install conformance runner from exact source
+        run: pip install "./source[dev,runtime-host]"
+
+      - name: Build exact release source before any push
+        env:
+          IMAGE: ${{ matrix.image }}:release-preflight
+          IMAGE_VERSION: ${{ inputs.source_tag || github.ref_name }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          VARIANT: ${{ matrix.variant }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --file "source/${{ matrix.dockerfile }}"
+            --tag "$IMAGE"
+            --build-arg "VCS_REF=$SOURCE_SHA"
+            --build-arg "IMAGE_VERSION=$IMAGE_VERSION"
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            --label "org.opencontainers.image.revision=$SOURCE_SHA"
+            --label "org.opencontainers.image.version=$IMAGE_VERSION"
+            --label "io.prometa.image.variant=$VARIANT"
+          )
+          if [ "$VARIANT" = debian ]; then
+            args+=(--build-arg "PYTHON_IMAGE=$PYTHON_IMAGE")
+          fi
+          docker build "${args[@]}" source
+
+      - name: Prove image identity, filesystem, and runtime API
+        env:
+          IMAGE: ${{ matrix.image }}:release-preflight
+          RELEASE_VERSION: ${{ inputs.source_tag || github.ref_name }}
+          VARIANT: ${{ matrix.variant }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${RELEASE_VERSION#v}
+          if [ "$VARIANT" = debian ]; then
+            test "$(docker run --rm --entrypoint id "$IMAGE" -u)" = 10001
+            run_as=()
+          else
+            test "$(docker run --rm --entrypoint id "$IMAGE" -u)" = 1001
+            test "$(docker run --rm --user 12345:0 --read-only --tmpfs /tmp \
+              --entrypoint id "$IMAGE" -u)" = 12345
+            run_as=(--user 12345:0 --read-only --tmpfs /tmp)
+          fi
+          test "$(docker inspect "$IMAGE" \
+            --format '{{ index .Config.Labels "io.prometa.image.variant" }}')" = "$VARIANT"
+          docker run --rm "${run_as[@]}" --entrypoint python "$IMAGE" \
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION; assert prometa.__version__ == '$version'; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 6"
+          prometa-runtime-conformance \
+            --profile deployment \
+            --driver-name "release-${VARIANT}" \
+            --command "docker run --rm -i ${run_as[*]} --entrypoint prometa-runtime-host-conformance-driver $IMAGE" \
+            --compact \
+            --output "runtime-host-conformance-${VARIANT}.json"
+
+      - name: Upload pre-publish conformance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-host-conformance-${{ matrix.variant }}-${{ steps.source.outputs.source_sha }}
+          path: runtime-host-conformance-${{ matrix.variant }}.json
+          if-no-files-found: error
+
+  publish:
+    name: publish ${{ matrix.image }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: prometa-runtime-host
+            dockerfile: deploy/reference-runtime/Dockerfile
+            variant: debian
+          - image: prometa-runtime-host-ubi9
+            dockerfile: deploy/reference-runtime/Dockerfile.ubi
+            variant: ubi9
+
+    steps:
+      - name: Check out release controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-control
+
+      - name: Check out exact release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_tag || github.ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Resolve immutable image coordinates
+        id: meta
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract=$(release-control/scripts/verify_runtime_release_contract.sh \
+            "$SOURCE_TAG" "$GITHUB_WORKSPACE/source")
+          release_version=$(printf '%s\n' "$contract" | sed -n 's/^release_version=//p')
+          source_sha=$(git -C source rev-parse HEAD)
+          actual_tag=$(git -C source describe --tags --exact-match HEAD)
+          test "$actual_tag" = "$SOURCE_TAG"
+
+          namespace="${{ inputs.registry }}"
+          namespace=${namespace:-ghcr.io/${GITHUB_REPOSITORY}}
+          namespace=${namespace%/}
+          namespace=$(printf '%s' "$namespace" | tr '[:upper:]' '[:lower:]')
+          case "$namespace" in
+            *[[:space:]]*|*@*) echo "invalid registry namespace: $namespace" >&2; exit 1 ;;
+          esac
+          host=${namespace%%/*}
+          image="$namespace/${{ matrix.image }}"
+          sha_tag="sha-${source_sha:0:12}"
+          {
+            echo "host=$host"
+            echo "image=$image"
+            echo "namespace=$namespace"
+            echo "release_tag=$SOURCE_TAG"
+            echo "release_version=$release_version"
+            echo "sha_tag=$sha_tag"
+            echo "source_sha=$source_sha"
+            if [ "$host" = ghcr.io ]; then
+              echo "is_ghcr=true"
+            else
+              echo "is_ghcr=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.meta.outputs.host }}
+          username: ${{ steps.meta.outputs.is_ghcr == 'true' && github.actor || secrets.REGISTRY_USER }}
+          password: ${{ steps.meta.outputs.is_ghcr == 'true' && secrets.GITHUB_TOKEN || secrets.REGISTRY_TOKEN }}
+
+      - name: Build and push canonical runtime image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          file: source/${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.release_tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.release_tag }}
+            io.prometa.image.variant=${{ matrix.variant }}
+          build-args: |
+            VCS_REF=${{ steps.meta.outputs.source_sha }}
+            IMAGE_VERSION=${{ steps.meta.outputs.release_tag }}
+            PYTHON_IMAGE=${{ matrix.variant == 'debian' && env.PYTHON_IMAGE || '' }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=runtime-release-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=runtime-release-${{ matrix.image }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" \
+            | sh -s -- -b "$RUNNER_TEMP/bin" "$SYFT_VERSION"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Generate release SBOMs and immutable metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          syft "$ref" \
+            -o "spdx-json=sbom-${{ matrix.image }}.spdx.json" \
+            -o "cyclonedx-json=sbom-${{ matrix.image }}.cdx.json"
+          jq -n \
+            --arg image "${{ steps.meta.outputs.image }}" \
+            --arg digest "${{ steps.build.outputs.digest }}" \
+            --arg tag "${{ steps.meta.outputs.release_tag }}" \
+            --arg revision "${{ steps.meta.outputs.source_sha }}" \
+            --arg variant "${{ matrix.variant }}" \
+            '{schemaVersion: 1, image: $image, digest: $digest, tag: $tag, revision: $revision, variant: $variant}' \
+            > "release-${{ matrix.image }}.json"
+
+      - name: Sign digest and attest CycloneDX SBOM
+        env:
+          COSIGN_YES: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          cosign sign "$ref"
+          cosign attest \
+            --predicate "sbom-${{ matrix.image }}.cdx.json" \
+            --type cyclonedx \
+            "$ref"
+
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload image release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-image-${{ matrix.image }}-${{ steps.meta.outputs.sha_tag }}
+          path: |
+            sbom-${{ matrix.image }}.*.json
+            release-${{ matrix.image }}.json
+          if-no-files-found: error
+
+      - name: Record immutable image digest
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.image }}"
+            echo '```text'
+            echo "${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-chart:
+    name: publish Helm chart
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out release controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-control
+
+      - name: Check out exact release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_tag || github.ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Resolve immutable chart coordinates
+        id: meta
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract=$(release-control/scripts/verify_runtime_release_contract.sh \
+            "$SOURCE_TAG" "$GITHUB_WORKSPACE/source")
+          release_version=$(printf '%s\n' "$contract" | sed -n 's/^release_version=//p')
+          chart_version=$(printf '%s\n' "$contract" | sed -n 's/^chart_version=//p')
+          source_sha=$(git -C source rev-parse HEAD)
+          actual_tag=$(git -C source describe --tags --exact-match HEAD)
+          test "$actual_tag" = "$SOURCE_TAG"
+
+          namespace="${{ inputs.registry }}"
+          namespace=${namespace:-ghcr.io/${GITHUB_REPOSITORY}}
+          namespace=${namespace%/}
+          namespace=$(printf '%s' "$namespace" | tr '[:upper:]' '[:lower:]')
+          host=${namespace%%/*}
+          chart_name=$(sed -n 's/^name: *//p' \
+            source/deploy/reference-runtime/chart/Chart.yaml | head -n 1)
+          repository="$namespace/charts/$chart_name"
+          {
+            echo "host=$host"
+            echo "namespace=$namespace"
+            echo "repository=$repository"
+            echo "chart_name=$chart_name"
+            echo "chart_version=$chart_version"
+            echo "release_version=$release_version"
+            echo "release_tag=$SOURCE_TAG"
+            echo "source_sha=$source_sha"
+            if [ "$host" = ghcr.io ]; then
+              echo "is_ghcr=true"
+            else
+              echo "is_ghcr=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.meta.outputs.host }}
+          username: ${{ steps.meta.outputs.is_ghcr == 'true' && github.actor || secrets.REGISTRY_USER }}
+          password: ${{ steps.meta.outputs.is_ghcr == 'true' && secrets.GITHUB_TOKEN || secrets.REGISTRY_TOKEN }}
+
+      - name: Package exact runtime chart
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-chart-release"
+          mkdir -p "$directory"
+          helm lint source/deploy/reference-runtime/chart \
+            -f source/deploy/reference-runtime/chart/values.production.example.yaml
+          helm package source/deploy/reference-runtime/chart --destination "$directory"
+          package="$directory/${{ steps.meta.outputs.chart_name }}-${{ steps.meta.outputs.chart_version }}.tgz"
+          test -s "$package"
+          helm show chart "$package" > "$directory/chart-metadata.yaml"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact image release metadata
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-image-prometa-runtime-host-*
+          path: ${{ runner.temp }}/runtime-image-release-metadata
+          merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" \
+            | sh -s -- -b "$RUNNER_TEMP/bin" "$SYFT_VERSION"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Generate chart SBOM bound to both runtime images
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-chart-release"
+          syft "${{ steps.package.outputs.package }}" \
+            -o "spdx-json=$directory/chart.spdx.json" \
+            -o "cyclonedx-json=$directory/chart.cdx.json"
+
+          chart_sha=$(sha256sum "${{ steps.package.outputs.package }}" | awk '{print $1}')
+          debian="$RUNNER_TEMP/runtime-image-release-metadata/release-prometa-runtime-host.json"
+          ubi="$RUNNER_TEMP/runtime-image-release-metadata/release-prometa-runtime-host-ubi9.json"
+          for metadata in "$debian" "$ubi"; do
+            jq -e \
+              --arg tag "${{ steps.meta.outputs.release_tag }}" \
+              --arg revision "${{ steps.meta.outputs.source_sha }}" \
+              '.schemaVersion == 1 and .tag == $tag and .revision == $revision and
+               (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+              "$metadata" >/dev/null
+          done
+          jq \
+            --arg chart_name "${{ steps.meta.outputs.chart_name }}" \
+            --arg chart_version "${{ steps.meta.outputs.chart_version }}" \
+            --arg chart_sha "$chart_sha" \
+            --slurpfile debian "$debian" \
+            --slurpfile ubi "$ubi" \
+            '
+              .metadata.component = {
+                type: "application",
+                name: $chart_name,
+                version: $chart_version,
+                hashes: [{alg: "SHA-256", content: $chart_sha}]
+              }
+              | .components = ((.components // []) + [
+                  {
+                    type: "container",
+                    name: $debian[0].image,
+                    version: $debian[0].tag,
+                    "bom-ref": ($debian[0].image + "@" + $debian[0].digest),
+                    hashes: [{alg: "SHA-256", content: ($debian[0].digest | sub("^sha256:"; ""))}]
+                  },
+                  {
+                    type: "container",
+                    name: $ubi[0].image,
+                    version: $ubi[0].tag,
+                    "bom-ref": ($ubi[0].image + "@" + $ubi[0].digest),
+                    hashes: [{alg: "SHA-256", content: ($ubi[0].digest | sub("^sha256:"; ""))}]
+                  }
+                ] | unique_by(."bom-ref" // (.name + "@" + (.version // ""))))
+            ' "$directory/chart.cdx.json" > "$directory/chart.cdx.tmp.json"
+          mv "$directory/chart.cdx.tmp.json" "$directory/chart.cdx.json"
+
+      - name: Push, sign, and attest chart digest
+        id: push
+        env:
+          COSIGN_YES: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(helm push "${{ steps.package.outputs.package }}" \
+            "oci://${{ steps.meta.outputs.namespace }}/charts" 2>&1)
+          printf '%s\n' "$output"
+          digest=$(printf '%s\n' "$output" | sed -n 's/^Digest: *//p' | tail -n 1)
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
+            echo "could not resolve pushed chart digest" >&2
+            exit 1
+          fi
+          ref="${{ steps.meta.outputs.repository }}@$digest"
+          cosign sign "$ref"
+          cosign attest \
+            --predicate "$RUNNER_TEMP/runtime-chart-release/chart.cdx.json" \
+            --type cyclonedx \
+            "$ref"
+          jq -n \
+            --arg repository "${{ steps.meta.outputs.repository }}" \
+            --arg digest "$digest" \
+            --arg chartVersion "${{ steps.meta.outputs.chart_version }}" \
+            --arg appVersion "${{ steps.meta.outputs.release_version }}" \
+            --arg releaseTag "${{ steps.meta.outputs.release_tag }}" \
+            --arg revision "${{ steps.meta.outputs.source_sha }}" \
+            '{schemaVersion: 1, repository: $repository, digest: $digest, chartVersion: $chartVersion, appVersion: $appVersion, releaseTag: $releaseTag, revision: $revision}' \
+            > "$RUNNER_TEMP/runtime-chart-release/release-chart.json"
+          {
+            echo "digest=$digest"
+            echo "ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest packaged chart provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.package }}
+
+      - name: Upload chart release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-chart-${{ steps.meta.outputs.chart_name }}-${{ steps.meta.outputs.chart_version }}
+          path: ${{ runner.temp }}/runtime-chart-release/*
+          if-no-files-found: error
+
+      - name: Record immutable chart digest
+        shell: bash
+        run: |
+          {
+            echo "### ${{ steps.meta.outputs.chart_name }} chart"
+            echo '```text'
+            echo "${{ steps.push.outputs.ref }}"
+            echo '```'
+            echo "Application version: ${{ steps.meta.outputs.release_version }}"
+            echo "Chart version: ${{ steps.meta.outputs.chart_version }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-published:
+    name: verify signed artifact set
+    needs: [publish, publish-chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-image-prometa-runtime-host-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-chart-prometa-runtime-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Resolve registry login
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/runtime-release/release-prometa-runtime-host.json"
+          image=$(jq -r .image "$metadata")
+          host=${image%%/*}
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          if [ "$host" = ghcr.io ]; then
+            echo "is_ghcr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_ghcr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ steps.registry.outputs.is_ghcr == 'true' && github.actor || secrets.REGISTRY_USER }}
+          password: ${{ steps.registry.outputs.is_ghcr == 'true' && secrets.GITHUB_TOKEN || secrets.REGISTRY_TOKEN }}
+
+      - name: Verify signatures, attestations, architecture, and chart pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-release"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/publish-runtime-artifacts.yml@refs/.*"
+          issuer=https://token.actions.githubusercontent.com
+          for name in prometa-runtime-host prometa-runtime-host-ubi9; do
+            metadata="$directory/release-${name}.json"
+            image=$(jq -r .image "$metadata")
+            digest=$(jq -r .digest "$metadata")
+            ref="$image@$digest"
+            cosign verify \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$ref" >/dev/null
+            cosign verify-attestation \
+              --type cyclonedx \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$ref" >/dev/null
+            docker buildx imagetools inspect --raw "$ref" \
+              | jq -e '(.manifests // []) as $items |
+                ($items | length == 0) or
+                any($items[]; .platform.os == "linux" and .platform.architecture == "amd64")' \
+              >/dev/null
+          done
+
+          chart=$(jq -r .repository "$directory/release-chart.json")
+          chart_digest=$(jq -r .digest "$directory/release-chart.json")
+          chart_version=$(jq -r .chartVersion "$directory/release-chart.json")
+          chart_ref="$chart@$chart_digest"
+          cosign verify \
+            --certificate-identity-regexp "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$chart_ref" >/dev/null
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$chart_ref" >/dev/null
+          helm pull "oci://${chart%/*}/${chart##*/}" \
+            --version "$chart_version" \
+            --destination "$RUNNER_TEMP/pulled-chart"
+
+      - name: Summarize verified artifact set
+        shell: bash
+        run: |
+          {
+            echo "### Signed tenant-runtime artifact set verified"
+            for name in prometa-runtime-host prometa-runtime-host-ubi9; do
+              metadata="$RUNNER_TEMP/runtime-release/release-${name}.json"
+              echo "- $(jq -r '.image + "@" + .digest' "$metadata")"
+            done
+            echo "- $(jq -r '.repository + "@" + .digest' \
+              "$RUNNER_TEMP/runtime-release/release-chart.json")"
+          } >> "$GITHUB_STEP_SUMMARY"

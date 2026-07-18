@@ -31,7 +31,7 @@ def test_runtime_deploy_assets_follow_package_version():
     )
 
     assert 'appVersion: "%s"' % version in chart
-    assert 'org.opencontainers.image.version="%s"' % version in dockerfile
+    assert "ARG IMAGE_VERSION=%s" % version in dockerfile
     assert '"prometa-sdk[runtime-host,runtime-mcp]==%s"' % version in dockerfile
     assert "ARG IMAGE_VERSION=%s" % version in ubi_dockerfile
     assert '"prometa-sdk[runtime-host,runtime-mcp]==%s"' % version in ubi_dockerfile

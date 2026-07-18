@@ -35,6 +35,39 @@ A green report proves the packaged admission, execution, failure, and
 zero-synchronous-control-plane cases. It is deployment evidence, not topology
 chaos or production certification.
 
+## Published release artifacts
+
+Each SDK release publishes the optional tenant runtime as three independent OCI
+artifacts from the exact immutable SDK tag:
+
+```text
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host:v0.18.0
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9:v0.18.0
+oci://ghcr.io/prometa-ai/orchestra-python-sdk/charts/prometa-runtime:0.3.1
+```
+
+The Debian and UBI9 images are Linux AMD64 release artifacts. The workflow
+records their immutable digests, SPDX and CycloneDX SBOMs, keyless signatures,
+CycloneDX attestations, and GitHub build provenance. The chart is packaged from
+the same tag, binds both image digests in its CycloneDX SBOM, and is separately
+signed and attested. Chart and application versions remain independent.
+
+Operators should resolve and mirror digest references from the workflow's
+`release-*.json` evidence, then verify the keyless signature before admission.
+For example, after setting `RUNTIME_IMAGE` to an `image@sha256:...` reference:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp \
+  'https://github.com/prometa-ai/orchestra-python-sdk/.github/workflows/publish-runtime-artifacts.yml@refs/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$RUNTIME_IMAGE"
+```
+
+The signatures, SBOMs, and provenance establish release identity and supply
+chain evidence. They do not by themselves certify an OpenShift deployment or
+replace tenant registry, policy, vulnerability, and fault-testing controls.
+
 ## Configuration
 
 Mount one strict JSON document at `/etc/prometa-runtime/config.json`.

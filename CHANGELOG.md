@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Exact-tag publication of Linux AMD64 Debian and UBI9 reference-runtime images
+  plus the OCI Helm chart, with immutable digest metadata, SPDX/CycloneDX SBOMs,
+  keyless signatures, SBOM attestations, build provenance, and post-publish
+  verification.
+- A release-contract verifier that binds the SDK package, runtime package,
+  container installation, chart application version, and immutable source tag
+  before any runtime artifact is pushed.
 - Runtime contract v2 admission with exact capability-version ranges,
   independently recomputed policy/configuration digests, and typed logical
   secret references that never carry credential values.
@@ -83,6 +90,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Security
 
+- The Debian runtime base is digest-pinned, and release automation builds from
+  an exact SDK tag while taking workflow controls from the protected default
+  branch. Existing tags can be backfilled without moving or rebuilding a tag
+  from mutable branch source.
 - MCP HTTP redirects and ambient proxy discovery are disabled, public plain
   HTTP is rejected, credential-controlled protocol headers are forbidden, and
   every declared origin or stdio command requires an explicit tenant egress

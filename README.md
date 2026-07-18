@@ -583,13 +583,16 @@ contracts.
 The non-root container, Compose example, tenant-owned Helm chart, logical
 backup/restore assets, strict configuration shape, and operator commands live in
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md).
-Chart `0.3.1` runs the target image's compatibility check after migration and
-before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
+The release-bound chart runs the target image's compatibility check after
+migration and before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
 tenant-selected immutable config revisions explicit. The CI drill uses a real
 schema-v2 source baseline, upgrades to schema v6 and bundle B, then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
-published-version certification claim. Separate pinned K3s/kube-router
+published-version certification claim. A separate manual release-channel drill
+executes an older signed chart/image, a newer signed chart/image, and a forward
+deployment of the older pair with a freshly authorized prior bundle. Separate
+pinned K3s/kube-router
 profiles now prove the chart's model-only and read-only MCP paths in one
 two-node, two-tenant reference topology. The current v2 profiles admit runtime
 contract v2 releases and bind capability ranges plus policy/configuration

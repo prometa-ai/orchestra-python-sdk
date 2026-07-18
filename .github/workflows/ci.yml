@@ -31,6 +31,7 @@ jobs:
           ruff check prometa tests
           .github/ci/verify_core_package_boundary.py
           deploy/reference-runtime/ci/topology_fixture.py
+          deploy/reference-runtime/ci/published_upgrade_fixture.py
           deploy/reference-runtime/ci/topology_probe.py
           deploy/reference-runtime/ci/topology_mcp_server.py
 
@@ -107,6 +108,7 @@ jobs:
           tests/test_runtime_*.py
           tests/test_promotion_attestation.py
           deploy/reference-runtime/ci/topology_fixture.py
+          deploy/reference-runtime/ci/published_upgrade_fixture.py
           deploy/reference-runtime/ci/topology_probe.py
           deploy/reference-runtime/ci/topology_mcp_server.py
 
@@ -214,9 +216,10 @@ jobs:
       - name: Verify image identity and installed API
         run: |
           set -euo pipefail
+          version=$(python -c 'import prometa; print(prometa.__version__)')
           test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
           docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
-            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresMcpAuditSink, PostgresMcpIdempotencyStore, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, official_mcp_transport_available, verify_postgres_runtime_integrity; assert prometa.__version__ == '0.18.0'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 6; assert official_mcp_transport_available(); assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresMcpAuditSink, PostgresMcpIdempotencyStore, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, official_mcp_transport_available, verify_postgres_runtime_integrity; assert prometa.__version__ == '$version'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 6; assert official_mcp_transport_available(); assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
 
       - name: Run deployment profile through fresh host containers
         run: >-
@@ -256,12 +259,13 @@ jobs:
         run: |
           set -euo pipefail
           image="prometa-runtime-host:ubi9-${{ github.sha }}"
+          version=$(python -c 'import prometa; print(prometa.__version__)')
           test "$(docker run --rm --entrypoint id "$image" -u)" = "1001"
           test "$(docker inspect "$image" --format '{{ index .Config.Labels "io.prometa.image.variant" }}')" = "ubi9"
           test "$(docker run --rm --user 12345:0 --read-only --tmpfs /tmp --entrypoint id "$image" -u)" = "12345"
           docker run --rm --user 12345:0 --read-only --tmpfs /tmp \
             --entrypoint python "$image" \
-            -c "import prometa; import prometa.runtime; assert prometa.__version__ == '0.18.0'"
+            -c "import prometa; import prometa.runtime; assert prometa.__version__ == '$version'"
 
       - name: Run deployment profile as an arbitrary UID
         run: >-

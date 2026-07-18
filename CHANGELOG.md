@@ -85,6 +85,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   binding, official Streamable HTTP transport, exact tools-plane policy,
   cross-replica PostgreSQL call admission, payload-free audit persistence,
   tenant-isolated credential rotation, and indeterminate replay quarantine.
+- A manual two-release K3d proof that verifies both immutable signed artifact
+  sets, upgrades the published UBI runtime image and Helm chart, then forward
+  deploys the prior pair with exact prior bundle bytes and fresh promotion
+  identity while emitting payload-free activation evidence.
+- Release automation now advances the independently versioned chart patch and
+  synchronizes release-bound topology profiles, examples, and runtime defaults
+  whenever the SDK version advances.
+- Runtime artifact publication waits for the exact SDK version to become
+  visible on PyPI before building its package-pinned images, removing the race
+  between package and OCI publication.
 
 ### Fixed
 

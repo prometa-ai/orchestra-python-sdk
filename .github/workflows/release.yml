@@ -5,6 +5,8 @@ name: Release
 #
 #   bump     = as-is | patch | minor | major    (default: as-is)
 #   version  = optional explicit version (overrides `bump`)
+#   chart_version = optional explicit chart version; otherwise the chart
+#                   patch advances whenever the SDK version advances
 #
 # Pick the right `bump` based on whether main was *already* bumped:
 #
@@ -73,6 +75,10 @@ on:
         description: "Explicit version like 0.4.0 — overrides `bump` if set"
         required: false
         type: string
+      chart_version:
+        description: "Explicit Helm chart version; defaults to the next chart patch"
+        required: false
+        type: string
 
 permissions:
   contents: write   # push the bump commit + tag to main
@@ -101,13 +107,15 @@ jobs:
         run: |
           set -euo pipefail
           CURRENT=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          CURRENT_CHART=$(sed -n 's/^version: *//p' deploy/reference-runtime/chart/Chart.yaml | head -n 1)
           echo "Current version: $CURRENT"
+          echo "Current chart version: $CURRENT_CHART"
 
           # Mode resolution priority:
           #   1. Explicit `version` input — operator typed a value, use it
           #      verbatim (covers as-is by typing the current version too).
           #   2. `bump: as-is` — publish CURRENT as-is, no rewrite, no
-          #      commit. Only the tag + publish step runs.
+          #      commit. Only the tag and publish steps run.
           #   3. `bump: patch/minor/major` — apply +1 to the chosen
           #      position; advances main by one commit before tagging.
           if [ -n "${{ inputs.version }}" ]; then
@@ -135,6 +143,24 @@ jobs:
             exit 1
           fi
 
+          if [ -n "${{ inputs.chart_version }}" ]; then
+            NEW_CHART_VERSION="${{ inputs.chart_version }}"
+          elif [ "$NEW_VERSION" = "$CURRENT" ]; then
+            NEW_CHART_VERSION="$CURRENT_CHART"
+          else
+            IFS=. read -r CHART_MAJOR CHART_MINOR CHART_PATCH <<< "$CURRENT_CHART"
+            NEW_CHART_VERSION="$CHART_MAJOR.$CHART_MINOR.$((CHART_PATCH + 1))"
+          fi
+          if ! echo "$NEW_CHART_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::chart version '$NEW_CHART_VERSION' is not MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          if [ "$NEW_VERSION" != "$CURRENT" ] \
+             && [ "$NEW_CHART_VERSION" = "$CURRENT_CHART" ]; then
+            echo "::error::an SDK advance requires a new chart version"
+            exit 1
+          fi
+
           # Equality with CURRENT is only an error in advance-mode. In
           # `as-is` (or explicit-version-equals-current) mode it's the
           # whole point — we're tagging what's already on main.
@@ -146,6 +172,7 @@ jobs:
           fi
 
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "chart_version=$NEW_CHART_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Refuse to clobber an existing tag
         # Hard guard: if `v<NEW>` already exists locally OR on origin,
@@ -174,20 +201,30 @@ jobs:
       - name: Synchronize release-bound versions
         # Explicit versions override the bump choice, including its default
         # as-is value. A true as-is release is verified without rewriting.
-        if: inputs.bump != 'as-is' || inputs.version != ''
+        if: inputs.bump != 'as-is' || inputs.version != '' || inputs.chart_version != ''
         env:
           NEW: ${{ steps.bump.outputs.new_version }}
+          NEW_CHART: ${{ steps.bump.outputs.chart_version }}
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/sync_runtime_release_version.py "$NEW"
+          python scripts/sync_runtime_release_version.py "$NEW" \
+            --chart-version "$NEW_CHART"
           git diff -- \
             pyproject.toml \
             prometa/__init__.py \
             deploy/reference-runtime/Dockerfile \
             deploy/reference-runtime/Dockerfile.ubi \
             deploy/reference-runtime/compose.yaml \
-            deploy/reference-runtime/chart/Chart.yaml
+            deploy/reference-runtime/chart/Chart.yaml \
+            deploy/reference-runtime/chart/values.production.example.yaml \
+            deploy/reference-runtime/chart/values.mcp.example.yaml \
+            deploy/reference-runtime/config.example.json \
+            deploy/reference-runtime/config.mcp.example.json \
+            deploy/reference-runtime/config.pull.example.json \
+            deploy/reference-runtime/topology-profiles.json \
+            deploy/reference-runtime/topology-profiles.mcp.json \
+            examples/runtime_kernel_quickstart.py
 
       - name: Verify the complete runtime release contract
         # Always runs. In as-is mode this catches a partially bumped release
@@ -214,7 +251,15 @@ jobs:
             deploy/reference-runtime/Dockerfile \
             deploy/reference-runtime/Dockerfile.ubi \
             deploy/reference-runtime/compose.yaml \
-            deploy/reference-runtime/chart/Chart.yaml
+            deploy/reference-runtime/chart/Chart.yaml \
+            deploy/reference-runtime/chart/values.production.example.yaml \
+            deploy/reference-runtime/chart/values.mcp.example.yaml \
+            deploy/reference-runtime/config.example.json \
+            deploy/reference-runtime/config.mcp.example.json \
+            deploy/reference-runtime/config.pull.example.json \
+            deploy/reference-runtime/topology-profiles.json \
+            deploy/reference-runtime/topology-profiles.mcp.json \
+            examples/runtime_kernel_quickstart.py
 
           # In as-is mode there's nothing to commit — main already has
           # the version we're about to tag. `git diff --cached --quiet`
@@ -228,7 +273,6 @@ jobs:
             git commit -m "chore: bump to $NEW"
             git push origin main
           fi
-
           git tag "v$NEW"
           git push origin "v$NEW"
 
@@ -264,6 +308,7 @@ jobs:
       - name: Summary
         env:
           NEW: ${{ steps.bump.outputs.new_version }}
+          NEW_CHART: ${{ steps.bump.outputs.chart_version }}
         shell: bash
         run: |
           {
@@ -271,6 +316,7 @@ jobs:
             echo ""
             echo "- **Version:** \`$NEW\`"
             echo "- **Tag:** \`v$NEW\`"
+            echo "- **Chart:** \`$NEW_CHART\`"
             echo ""
             echo "The package workflow is publishing to PyPI and the runtime-artifact workflow is publishing signed images and the OCI chart."
             echo "Watch them here: [PyPI](../../actions/workflows/publish.yml) | [runtime artifacts](../../actions/workflows/publish-runtime-artifacts.yml)"

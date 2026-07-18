@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -60,8 +61,10 @@ def _canonical(value) -> str:
 
 
 def _instant(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -74,9 +77,7 @@ def _public_key(private_key: Ed25519PrivateKey) -> str:
 
 
 def _sign(private_key: Ed25519PrivateKey, payload: str) -> str:
-    return base64.b64encode(private_key.sign(payload.encode("utf-8"))).decode(
-        "ascii"
-    )
+    return base64.b64encode(private_key.sign(payload.encode("utf-8"))).decode("ascii")
 
 
 def _content(label: str, manifest_version: int) -> dict:
@@ -135,9 +136,7 @@ def _content(label: str, manifest_version: int) -> dict:
             "inputSchema": {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "properties": {
-                    "question": {"type": "string", "minLength": 1}
-                },
+                "properties": {"question": {"type": "string", "minLength": 1}},
                 "required": ["question"],
                 "additionalProperties": False,
             },
@@ -160,9 +159,7 @@ def _bundle(
 ) -> dict:
     content = _content(label, manifest_version)
     canonical_content = _canonical(content)
-    digest = "sha256:" + hashlib.sha256(
-        canonical_content.encode("utf-8")
-    ).hexdigest()
+    digest = "sha256:" + hashlib.sha256(canonical_content.encode("utf-8")).hexdigest()
     claims = {
         "envelopeVersion": 1,
         "issuer": BUNDLE_ISSUER,
@@ -237,8 +234,7 @@ def _attestation(
         "expiresAt": _instant(now + timedelta(minutes=20)),
         "offlineLeaseExpiresAt": _instant(now + timedelta(minutes=15)),
         "jti": "promotion-upgrade-%s" % label.lower(),
-        "revocationRef": "urn:prometa:promotion-attestation:%s"
-        % attestation_id,
+        "revocationRef": "urn:prometa:promotion-attestation:%s" % attestation_id,
     }
     payload = _canonical(claims)
     return {
@@ -272,6 +268,7 @@ def _config(
     release_id: str,
     deployment_id: str,
     gateway_url: str,
+    runtime_version: str,
     bundle_public_key: str,
     promotion_public_key: str,
 ) -> dict:
@@ -279,7 +276,7 @@ def _config(
         "configVersion": 1,
         "tenantId": TENANT_ID,
         "runtimeId": RUNTIME_ID,
-        "runtimeVersion": "0.18.0",
+        "runtimeVersion": runtime_version,
         "orgId": ORG_ID,
         "environment": "prod",
         "releaseId": release_id,
@@ -460,6 +457,17 @@ def _run_baseline_schema_install(source: Path, dsn: str) -> None:
     )
 
 
+def _source_runtime_version(source: Path) -> str:
+    match = re.search(
+        r'^__version__ = "([0-9]+\.[0-9]+\.[0-9]+)"$',
+        (source / "prometa/__init__.py").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise AssertionError("source runtime version is unavailable")
+    return match.group(1)
+
+
 def _temporary_database(base_dsn: str):
     import psycopg
 
@@ -561,6 +569,7 @@ def test_source_baseline_upgrade_and_fresh_prior_bundle_rollback(tmp_path) -> No
                 release_id=release_id,
                 deployment_id=deployment_id,
                 gateway_url="http://127.0.0.1:%d" % gateway.server_address[1],
+                runtime_version=_source_runtime_version(source),
                 bundle_public_key=_public_key(bundle_key),
                 promotion_public_key=_public_key(promotion_key),
             )
@@ -615,9 +624,7 @@ def test_source_baseline_upgrade_and_fresh_prior_bundle_rollback(tmp_path) -> No
                 "freshPromotionIdentity": first[4] != rollback[4],
                 "synchronousControlPlaneCalls": 0,
             }
-            Path(report_path).write_text(
-                _canonical(report) + "\n", encoding="utf-8"
-            )
+            Path(report_path).write_text(_canonical(report) + "\n", encoding="utf-8")
     finally:
         _stop_host(process)
         gateway.shutdown()

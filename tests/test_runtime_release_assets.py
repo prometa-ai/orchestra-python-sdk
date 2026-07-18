@@ -8,6 +8,7 @@ ROOT = Path(__file__).parent.parent
 VERIFIER = ROOT / "scripts/verify_runtime_release_contract.sh"
 SYNCHRONIZER = ROOT / "scripts/sync_runtime_release_version.py"
 ARTIFACT_WORKFLOW = ROOT / ".github/workflows/publish-runtime-artifacts.yml"
+PUBLISHED_INSTALL_WORKFLOW = ROOT / ".github/workflows/runtime-published-install.yml"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 
 
@@ -188,6 +189,24 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert 'mkdir -p "$RUNNER_TEMP/pulled-chart"' in workflow
     assert "helm pull" in workflow
     assert "verify signed artifact set" in workflow
+
+
+def test_published_install_workflow_consumes_immutable_release_artifacts():
+    workflow = PUBLISHED_INSTALL_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "packages: read" in workflow
+    assert "ref: ${{ inputs.source_tag }}" in workflow
+    assert "gh release download" in workflow
+    assert "git -C source describe --tags --exact-match HEAD" in workflow
+    assert "release-prometa-runtime-host-ubi9.json" in workflow
+    assert "cosign verify" in workflow
+    assert "cosign verify-attestation" in workflow
+    assert "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE: published" in workflow
+    assert "PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256" in workflow
+    assert "PROMETA_RUNTIME_TOPOLOGY_CLUSTER: runtime-published-install" in workflow
+    assert "reference-profile-not-production-certification" in workflow
+    assert "not OpenShift production certification" in workflow
 
 
 def test_release_dispatches_package_and_runtime_artifacts_from_same_tag():

@@ -8,6 +8,7 @@ import copy
 import hashlib
 import ipaddress
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,10 @@ _TOOL_CONFIGURATION_KEYS = (
     "inputSchema",
     "rateLimitPerMin",
 )
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_RELEASE_TAG_PATTERN = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9_.-]+)?")
+_REVISION_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 def _canonical(value: Any) -> str:
@@ -959,16 +964,12 @@ def _chart_values(
     workload: str = "model-only",
     profile_name: str = "k3d-k3s-kube-router-v2",
 ) -> Mapping[str, Any]:
-    repository, tag = runtime_image.rsplit(":", 1)
+    image_values = _runtime_image_values(runtime_image)
     runtime_namespace = "runtime-%s" % tenant
     values: Dict[str, Any] = {
         "fullnameOverride": "runtime",
         "replicaCount": replicas,
-        "image": {
-            "repository": repository,
-            "tag": tag,
-            "pullPolicy": "Never",
-        },
+        "image": {**image_values, "pullPolicy": "Never"},
         "runtimeConfig": {
             "existingSecret": "runtime-release",
             "rolloutId": "topology-deployment-%s" % tenant,
@@ -1172,6 +1173,26 @@ def _chart_values(
     return values
 
 
+def _runtime_image_values(runtime_image: str) -> Mapping[str, str]:
+    if not runtime_image or len(runtime_image) > 512 or any(
+        character.isspace() for character in runtime_image
+    ):
+        raise ValueError("runtime_image_invalid")
+    if "@" in runtime_image:
+        if runtime_image.count("@") != 1:
+            raise ValueError("runtime_image_invalid")
+        repository, digest = runtime_image.rsplit("@", 1)
+        if not repository or not _SHA256_PATTERN.fullmatch(digest):
+            raise ValueError("runtime_image_invalid")
+        return {"repository": repository, "digest": digest}
+    if ":" not in runtime_image:
+        raise ValueError("runtime_image_invalid")
+    repository, tag = runtime_image.rsplit(":", 1)
+    if not repository or not _IMAGE_TAG_PATTERN.fullmatch(tag):
+        raise ValueError("runtime_image_invalid")
+    return {"repository": repository, "tag": tag}
+
+
 def _validated_receipt_endpoint(
     base_url: Optional[str], endpoint_cidr: Optional[str]
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -1219,8 +1240,7 @@ def prepare(
     profile = _load_profile(profile_path)
     workload = str(profile["workload"])
     mcp_enabled = workload == "mcp-read-only"
-    if ":" not in runtime_image or len(runtime_image) > 256:
-        raise ValueError("runtime_image_invalid")
+    _runtime_image_values(runtime_image)
     if runtime_version != profile["runtimeVersion"]:
         raise ValueError("runtime_version_mismatch")
     receipt_base_url, receipt_endpoint_cidr = _validated_receipt_endpoint(
@@ -1813,6 +1833,12 @@ def write_report(
     mcp_audit_count_b: Optional[int] = None,
     mcp_indeterminate_count_a: Optional[int] = None,
     mcp_indeterminate_count_b: Optional[int] = None,
+    artifact_mode: str = "source-build",
+    runtime_image_reference: Optional[str] = None,
+    chart_artifact_sha256: Optional[str] = None,
+    chart_oci_reference: Optional[str] = None,
+    release_tag: Optional[str] = None,
+    release_revision: Optional[str] = None,
 ) -> None:
     profile = _load_profile(profile_path)
     expected_replicas = int(profile["runtimeReplicasPerTenant"])
@@ -1824,6 +1850,48 @@ def write_report(
         or node_count_b != expected_replicas
     ):
         raise ValueError("topology_observation_invalid")
+    if artifact_mode == "source-build":
+        if any(
+            value is not None
+            for value in (
+                runtime_image_reference,
+                chart_artifact_sha256,
+                chart_oci_reference,
+                release_tag,
+                release_revision,
+            )
+        ):
+            raise ValueError("topology_artifact_evidence_invalid")
+        artifact_source = {"mode": "source-build"}
+    elif artifact_mode == "published-release":
+        if (
+            runtime_image_reference is None
+            or chart_artifact_sha256 is None
+            or chart_oci_reference is None
+            or release_tag is None
+            or release_revision is None
+        ):
+            raise ValueError("topology_artifact_evidence_invalid")
+        runtime_values = _runtime_image_values(runtime_image_reference)
+        if (
+            "digest" not in runtime_values
+            or not _SHA256_PATTERN.fullmatch(chart_artifact_sha256)
+            or "@" not in chart_oci_reference
+            or not _SHA256_PATTERN.fullmatch(chart_oci_reference.rsplit("@", 1)[-1])
+            or not _RELEASE_TAG_PATTERN.fullmatch(release_tag)
+            or not _REVISION_PATTERN.fullmatch(release_revision)
+        ):
+            raise ValueError("topology_artifact_evidence_invalid")
+        artifact_source = {
+            "mode": "published-release",
+            "releaseTag": release_tag,
+            "releaseRevision": release_revision,
+            "runtimeImage": runtime_image_reference,
+            "chartPackageSha256": chart_artifact_sha256,
+            "chartOciReference": chart_oci_reference,
+        }
+    else:
+        raise ValueError("topology_artifact_evidence_invalid")
     report = {
         "contractVersion": 1,
         "profile": profile["name"],
@@ -1837,6 +1905,7 @@ def write_report(
         "networkPolicyController": profile["networkPolicyController"],
         "runtimeVersion": profile["runtimeVersion"],
         "chartVersion": profile["chartVersion"],
+        "artifactSource": artifact_source,
         "bundleSchemaVersion": RUNTIME_BUNDLE_SCHEMA_VERSION,
         "runtimeContractVersion": RUNTIME_CONTRACT_VERSION,
         "capabilityRangeAdmission": True,
@@ -2005,6 +2074,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report_parser.add_argument("--mcp-audit-count-b", type=int)
     report_parser.add_argument("--mcp-indeterminate-count-a", type=int)
     report_parser.add_argument("--mcp-indeterminate-count-b", type=int)
+    report_parser.add_argument(
+        "--artifact-mode",
+        choices=("source-build", "published-release"),
+        default="source-build",
+    )
+    report_parser.add_argument("--runtime-image-reference")
+    report_parser.add_argument("--chart-artifact-sha256")
+    report_parser.add_argument("--chart-oci-reference")
+    report_parser.add_argument("--release-tag")
+    report_parser.add_argument("--release-revision")
 
     args = parser.parse_args(argv)
     if args.command == "profile-value":
@@ -2081,6 +2160,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.mcp_audit_count_b,
             args.mcp_indeterminate_count_a,
             args.mcp_indeterminate_count_b,
+            args.artifact_mode,
+            args.runtime_image_reference,
+            args.chart_artifact_sha256,
+            args.chart_oci_reference,
+            args.release_tag,
+            args.release_revision,
         )
     return 0
 

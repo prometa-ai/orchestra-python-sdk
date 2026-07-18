@@ -727,3 +727,194 @@ jobs:
             echo "- $(jq -r '.repository + "@" + .digest' \
               "$RUNNER_TEMP/runtime-release/release-chart.json")"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-github-release:
+    name: publish immutable GitHub release evidence
+    needs: verify-published
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download image evidence from this publication run for release
+        if: ${{ inputs.verify_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-image-prometa-runtime-host-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Download chart evidence from this publication run for release
+        if: ${{ inputs.verify_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-chart-prometa-runtime-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Download image evidence from the prior publication run for release
+        if: ${{ inputs.verify_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.verify_run_id }}
+          pattern: runtime-image-prometa-runtime-host-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Download chart evidence from the prior publication run for release
+        if: ${{ inputs.verify_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.verify_run_id }}
+          pattern: runtime-chart-prometa-runtime-*
+          path: ${{ runner.temp }}/runtime-release
+          merge-multiple: true
+
+      - name: Validate and publish immutable release evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.source_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/runtime-release"
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          source_sha=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          runtime_version=${RELEASE_TAG#v}
+          chart_version=$(jq -r .chartVersion "$directory/release-chart.json")
+          chart_package="$directory/prometa-runtime-$chart_version.tgz"
+          required=(
+            "$directory/release-prometa-runtime-host.json"
+            "$directory/release-prometa-runtime-host-ubi9.json"
+            "$directory/release-chart.json"
+            "$chart_package"
+          )
+          for path in "${required[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "Required release evidence is unavailable: $path" >&2
+              exit 1
+            fi
+          done
+
+          jq -e --arg tag "$RELEASE_TAG" --arg revision "$source_sha" \
+            '.schemaVersion == 1 and .tag == $tag and .revision == $revision and
+             .variant == "debian" and (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$directory/release-prometa-runtime-host.json" >/dev/null
+          jq -e --arg tag "$RELEASE_TAG" --arg revision "$source_sha" \
+            '.schemaVersion == 1 and .tag == $tag and .revision == $revision and
+             .variant == "ubi9" and (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$directory/release-prometa-runtime-host-ubi9.json" >/dev/null
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg revision "$source_sha" \
+            --arg app_version "$runtime_version" \
+            '.schemaVersion == 1 and .releaseTag == $tag and
+             .revision == $revision and .appVersion == $app_version and
+             (.digest | test("^sha256:[a-f0-9]{64}$"))' \
+            "$directory/release-chart.json" >/dev/null
+
+          mapfile -t assets < <(find "$directory" -maxdepth 1 -type f -print | sort)
+          if [ "${#assets[@]}" -lt 4 ]; then
+            echo "Release evidence set is unexpectedly small." >&2
+            exit 1
+          fi
+
+          debian_ref=$(jq -r '.image + "@" + .digest' \
+            "$directory/release-prometa-runtime-host.json")
+          ubi_ref=$(jq -r '.image + "@" + .digest' \
+            "$directory/release-prometa-runtime-host-ubi9.json")
+          chart_ref=$(jq -r '.repository + "@" + .digest' \
+            "$directory/release-chart.json")
+          notes="$RUNNER_TEMP/runtime-release-notes.md"
+          cat >"$notes" <<EOF
+          Signed tenant-runtime artifact set for \`$RELEASE_TAG\`.
+
+          - Source revision: \`$source_sha\`
+          - Debian runtime: \`$debian_ref\`
+          - UBI9 runtime: \`$ubi_ref\`
+          - Helm chart: \`$chart_ref\`
+          - Helm chart version: \`$chart_version\`
+
+          Assets include immutable metadata, the packaged chart, and CycloneDX/SPDX SBOMs.
+          EOF
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_document=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" --json assets)
+            missing=()
+            for path in "${assets[@]}"; do
+              name=$(basename "$path")
+              expected="sha256:$(sha256sum "$path" | awk '{print $1}')"
+              existing=$(jq -c --arg name "$name" \
+                '[.assets[] | select(.name == $name)][0] // empty' \
+                <<<"$release_document")
+              if [ -z "$existing" ]; then
+                missing+=("$path")
+                continue
+              fi
+              observed=$(jq -r '.digest // empty' <<<"$existing")
+              if [ -z "$observed" ]; then
+                echo "Existing release asset has no verifiable digest: $name" >&2
+                exit 1
+              fi
+              if [ "$observed" != "$expected" ]; then
+                echo "Existing release asset digest differs for $name" >&2
+                exit 1
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              gh release upload "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" "${missing[@]}"
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes" \
+              "${assets[@]}"
+          fi
+
+          verified=false
+          for _ in $(seq 1 12); do
+            release_document=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" --json assets)
+            verified=true
+            for path in "${assets[@]}"; do
+              name=$(basename "$path")
+              expected="sha256:$(sha256sum "$path" | awk '{print $1}')"
+              observed=$(jq -r --arg name "$name" \
+                '.assets[] | select(.name == $name) | .digest' \
+                <<<"$release_document")
+              if [ "$observed" != "$expected" ]; then
+                verified=false
+                break
+              fi
+            done
+            if [ "$verified" = true ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$verified" != true ]; then
+            echo "GitHub release asset digests did not converge." >&2
+            exit 1
+          fi
+
+          {
+            echo "### Immutable GitHub release evidence published"
+            echo "- Release: \`$RELEASE_TAG\`"
+            echo "- Source: \`$source_sha\`"
+            echo "- Assets: \`${#assets[@]}\` digest-verified files"
+          } >> "$GITHUB_STEP_SUMMARY"

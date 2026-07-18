@@ -450,6 +450,15 @@ soak.
 
 ### Published-artifact upgrade and rollback proof
 
+The release coordinator runs the full CI matrix against the exact source tag
+before dispatching package or runtime publication. After OCI verification, the
+publisher creates a digest-checked GitHub Release containing immutable image
+metadata, the packaged chart, and CycloneDX/SPDX SBOMs. Re-running publication
+in verification-only mode can add missing assets, but it refuses to overwrite
+an existing asset whose digest differs. The install and transition drills use
+that release as their discovery boundary and independently re-verify the OCI
+signatures and attestations.
+
 The manual `Verify published runtime upgrade and rollback` workflow accepts an
 older baseline tag and a newer target tag. It verifies both signed release sets,
 establishes the exact baseline K3d topology, then executes three forward Helm

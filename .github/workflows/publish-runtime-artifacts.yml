@@ -731,6 +731,7 @@ jobs:
   publish-github-release:
     name: publish immutable GitHub release evidence
     needs: verify-published
+    if: ${{ always() && needs.verify-published.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

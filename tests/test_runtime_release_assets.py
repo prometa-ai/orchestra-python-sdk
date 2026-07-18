@@ -251,6 +251,7 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert "helm pull" in workflow
     assert "verify signed artifact set" in workflow
     assert "publish immutable GitHub release evidence" in workflow
+    assert "always() && needs.verify-published.result == 'success'" in workflow
     assert "contents: write" in workflow
     assert 'gh release create "$RELEASE_TAG"' in workflow
     assert 'gh release upload "$RELEASE_TAG"' in workflow

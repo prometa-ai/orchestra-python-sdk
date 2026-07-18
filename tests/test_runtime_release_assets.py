@@ -180,6 +180,12 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert workflow.count("cosign sign") == 2
     assert workflow.count("--type cyclonedx") >= 4
     assert workflow.count("actions/attest-build-provenance@v2") == 2
+    assert "verify_run_id:" in workflow
+    assert "actions: read" in workflow
+    assert workflow.count("run-id: ${{ inputs.verify_run_id }}") == 2
+    assert "inputs.verify_run_id != '' && needs.publish.result == 'skipped'" in workflow
+    assert 'expected_tag="${{ inputs.source_tag || github.ref_name }}"' in workflow
+    assert 'mkdir -p "$RUNNER_TEMP/pulled-chart"' in workflow
     assert "helm pull" in workflow
     assert "verify signed artifact set" in workflow
 

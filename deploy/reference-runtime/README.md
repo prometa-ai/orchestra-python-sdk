@@ -51,6 +51,8 @@ records their immutable digests, SPDX and CycloneDX SBOMs, keyless signatures,
 CycloneDX attestations, and GitHub build provenance. The chart is packaged from
 the same tag, binds both image digests in its CycloneDX SBOM, and is separately
 signed and attested. Chart and application versions remain independent.
+GHCR visibility and access remain organization policy; authenticate the tenant
+registry mirror or pull client when these packages are not public.
 
 Operators should resolve and mirror digest references from the workflow's
 `release-*.json` evidence, then verify the keyless signature before admission.

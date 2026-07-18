@@ -50,6 +50,9 @@ _TOOL_CONFIGURATION_KEYS = (
 )
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_KUBERNETES_NAME_PATTERN = re.compile(
+    r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+)
 _RELEASE_TAG_PATTERN = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9_.-]+)?")
 _REVISION_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
@@ -686,7 +689,12 @@ def _postgres_resources(
 
 
 def _model_resources(
-    tenant: str, image: str, source: str, workload: str
+    tenant: str,
+    image: str,
+    source: str,
+    workload: str,
+    image_pull_policy: str = "Never",
+    image_pull_secret: Optional[str] = None,
 ) -> Tuple[Mapping[str, Any], ...]:
     namespace = "models-%s" % tenant
     labels = {"app.kubernetes.io/name": "model-gateway"}
@@ -696,7 +704,7 @@ def _model_resources(
     container = {
         "name": "model-gateway",
         "image": image,
-        "imagePullPolicy": "Never",
+        "imagePullPolicy": image_pull_policy,
         "command": ["python", "/opt/topology/topology_probe.py"],
         "args": arguments,
         "ports": [{"name": "http", "containerPort": 8000}],
@@ -713,6 +721,13 @@ def _model_resources(
         },
         "volumeMounts": list(_support_mounts()),
     }
+    pod_spec: Dict[str, Any] = {
+        "securityContext": _restricted_pod_security(),
+        "containers": [container],
+        "volumes": list(_support_volumes()),
+    }
+    if image_pull_secret is not None:
+        pod_spec["imagePullSecrets"] = [{"name": image_pull_secret}]
     return (
         _config_map(namespace, source),
         {
@@ -724,11 +739,7 @@ def _model_resources(
                 "selector": {"matchLabels": labels},
                 "template": {
                     "metadata": {"labels": labels},
-                    "spec": {
-                        "securityContext": _restricted_pod_security(),
-                        "containers": [container],
-                        "volumes": list(_support_volumes()),
-                    },
+                    "spec": pod_spec,
                 },
             },
         },
@@ -749,9 +760,65 @@ def _mcp_resources(
     image: str,
     source: str,
     token: str,
+    image_pull_policy: str = "Never",
+    image_pull_secret: Optional[str] = None,
 ) -> Tuple[Mapping[str, Any], ...]:
     namespace = "tools-%s" % tenant
     labels = {"app.kubernetes.io/name": "mcp-integration"}
+    pod_spec: Dict[str, Any] = {
+        "automountServiceAccountToken": False,
+        "securityContext": _restricted_pod_security(),
+        "containers": [
+            {
+                "name": "mcp-integration",
+                "image": image,
+                "imagePullPolicy": image_pull_policy,
+                "command": [
+                    "python",
+                    "/opt/topology/topology_mcp_server.py",
+                ],
+                "args": ["--tenant", tenant, "--port", "8000"],
+                "ports": [{"name": "http", "containerPort": 8000}],
+                "securityContext": _restricted_container_security(),
+                "readinessProbe": {
+                    "httpGet": {"path": "/healthz", "port": "http"},
+                    "periodSeconds": 2,
+                    "timeoutSeconds": 2,
+                    "failureThreshold": 45,
+                },
+                "resources": {
+                    "requests": {"cpu": "25m", "memory": "64Mi"},
+                    "limits": {"cpu": "500m", "memory": "256Mi"},
+                },
+                "volumeMounts": [
+                    {
+                        "name": "support",
+                        "mountPath": "/opt/topology",
+                        "readOnly": True,
+                    },
+                    {
+                        "name": "credentials",
+                        "mountPath": "/var/run/secrets/prometa-mcp",
+                        "readOnly": True,
+                    },
+                    {"name": "tmp", "mountPath": "/tmp"},
+                ],
+            }
+        ],
+        "volumes": [
+            {
+                "name": "support",
+                "configMap": {"name": "topology-mcp-server"},
+            },
+            {
+                "name": "credentials",
+                "secret": {"secretName": "mcp-server-credentials"},
+            },
+            {"name": "tmp", "emptyDir": {"sizeLimit": "32Mi"}},
+        ],
+    }
+    if image_pull_secret is not None:
+        pod_spec["imagePullSecrets"] = [{"name": image_pull_secret}]
     return (
         {
             "apiVersion": "v1",
@@ -783,58 +850,7 @@ def _mcp_resources(
                 "selector": {"matchLabels": labels},
                 "template": {
                     "metadata": {"labels": labels},
-                    "spec": {
-                        "automountServiceAccountToken": False,
-                        "securityContext": _restricted_pod_security(),
-                        "containers": [
-                            {
-                                "name": "mcp-integration",
-                                "image": image,
-                                "imagePullPolicy": "Never",
-                                "command": [
-                                    "python",
-                                    "/opt/topology/topology_mcp_server.py",
-                                ],
-                                "args": ["--tenant", tenant, "--port", "8000"],
-                                "ports": [{"name": "http", "containerPort": 8000}],
-                                "securityContext": _restricted_container_security(),
-                                "readinessProbe": {
-                                    "httpGet": {"path": "/healthz", "port": "http"},
-                                    "periodSeconds": 2,
-                                    "timeoutSeconds": 2,
-                                    "failureThreshold": 45,
-                                },
-                                "resources": {
-                                    "requests": {"cpu": "25m", "memory": "64Mi"},
-                                    "limits": {"cpu": "500m", "memory": "256Mi"},
-                                },
-                                "volumeMounts": [
-                                    {
-                                        "name": "support",
-                                        "mountPath": "/opt/topology",
-                                        "readOnly": True,
-                                    },
-                                    {
-                                        "name": "credentials",
-                                        "mountPath": "/var/run/secrets/prometa-mcp",
-                                        "readOnly": True,
-                                    },
-                                    {"name": "tmp", "mountPath": "/tmp"},
-                                ],
-                            }
-                        ],
-                        "volumes": [
-                            {
-                                "name": "support",
-                                "configMap": {"name": "topology-mcp-server"},
-                            },
-                            {
-                                "name": "credentials",
-                                "secret": {"secretName": "mcp-server-credentials"},
-                            },
-                            {"name": "tmp", "emptyDir": {"sizeLimit": "32Mi"}},
-                        ],
-                    },
+                    "spec": pod_spec,
                 },
             },
         },
@@ -886,8 +902,44 @@ def _probe_pod(
     *,
     name: str,
     app_name: str,
+    image_pull_policy: str = "Never",
+    image_pull_secret: Optional[str] = None,
 ) -> Mapping[str, Any]:
     namespace = "gateway-%s" % tenant
+    pod_spec: Dict[str, Any] = {
+        "restartPolicy": "Always",
+        "automountServiceAccountToken": False,
+        "securityContext": _restricted_pod_security(),
+        "containers": [
+            {
+                "name": "probe",
+                "image": image,
+                "imagePullPolicy": image_pull_policy,
+                "command": ["python", "/opt/topology/topology_probe.py"],
+                "args": ["sleep"],
+                "env": [
+                    {
+                        "name": "RUNTIME_API_TOKEN",
+                        "valueFrom": {
+                            "secretKeyRef": {
+                                "name": "probe-credentials",
+                                "key": "api-token",
+                            }
+                        },
+                    }
+                ],
+                "securityContext": _restricted_container_security(),
+                "resources": {
+                    "requests": {"cpu": "10m", "memory": "24Mi"},
+                    "limits": {"cpu": "500m", "memory": "128Mi"},
+                },
+                "volumeMounts": list(_support_mounts()),
+            }
+        ],
+        "volumes": list(_support_volumes()),
+    }
+    if image_pull_secret is not None:
+        pod_spec["imagePullSecrets"] = [{"name": image_pull_secret}]
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -896,43 +948,17 @@ def _probe_pod(
             "namespace": namespace,
             "labels": {"app.kubernetes.io/name": app_name},
         },
-        "spec": {
-            "restartPolicy": "Always",
-            "automountServiceAccountToken": False,
-            "securityContext": _restricted_pod_security(),
-            "containers": [
-                {
-                    "name": "probe",
-                    "image": image,
-                    "imagePullPolicy": "Never",
-                    "command": ["python", "/opt/topology/topology_probe.py"],
-                    "args": ["sleep"],
-                    "env": [
-                        {
-                            "name": "RUNTIME_API_TOKEN",
-                            "valueFrom": {
-                                "secretKeyRef": {
-                                    "name": "probe-credentials",
-                                    "key": "api-token",
-                                }
-                            },
-                        }
-                    ],
-                    "securityContext": _restricted_container_security(),
-                    "resources": {
-                        "requests": {"cpu": "10m", "memory": "24Mi"},
-                        "limits": {"cpu": "500m", "memory": "128Mi"},
-                    },
-                    "volumeMounts": list(_support_mounts()),
-                }
-            ],
-            "volumes": list(_support_volumes()),
-        },
+        "spec": pod_spec,
     }
 
 
 def _gateway_resources(
-    tenant: str, image: str, source: str, api_token: str
+    tenant: str,
+    image: str,
+    source: str,
+    api_token: str,
+    image_pull_policy: str = "Never",
+    image_pull_secret: Optional[str] = None,
 ) -> Tuple[Mapping[str, Any], ...]:
     namespace = "gateway-%s" % tenant
     return (
@@ -948,12 +974,16 @@ def _gateway_resources(
             image,
             name="probe",
             app_name="tenant-ai-gateway",
+            image_pull_policy=image_pull_policy,
+            image_pull_secret=image_pull_secret,
         ),
         _probe_pod(
             tenant,
             image,
             name="rogue",
             app_name="rogue-client",
+            image_pull_policy=image_pull_policy,
+            image_pull_secret=image_pull_secret,
         ),
     )
 
@@ -965,13 +995,18 @@ def _chart_values(
     receipt_endpoint_cidr: Optional[str] = None,
     workload: str = "model-only",
     profile_name: str = "k3d-k3s-kube-router-v2",
+    image_pull_policy: str = "Never",
+    image_pull_secret: Optional[str] = None,
 ) -> Mapping[str, Any]:
-    image_values = _runtime_image_values(runtime_image)
+    image_values: Dict[str, Any] = dict(_runtime_image_values(runtime_image))
+    image_values["pullPolicy"] = image_pull_policy
+    if image_pull_secret is not None:
+        image_values["pullSecrets"] = [{"name": image_pull_secret}]
     runtime_namespace = "runtime-%s" % tenant
     values: Dict[str, Any] = {
         "fullnameOverride": "runtime",
         "replicaCount": replicas,
-        "image": {**image_values, "pullPolicy": "Never"},
+        "image": image_values,
         "runtimeConfig": {
             "existingSecret": "runtime-release",
             "rolloutId": "topology-deployment-%s" % tenant,
@@ -1238,11 +1273,18 @@ def prepare(
     receipt_base_url: Optional[str] = None,
     receipt_endpoint_cidr: Optional[str] = None,
     mcp_server_source_path: Optional[Path] = None,
+    runtime_image_pull_policy: str = "Never",
+    runtime_image_pull_secret: Optional[str] = None,
 ) -> None:
     profile = _load_profile(profile_path)
     workload = str(profile["workload"])
     mcp_enabled = workload == "mcp-read-only"
     _runtime_image_values(runtime_image)
+    if runtime_image_pull_policy not in ("Never", "IfNotPresent") or (
+        runtime_image_pull_secret is not None
+        and not _KUBERNETES_NAME_PATTERN.fullmatch(runtime_image_pull_secret)
+    ):
+        raise ValueError("runtime_image_pull_invalid")
     if runtime_version != profile["runtimeVersion"]:
         raise ValueError("runtime_version_mismatch")
     receipt_base_url, receipt_endpoint_cidr = _validated_receipt_endpoint(
@@ -1262,6 +1304,7 @@ def prepare(
     output_dir.chmod(0o700)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     resources = []
+    namespace_resources = []
     platform_tenants = []
     namespace_profiles = [
         ("runtime", "restricted"),
@@ -1273,7 +1316,9 @@ def prepare(
         namespace_profiles.append(("tools", "restricted"))
     for tenant in TENANTS:
         for prefix, policy in namespace_profiles:
-            resources.append(_namespace("%s-%s" % (prefix, tenant), tenant, policy))
+            namespace = _namespace("%s-%s" % (prefix, tenant), tenant, policy)
+            namespace_resources.append(namespace)
+            resources.append(namespace)
         release = _signed_release(tenant, now, workload)
         api_token = secrets.token_urlsafe(36)
         receipt_write_key = "pk_topology_" + secrets.token_urlsafe(36)
@@ -1318,6 +1363,8 @@ def prepare(
                 receipt_endpoint_cidr=receipt_endpoint_cidr,
                 workload=workload,
                 profile_name=str(profile["name"]),
+                image_pull_policy=runtime_image_pull_policy,
+                image_pull_secret=runtime_image_pull_secret,
             ),
         )
         if receipt_base_url is not None:
@@ -1343,13 +1390,38 @@ def prepare(
                 postgres_password,
             )
         )
-        resources.extend(_model_resources(tenant, runtime_image, source, workload))
-        resources.extend(_gateway_resources(tenant, runtime_image, source, api_token))
+        resources.extend(
+            _model_resources(
+                tenant,
+                runtime_image,
+                source,
+                workload,
+                runtime_image_pull_policy,
+                runtime_image_pull_secret,
+            )
+        )
+        resources.extend(
+            _gateway_resources(
+                tenant,
+                runtime_image,
+                source,
+                api_token,
+                runtime_image_pull_policy,
+                runtime_image_pull_secret,
+            )
+        )
         if mcp_enabled:
             mcp_token = secrets.token_urlsafe(36)
             rotated_mcp_token = secrets.token_urlsafe(36)
             resources.extend(
-                _mcp_resources(tenant, runtime_image, mcp_source or "", mcp_token)
+                _mcp_resources(
+                    tenant,
+                    runtime_image,
+                    mcp_source or "",
+                    mcp_token,
+                    runtime_image_pull_policy,
+                    runtime_image_pull_secret,
+                )
             )
             for suffix, value in (
                 ("mcp-server.env", "token=%s\n" % rotated_mcp_token),
@@ -1361,6 +1433,10 @@ def prepare(
                 path = output_dir / ("tenant-%s-rotated-%s" % (tenant, suffix))
                 path.write_text(value, encoding="utf-8")
                 path.chmod(0o600)
+    _write_json(
+        output_dir / "support-namespaces.json",
+        {"apiVersion": "v1", "kind": "List", "items": namespace_resources},
+    )
     _write_json(
         output_dir / "support-resources.json",
         {"apiVersion": "v1", "kind": "List", "items": resources},
@@ -2025,6 +2101,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prepare_parser.add_argument("--receipt-base-url")
     prepare_parser.add_argument("--receipt-endpoint-cidr")
     prepare_parser.add_argument("--mcp-server-source", type=Path)
+    prepare_parser.add_argument(
+        "--runtime-image-pull-policy",
+        choices=("Never", "IfNotPresent"),
+        default="Never",
+    )
+    prepare_parser.add_argument("--runtime-image-pull-secret")
 
     verify_platform = subparsers.add_parser("verify-platform-receipts")
     verify_platform.add_argument("--fixture", type=Path, required=True)
@@ -2104,6 +2186,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.receipt_base_url,
             args.receipt_endpoint_cidr,
             args.mcp_server_source,
+            args.runtime_image_pull_policy,
+            args.runtime_image_pull_secret,
         )
     elif args.command == "verify-platform-receipts":
         verify_platform_receipts(

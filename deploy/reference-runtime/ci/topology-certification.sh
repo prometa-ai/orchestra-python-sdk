@@ -19,6 +19,8 @@ release_tag=${PROMETA_RUNTIME_TOPOLOGY_RELEASE_TAG:-}
 release_revision=${PROMETA_RUNTIME_TOPOLOGY_RELEASE_REVISION:-}
 chart_sha256=${PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256:-}
 chart_oci_reference=${PROMETA_RUNTIME_TOPOLOGY_CHART_OCI_REFERENCE:-}
+registry_config=${PROMETA_RUNTIME_TOPOLOGY_REGISTRY_CONFIG:-}
+registry_secret_name=topology-registry
 cluster=${PROMETA_RUNTIME_TOPOLOGY_CLUSTER:-prometa-runtime-topology}
 report=${PROMETA_RUNTIME_TOPOLOGY_REPORT:-"$root/runtime-topology-certification.json"}
 keep_cluster=${PROMETA_RUNTIME_KEEP_TOPOLOGY_CLUSTER:-false}
@@ -276,6 +278,10 @@ case "$artifact_mode" in
       echo "Published topology mode requires a packaged chart file." >&2
       exit 2
     fi
+    if [ ! -f "$registry_config" ]; then
+      echo "Published topology mode requires a Docker registry config file." >&2
+      exit 2
+    fi
     "$python_command" - \
       "$runtime_image" "$release_tag" "$release_revision" \
       "$chart_sha256" "$chart_oci_reference" <<'PY'
@@ -294,6 +300,19 @@ if not re.fullmatch(digest, chart_sha256):
     raise SystemExit("published chart package SHA-256 is invalid")
 if not re.fullmatch(r"[^\s@]+@" + digest, chart_oci):
     raise SystemExit("published chart OCI reference is invalid")
+PY
+    "$python_command" - "$registry_config" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit("registry config is invalid") from None
+auths = document.get("auths") if isinstance(document, dict) else None
+if not isinstance(auths, dict) or not auths:
+    raise SystemExit("registry config has no authenticated registry")
 PY
     actual_chart_sha256=$(
       "$python_command" - "$chart" <<'PY'
@@ -436,6 +455,12 @@ prepare_args=(
   --runtime-version "$runtime_version"
   --mcp-server-source "$mcp_server_source"
 )
+if [ "$artifact_mode" = published ]; then
+  prepare_args+=(
+    --runtime-image-pull-policy IfNotPresent
+    --runtime-image-pull-secret "$registry_secret_name"
+  )
+fi
 if [ "$receipt_proof" = true ]; then
   platform_network="k3d-$cluster"
   docker network connect "$platform_network" "$platform_container"
@@ -466,13 +491,34 @@ if [ "$receipt_proof" = true ]; then
     --fixture "$assets/platform-receipt-fixture.json"
 fi
 
+images_to_import=("$postgres_node_image")
+if [ "$artifact_mode" = source ]; then
+  images_to_import=("$runtime_image" "${images_to_import[@]}")
+fi
 K3D="$k3d_command" "$image_importer" \
   "$cluster" "$server_nodes" "$agent_nodes" \
-  "$runtime_image" "$postgres_node_image"
+  "${images_to_import[@]}"
 KUBECONFIG="$kubeconfig" "$kubectl_command" wait --for=condition=Ready nodes \
   --all --timeout=180s
 KUBECONFIG="$kubeconfig" "$kubectl_command" rollout status \
   -n kube-system deployment/coredns --timeout=180s
+if [ "$artifact_mode" = published ]; then
+  KUBECONFIG="$kubeconfig" "$kubectl_command" apply \
+    -f "$assets/support-namespaces.json" >/dev/null
+  registry_namespaces=(runtime-a runtime-b gateway-a gateway-b models-a models-b)
+  if [ "$workload" = mcp-read-only ]; then
+    registry_namespaces+=(tools-a tools-b)
+  fi
+  for namespace in "${registry_namespaces[@]}"; do
+    KUBECONFIG="$kubeconfig" "$kubectl_command" create secret generic \
+      "$registry_secret_name" \
+      --namespace "$namespace" \
+      --type kubernetes.io/dockerconfigjson \
+      --from-file=.dockerconfigjson="$registry_config" \
+      --dry-run=client -o json | \
+      KUBECONFIG="$kubeconfig" "$kubectl_command" apply -f - >/dev/null
+  done
+fi
 KUBECONFIG="$kubeconfig" "$kubectl_command" apply -f "$assets/support-resources.json"
 
 for tenant in a b; do

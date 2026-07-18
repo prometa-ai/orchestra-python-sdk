@@ -204,6 +204,8 @@ def test_published_install_workflow_consumes_immutable_release_artifacts():
     assert "cosign verify-attestation" in workflow
     assert "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE: published" in workflow
     assert "PROMETA_RUNTIME_TOPOLOGY_CHART_SHA256" in workflow
+    assert "PROMETA_RUNTIME_TOPOLOGY_REGISTRY_CONFIG" in workflow
+    assert 'echo "DOCKER_CONFIG=$RUNNER_TEMP/docker-config"' in workflow
     assert "PROMETA_RUNTIME_TOPOLOGY_CLUSTER: runtime-published-install" in workflow
     assert "reference-profile-not-production-certification" in workflow
     assert "not OpenShift production certification" in workflow

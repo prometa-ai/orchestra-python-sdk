@@ -9,7 +9,7 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host,runti
 FROM ${PYTHON_IMAGE}
 
 ARG VCS_REF=unknown
-ARG IMAGE_VERSION=0.18.0
+ARG IMAGE_VERSION=0.18.1
 
 LABEL org.opencontainers.image.title="Prometa reference tenant runtime" \
       org.opencontainers.image.description="Tenant-deployed host for signed Orchestra runtime releases" \
@@ -27,7 +27,7 @@ RUN groupadd --gid 10001 runtime \
     && useradd --uid 10001 --gid runtime --create-home --shell /usr/sbin/nologin runtime
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
-      "prometa-sdk[runtime-host,runtime-mcp]==0.18.0" \
+      "prometa-sdk[runtime-host,runtime-mcp]==0.18.1" \
     && rm -rf /wheels
 
 USER 10001:10001

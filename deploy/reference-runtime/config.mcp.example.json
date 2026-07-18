@@ -2,7 +2,7 @@
   "configVersion": 1,
   "tenantId": "tenant-runtime-owner",
   "runtimeId": "runtime-mcp-prod-01",
-  "runtimeVersion": "0.18.0",
+  "runtimeVersion": "0.18.1",
   "orgId": "org-from-signed-release",
   "environment": "prod",
   "releaseId": "release-from-promotion-attestation",

@@ -9,7 +9,7 @@ replicaCount: 2
 
 image:
   repository: registry.example.com/orchestra/prometa-runtime-host
-  tag: "0.18.0"
+  tag: "0.18.1"
 
 # The chart does not create or copy MCP credentials. The host configuration
 # names this environment variable, while the operator projects its value from

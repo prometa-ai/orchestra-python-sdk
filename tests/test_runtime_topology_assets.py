@@ -2,6 +2,8 @@ import importlib.util
 import json
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -118,6 +120,7 @@ def test_topology_scripts_are_executable_and_bound_to_payload_free_report():
     assert "mcp_tool_call_indeterminate" in harness_text
     assert "runtime-mcp-credentials" in harness_text
     assert "verify-platform-receipts" in harness_text
+    assert 'PYTHON="$python_command" K3D="$k3d_command"' in harness_text
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -216,6 +219,48 @@ def test_verified_image_import_fails_closed_when_images_never_appear(
     assert result.returncode == 2
     assert (state / "count").read_text(encoding="utf-8").strip() == "2"
     assert "did not converge after 2 attempts" in result.stderr
+
+
+def test_verified_image_import_terminates_a_hung_attempt_before_retrying(
+    tmp_path, monkeypatch
+):
+    state, k3d, docker, environment = _image_import_fakes(tmp_path, succeed_on=2)
+    k3d.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+count_file="$FAKE_IMPORT_STATE/count"
+count=0
+if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+count=$((count + 1))
+printf '%s\n' "$count" >"$count_file"
+printf '%s\n' "$*" >>"$FAKE_IMPORT_STATE/calls"
+if [ "$count" -eq 1 ]; then sleep 30; fi
+""",
+        encoding="utf-8",
+    )
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("K3D", str(k3d))
+    monkeypatch.setenv("DOCKER", str(docker))
+    monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_ATTEMPTS", "2")
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_RETRY_SECONDS", "0")
+    monkeypatch.setenv("PROMETA_K3D_IMAGE_IMPORT_TIMEOUT_SECONDS", "1")
+
+    started = time.monotonic()
+    result = subprocess.run(
+        [str(IMAGE_IMPORTER), "test-cluster", "1", "0", "runtime:test"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert time.monotonic() - started < 8
+    assert (state / "count").read_text(encoding="utf-8").strip() == "2"
+    assert "exceeded 1 seconds" in result.stderr
+    assert "attempt 1/2 incomplete (status=124" in result.stderr
 
 
 def test_mcp_topology_profile_reuses_pins_but_has_an_explicit_workload():

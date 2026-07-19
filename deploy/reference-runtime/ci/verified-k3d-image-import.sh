@@ -14,19 +14,28 @@ images=("$@")
 
 k3d_command=${K3D:-k3d}
 docker_command=${DOCKER:-docker}
+python_command=${PYTHON:-python3}
 attempts=${PROMETA_K3D_IMAGE_IMPORT_ATTEMPTS:-3}
 retry_seconds=${PROMETA_K3D_IMAGE_IMPORT_RETRY_SECONDS:-2}
+import_timeout_seconds=${PROMETA_K3D_IMAGE_IMPORT_TIMEOUT_SECONDS:-120}
 
-for value in "$server_nodes" "$agent_nodes" "$attempts" "$retry_seconds"; do
+for value in "$server_nodes" "$agent_nodes" "$attempts" "$retry_seconds" \
+  "$import_timeout_seconds"; do
   case "$value" in
   ''|*[!0-9]*)
-    echo "Node counts, attempts, and retry delay must be non-negative integers." >&2
+    echo "Node counts, attempts, retry delay, and import timeout must be non-negative integers." >&2
     exit 2
     ;;
   esac
 done
-if [ "$server_nodes" -eq 0 ] || [ "$attempts" -eq 0 ]; then
-  echo "At least one server node and one import attempt are required." >&2
+if [ "$server_nodes" -eq 0 ] || [ "$attempts" -eq 0 ] || \
+   [ "$import_timeout_seconds" -eq 0 ]; then
+  echo "At least one server node, one import attempt, and a positive import timeout are required." >&2
+  exit 2
+fi
+
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  echo "Python is required to enforce the K3d image-import deadline." >&2
   exit 2
 fi
 
@@ -69,10 +78,43 @@ verify_images() {
   [ "${#missing[@]}" -eq 0 ]
 }
 
+run_import_with_deadline() {
+  "$python_command" - "$import_timeout_seconds" "$k3d_command" \
+    image import --mode direct --cluster "$cluster" "${images[@]}" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout_seconds = int(sys.argv[1])
+command = sys.argv[2:]
+process = subprocess.Popen(command, start_new_session=True)
+try:
+    raise SystemExit(process.wait(timeout=timeout_seconds))
+except subprocess.TimeoutExpired:
+    print(
+        f"K3d image import exceeded {timeout_seconds} seconds; terminating it.",
+        file=sys.stderr,
+    )
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+    raise SystemExit(124)
+PY
+}
+
 for ((attempt = 1; attempt <= attempts; attempt++)); do
   import_status=0
-  if "$k3d_command" image import --mode direct --cluster "$cluster" \
-    "${images[@]}"; then
+  if run_import_with_deadline; then
     import_status=0
   else
     import_status=$?

@@ -417,7 +417,11 @@ checksums, runtime/chart versions, and upstream K3s/PostgreSQL image digests.
 The harness refuses version drift, verifies the upstream PostgreSQL digest,
 then normalizes it to a single-platform local image so Docker Desktop and Linux
 runners import the same OCI content into every K3s node. It verifies both
-imported images on every node before applying any workload.
+imported images on every node before applying any workload. Each K3d import
+attempt is terminated after 120 seconds by default so a broken Docker stream
+cannot consume the full certification-job deadline; override the bound with
+`PROMETA_K3D_IMAGE_IMPORT_TIMEOUT_SECONDS` when slower local storage requires
+it.
 
 ### Published-artifact install proof
 

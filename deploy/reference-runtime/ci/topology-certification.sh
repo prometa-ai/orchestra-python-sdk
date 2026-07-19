@@ -495,7 +495,7 @@ images_to_import=("$postgres_node_image")
 if [ "$artifact_mode" = source ]; then
   images_to_import=("$runtime_image" "${images_to_import[@]}")
 fi
-K3D="$k3d_command" "$image_importer" \
+PYTHON="$python_command" K3D="$k3d_command" "$image_importer" \
   "$cluster" "$server_nodes" "$agent_nodes" \
   "${images_to_import[@]}"
 KUBECONFIG="$kubeconfig" "$kubectl_command" wait --for=condition=Ready nodes \

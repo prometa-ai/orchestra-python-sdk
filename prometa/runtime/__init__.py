@@ -79,6 +79,7 @@ from .admission import (
     activate_runtime_release,
 )
 from .kernel import (
+    RUNTIME_EDGE_OVERLOAD_CONTRACT,
     RuntimeExecutionError,
     ModelAdapterError,
     RuntimeEvidenceEvent,
@@ -266,6 +267,7 @@ __all__ = [
     "DenyAllToolBroker",
     "RuntimeStateStore",
     "InMemoryRuntimeStateStore",
+    "RUNTIME_EDGE_OVERLOAD_CONTRACT",
     "RuntimeExecutionPolicy",
     "RuntimeExecutionResult",
     "available_runtime_capabilities",

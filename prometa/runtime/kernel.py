@@ -14,6 +14,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from typing import (
     Any,
     Awaitable,
@@ -42,6 +43,9 @@ from .admission import (
 from .tasks import RuntimeTaskClaim
 
 
+RUNTIME_EDGE_OVERLOAD_CONTRACT = "orchestra-runtime-edge-overload-v1"
+
+
 class RuntimeExecutionError(RuntimeError):
     """Stable fail-closed execution error."""
 
@@ -59,6 +63,31 @@ class RuntimeExecutionError(RuntimeError):
 
 class ModelAdapterError(RuntimeExecutionError):
     """Normalized model-plane failure raised by a model adapter."""
+
+    def __init__(
+        self,
+        code: str,
+        message: Optional[str] = None,
+        *,
+        retryable: bool = False,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
+        if retry_after_seconds is not None and (
+            not retryable
+            or not isinstance(retry_after_seconds, (int, float))
+            or isinstance(retry_after_seconds, bool)
+            or not isfinite(retry_after_seconds)
+            or retry_after_seconds < 0
+        ):
+            raise ValueError(
+                "retry_after_seconds requires a retryable non-negative number"
+            )
+        self.retry_after_seconds = (
+            float(retry_after_seconds)
+            if retry_after_seconds is not None
+            else None
+        )
+        super().__init__(code, message, retryable=retryable)
 
 
 def _strict_json_loads(value: str) -> Any:
@@ -273,10 +302,13 @@ class RuntimeExecutionPolicy:
     timeout_seconds: float = 30.0
     tool_timeout_seconds: float = 30.0
     initial_backoff_seconds: float = 0.1
+    max_backoff_seconds: float = 30.0
+    max_retry_after_seconds: float = 30.0
     max_steps: int = 8
     fallback_model_names: Tuple[str, ...] = ()
     circuit_failure_threshold: int = 3
     circuit_reset_seconds: float = 30.0
+    overload_contract_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_attempts_per_model <= 5:
@@ -285,12 +317,23 @@ class RuntimeExecutionPolicy:
             raise ValueError("timeouts must be positive")
         if self.initial_backoff_seconds < 0:
             raise ValueError("initial_backoff_seconds must not be negative")
+        if self.max_backoff_seconds < self.initial_backoff_seconds:
+            raise ValueError(
+                "max_backoff_seconds must be at least initial_backoff_seconds"
+            )
+        if self.max_retry_after_seconds < 0:
+            raise ValueError("max_retry_after_seconds must not be negative")
         if not 1 <= self.max_steps <= 64:
             raise ValueError("max_steps must be between 1 and 64")
         if not 1 <= self.circuit_failure_threshold <= 100:
             raise ValueError("circuit_failure_threshold must be between 1 and 100")
         if self.circuit_reset_seconds <= 0:
             raise ValueError("circuit_reset_seconds must be positive")
+        if self.overload_contract_id not in {
+            None,
+            RUNTIME_EDGE_OVERLOAD_CONTRACT,
+        }:
+            raise ValueError("overload_contract_id is unsupported")
         if any(
             not isinstance(name, str)
             or not name.strip()
@@ -491,6 +534,10 @@ class RuntimeKernel:
         attributes: Optional[Mapping[str, Any]] = None,
     ) -> None:
         merged = self._identity_attributes(request_id)
+        if self.policy.overload_contract_id is not None:
+            merged["prometa.runtime.edge_overload_contract"] = (
+                self.policy.overload_contract_id
+            )
         if attributes:
             merged.update(attributes)
         event = RuntimeEvidenceEvent(
@@ -1182,16 +1229,21 @@ class RuntimeKernel:
 
                     last_error = failure
                     self._model_failed(model, request_id)
+                    failure_attributes = {
+                        "gen_ai.request.model": model.model_name,
+                        "retry.attempt_number": retry_attempt,
+                        "prometa.runtime.reason": failure.code,
+                        "prometa.runtime.retryable": failure.retryable,
+                    }
+                    if failure.retry_after_seconds is not None:
+                        failure_attributes["retry.server_retry_after_ms"] = int(
+                            failure.retry_after_seconds * 1000
+                        )
                     self._emit(
                         "runtime.model.attempt",
                         "failed",
                         request_id,
-                        {
-                            "gen_ai.request.model": model.model_name,
-                            "retry.attempt_number": retry_attempt,
-                            "prometa.runtime.reason": failure.code,
-                            "prometa.runtime.retryable": failure.retryable,
-                        },
+                        failure_attributes,
                     )
                     if executed_tool and failure.retryable:
                         raise RuntimeExecutionError(
@@ -1201,9 +1253,33 @@ class RuntimeKernel:
                     if not failure.retryable:
                         raise failure
                     if retry_attempt < self.policy.max_attempts_per_model:
-                        backoff = self.policy.initial_backoff_seconds * (
-                            2 ** (retry_attempt - 1)
+                        retry_after = failure.retry_after_seconds
+                        if (
+                            retry_after is not None
+                            and retry_after > self.policy.max_retry_after_seconds
+                        ):
+                            self._emit(
+                                "runtime.retry",
+                                "skipped",
+                                request_id,
+                                {
+                                    "gen_ai.request.model": model.model_name,
+                                    "retry.attempt_number": retry_attempt + 1,
+                                    "retry.server_retry_after_ms": int(
+                                        retry_after * 1000
+                                    ),
+                                    "prometa.runtime.reason": (
+                                        "retry_after_exceeds_budget"
+                                    ),
+                                },
+                            )
+                            break
+                        exponential_backoff = min(
+                            self.policy.max_backoff_seconds,
+                            self.policy.initial_backoff_seconds
+                            * (2 ** (retry_attempt - 1)),
                         )
+                        backoff = max(exponential_backoff, retry_after or 0.0)
                         self._emit(
                             "runtime.retry",
                             "scheduled",
@@ -1212,6 +1288,12 @@ class RuntimeKernel:
                                 "gen_ai.request.model": model.model_name,
                                 "retry.attempt_number": retry_attempt + 1,
                                 "retry.backoff_ms": int(backoff * 1000),
+                                "retry.backoff_source": (
+                                    "server"
+                                    if retry_after is not None
+                                    and retry_after >= exponential_backoff
+                                    else "runtime"
+                                ),
                             },
                         )
                         await self._sleep(backoff)
@@ -1265,6 +1347,7 @@ __all__ = [
     "RuntimeStateStore",
     "InMemoryRuntimeStateStore",
     "RuntimeExecutionPolicy",
+    "RUNTIME_EDGE_OVERLOAD_CONTRACT",
     "RuntimeExecutionResult",
     "available_runtime_capabilities",
     "RuntimeKernel",

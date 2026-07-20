@@ -110,6 +110,9 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if and .Values.networkPolicy.enabled (empty .Values.networkPolicy.egress) -}}
 {{- fail "networkPolicy.egress must explicitly allow the runtime database and model gateway" -}}
 {{- end -}}
+{{- if and (not (empty .Values.runtimeEdge.overloadContract)) (ne .Values.runtimeEdge.overloadContract "orchestra-runtime-edge-overload-v1") -}}
+{{- fail "runtimeEdge.overloadContract is unsupported" -}}
+{{- end -}}
 {{- if and .Values.autoscaling.enabled (empty .Values.autoscaling.targetCPUUtilizationPercentage) (empty .Values.autoscaling.targetMemoryUtilizationPercentage) -}}
 {{- fail "autoscaling requires at least one CPU or memory utilization target" -}}
 {{- end -}}
@@ -124,6 +127,9 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- if .Values.productionProfile.enabled -}}
 {{- $profileId := required "productionProfile.profileId is required" .Values.productionProfile.profileId -}}
+{{- if ne .Values.runtimeEdge.overloadContract "orchestra-runtime-edge-overload-v1" -}}
+{{- fail "the OpenShift runtime profile requires orchestra-runtime-edge-overload-v1" -}}
+{{- end -}}
 {{- if ne .Values.productionProfile.imageFlavor "ubi9" -}}
 {{- fail "productionProfile.imageFlavor must be ubi9" -}}
 {{- end -}}
@@ -184,7 +190,7 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
+{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
 {{- fail (printf "extraEnv cannot override reserved variable %s" .name) -}}
 {{- end -}}
 {{- end -}}

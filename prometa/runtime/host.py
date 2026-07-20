@@ -41,6 +41,7 @@ from .kernel import (
     EvidenceEmitter,
     GuardEvaluator,
     HumanEscalation,
+    RUNTIME_EDGE_OVERLOAD_CONTRACT,
     RuntimeEvidenceEvent,
     RuntimeExecutionError,
     RuntimeExecutionPolicy,
@@ -102,6 +103,7 @@ _ENVIRONMENT_NAME_FIRST = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 )
 _ENVIRONMENT_NAME_CHARACTERS = _ENVIRONMENT_NAME_FIRST.union("0123456789")
+_RUNTIME_EDGE_OVERLOAD_CONTRACT_ENV = "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT"
 
 
 class RuntimeHostError(RuntimeError):
@@ -1612,6 +1614,14 @@ def build_reference_runtime_host(
     """Activate configured artifacts and construct the tenant request host."""
 
     env = environment if environment is not None else os.environ
+    overload_contract = env.get(_RUNTIME_EDGE_OVERLOAD_CONTRACT_ENV, "").strip()
+    if overload_contract and overload_contract != RUNTIME_EDGE_OVERLOAD_CONTRACT:
+        raise RuntimeHostError("runtime_edge_overload_contract_unsupported")
+    if (
+        overload_contract == RUNTIME_EDGE_OVERLOAD_CONTRACT
+        and config.model_gateway_endpoint_path != "/v1/chat/completions"
+    ):
+        raise RuntimeHostError("runtime_edge_model_endpoint_unsupported")
     dsn = env.get(config.database_dsn_env, "").strip()
     if not dsn:
         raise RuntimeHostError("runtime_database_url_missing")
@@ -1780,6 +1790,7 @@ def build_reference_runtime_host(
                 if config.mcp_broker is not None
                 else 30.0
             ),
+            overload_contract_id=overload_contract or None,
         ),
         guard_evaluator=guard_evaluator,
         tool_broker=tool_broker,

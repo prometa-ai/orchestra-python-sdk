@@ -58,7 +58,9 @@ def test_runtime_ubi_image_and_openshift_profile_are_explicitly_bounded():
 
     assert 'digest: ""' in values
     assert "productionProfile:" in values
+    assert 'overloadContract: ""' in values
     assert "profileId: orchestra-ocp-4.20-amd64-v1" in profile
+    assert "overloadContract: orchestra-runtime-edge-overload-v1" in profile
     assert "namespaceDefaultDenyAcknowledged: false" in profile
     assert "modelGatewayApiKeyOptional: false" in profile
     assert "receiptApiKeyOptional: false" in profile
@@ -66,6 +68,8 @@ def test_runtime_ubi_image_and_openshift_profile_are_explicitly_bounded():
     assert "the OpenShift runtime profile requires" in helpers
     assert "a separate migration credential Secret" in helpers
     assert "prometa.io/production-profile-id" in deployment
+    assert "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" in deployment
+    assert "orchestra-runtime-edge-overload-v1" in helpers
 
 
 def test_runtime_topology_profiles_follow_current_chart_version():

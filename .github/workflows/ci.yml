@@ -393,6 +393,7 @@ jobs:
           grep -qF 'prometa.io/production-profile-id: "orchestra-ocp-4.20-amd64-v1"' runtime-chart-openshift.yaml
           grep -qF 'image: "registry.example.test/orchestra/prometa-runtime-host-ubi9@sha256:aaaaaaaa' runtime-chart-openshift.yaml
           grep -qF 'prometa.io/runtime-config-rollout-id: "deployment-prod-v1"' runtime-chart-openshift.yaml
+          grep -qF 'value: "orchestra-runtime-edge-overload-v1"' runtime-chart-openshift.yaml
           grep -qF 'secretName: "orchestra-runtime-release-prod-v1"' runtime-chart-openshift.yaml
           grep -qF 'name: "orchestra-runtime-credentials"' runtime-chart-openshift.yaml
           grep -qF 'name: "orchestra-runtime-migration-credentials"' runtime-chart-openshift.yaml
@@ -433,6 +434,19 @@ jobs:
             "${OPENSHIFT_ARGS[@]}" --set image.digest=sha256:ABC \
             >/dev/null 2>&1; then
             echo "OpenShift runtime profile accepted a mutable or invalid image identity" >&2
+            exit 1
+          fi
+          if helm template openshift-invalid-overload-contract "$chart" \
+            -f "$openshift" "${OPENSHIFT_ARGS[@]}" \
+            --set runtimeEdge.overloadContract=unknown-contract \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted an unknown overload contract" >&2
+            exit 1
+          fi
+          if helm template reserved-overload-contract "$chart" -f "$example" \
+            --set 'extraEnv[0].name=PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT' \
+            --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
+            echo "chart allowed overload contract environment override" >&2
             exit 1
           fi
 

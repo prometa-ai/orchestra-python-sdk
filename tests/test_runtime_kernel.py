@@ -29,6 +29,7 @@ from prometa.runtime import (
     ModelAdapterError,
     ModelInvocationResponse,
     ModelToolCall,
+    RUNTIME_EDGE_OVERLOAD_CONTRACT,
     RuntimeAdmissionPolicy,
     RuntimeEvidenceEvent,
     RuntimeExecutionError,
@@ -389,6 +390,103 @@ def test_retry_circuit_open_and_deterministic_fallback() -> None:
         event.name == "runtime.circuit_breaker" and event.outcome == "denied"
         for event in emitter.events
     )
+
+
+def test_certified_runtime_edge_honors_server_backpressure_and_emits_contract() -> None:
+    _, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelAdapterError(
+            "overloaded",
+            retryable=True,
+            retry_after_seconds=2,
+        ),
+        ModelInvocationResponse(content='{"answer":"ready"}'),
+    )
+    sleeps = []
+
+    async def no_sleep(value):
+        sleeps.append(value)
+
+    kernel, emitter = _kernel(
+        admitted,
+        adapter,
+        execution_policy=RuntimeExecutionPolicy(
+            overload_contract_id=RUNTIME_EDGE_OVERLOAD_CONTRACT,
+        ),
+        sleep=no_sleep,
+    )
+    result = asyncio.run(kernel.execute({"question": "hello"}))
+
+    assert result.output == {"answer": "ready"}
+    assert sleeps == [2]
+    scheduled = next(
+        event
+        for event in emitter.events
+        if event.name == "runtime.retry" and event.outcome == "scheduled"
+    )
+    assert scheduled.attributes["retry.backoff_source"] == "server"
+    assert scheduled.attributes["retry.backoff_ms"] == 2000
+    assert all(
+        event.attributes["prometa.runtime.edge_overload_contract"]
+        == RUNTIME_EDGE_OVERLOAD_CONTRACT
+        for event in emitter.events
+    )
+
+
+def test_certified_runtime_edge_skips_retry_after_outside_budget() -> None:
+    _, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelAdapterError(
+            "overloaded",
+            retryable=True,
+            retry_after_seconds=31,
+        ),
+        ModelInvocationResponse(content='{"answer":"fallback"}'),
+    )
+    sleeps = []
+
+    async def no_sleep(value):
+        sleeps.append(value)
+
+    kernel, emitter = _kernel(
+        admitted,
+        adapter,
+        execution_policy=RuntimeExecutionPolicy(
+            fallback_model_names=("Fallback",),
+            overload_contract_id=RUNTIME_EDGE_OVERLOAD_CONTRACT,
+        ),
+        sleep=no_sleep,
+    )
+    result = asyncio.run(kernel.execute({"question": "hello"}))
+
+    assert result.used_fallback is True
+    assert sleeps == []
+    skipped = next(
+        event
+        for event in emitter.events
+        if event.name == "runtime.retry" and event.outcome == "skipped"
+    )
+    assert skipped.attributes["prometa.runtime.reason"] == (
+        "retry_after_exceeds_budget"
+    )
+    assert skipped.attributes["retry.server_retry_after_ms"] == 31_000
+
+
+def test_model_adapter_retry_after_requires_retryable_bounded_metadata() -> None:
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        ModelAdapterError(
+            "rejected",
+            retryable=False,
+            retry_after_seconds=1,
+        )
+    with pytest.raises(ValueError, match="retry_after_seconds"):
+        ModelAdapterError(
+            "overloaded",
+            retryable=True,
+            retry_after_seconds=float("nan"),
+        )
+    with pytest.raises(ValueError, match="overload_contract_id"):
+        RuntimeExecutionPolicy(overload_contract_id="unknown-contract")
 
 
 def test_non_retryable_model_failure_does_not_fallback() -> None:

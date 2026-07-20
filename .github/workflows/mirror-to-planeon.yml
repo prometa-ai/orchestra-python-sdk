@@ -1,0 +1,47 @@
+name: Mirror to planeon-python-sdk
+
+# Keeps caglarsubas/planeon-python-sdk an exact mirror of this repo.
+# Fires whenever a merge/push, branch/tag creation, or deletion happens here,
+# then force-mirrors ALL branches and tags to the destination.
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  create:
+  delete:
+  workflow_dispatch:
+
+# Never run two mirror pushes at once; let the newest queue behind the running one.
+concurrency:
+  group: mirror-to-planeon
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Force-mirror all branches and tags to planeon-python-sdk
+        env:
+          MIRROR_DEPLOY_KEY: ${{ secrets.PLANEON_MIRROR_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Destination write key (SSH deploy key on caglarsubas/planeon-python-sdk)
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"
+
+          # Fresh bare mirror of the source (public repo -> no creds needed to read)
+          git clone --mirror https://github.com/prometa-ai/orchestra-python-sdk.git src.git
+          cd src.git
+
+          # Drop GitHub's internal pull refs so only real branches/tags get mirrored.
+          git for-each-ref --format='%(refname)' 'refs/pull/*' \
+            | while read -r r; do git update-ref -d "$r"; done
+
+          # Exact replica: adds, updates (force), and deletions of every branch + tag.
+          git push --mirror git@github.com:caglarsubas/planeon-python-sdk.git

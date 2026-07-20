@@ -39,9 +39,9 @@ jobs:
           git clone --mirror https://github.com/prometa-ai/orchestra-python-sdk.git src.git
           cd src.git
 
-          # Drop GitHub's internal pull refs so only real branches/tags get mirrored.
-          git for-each-ref --format='%(refname)' 'refs/pull/*' \
-            | while read -r r; do git update-ref -d "$r"; done
-
-          # Exact replica: adds, updates (force), and deletions of every branch + tag.
-          git push --mirror git@github.com:caglarsubas/planeon-python-sdk.git
+          # Push ONLY real branches + tags (never GitHub's hidden refs/pull/*),
+          # force-updating and pruning so the destination is an exact replica:
+          # adds, updates (incl. rebased/force-pushed branches), and deletions.
+          git push --prune git@github.com:caglarsubas/planeon-python-sdk.git \
+            '+refs/heads/*:refs/heads/*' \
+            '+refs/tags/*:refs/tags/*'

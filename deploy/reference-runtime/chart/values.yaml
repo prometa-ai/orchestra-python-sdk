@@ -23,6 +23,12 @@ productionProfile:
   # a namespace-wide default deny must exist before Helm starts pre-install hooks.
   namespaceDefaultDenyAcknowledged: false
 
+# The certified profile binds bounded per-request retries and server
+# backpressure handling. Distributed admission, fairness, and autoscaling stay
+# at the tenant gateway/deployment edge.
+runtimeEdge:
+  overloadContract: ""
+
 serviceAccount:
   create: true
   name: ""

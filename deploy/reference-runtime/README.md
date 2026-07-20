@@ -19,7 +19,7 @@ Build from the SDK repository root:
 
 ```bash
 docker build -f deploy/reference-runtime/Dockerfile \
-  -t prometa-runtime-host:0.18.0 .
+  -t prometa-runtime-host:0.18.2 .
 ```
 
 Run the combined profile through a fresh container process per case:
@@ -28,7 +28,7 @@ Run the combined profile through a fresh container process per case:
 prometa-runtime-conformance \
   --profile deployment \
   --driver-name reference-host-container \
-  --command "docker run --rm -i --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:0.18.0"
+  --command "docker run --rm -i --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:0.18.2"
 ```
 
 A green report proves the packaged admission, execution, failure, and
@@ -41,9 +41,9 @@ Each SDK release publishes the optional tenant runtime as three independent OCI
 artifacts from the exact immutable SDK tag:
 
 ```text
-ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host:v0.18.0
-ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9:v0.18.0
-oci://ghcr.io/prometa-ai/orchestra-python-sdk/charts/prometa-runtime:0.3.1
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host:v0.18.2
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9:v0.18.2
+oci://ghcr.io/prometa-ai/orchestra-python-sdk/charts/prometa-runtime:0.3.3
 ```
 
 The Debian and UBI9 images are Linux AMD64 release artifacts. The workflow
@@ -85,6 +85,9 @@ provider:
 
 - `PROMETA_RUNTIME_DATABASE_URL`: tenant PostgreSQL DSN;
 - `PROMETA_RUNTIME_API_TOKEN`: at least 32 bytes, required by the request API;
+- `PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT`: optional outside the declared
+  production profile; the only supported value is
+  `orchestra-runtime-edge-overload-v1`.
 - `MODEL_GATEWAY_API_KEY`: required only when `modelGateway.apiKeyEnv` names it.
 - `ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY`: required only when
   `controlPlanePull.apiKeyEnv` names it; use a narrow `runtime:read` key.
@@ -177,6 +180,12 @@ prometa-runtime-host --config /etc/prometa-runtime/config.json
 port only to the tenant gateway or private network in production. This first
 host does not terminate TLS, implement a distributed rate limit, or prove
 overload fairness; the tenant gateway and deployment topology own those controls.
+When `PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT` selects
+`orchestra-runtime-edge-overload-v1`, the host accepts only the chat-completions
+model workload, honors normalized `Retry-After` delays within its 30-second
+budget, skips longer waits, and stamps the contract ID on runtime evidence.
+This is per-request protection, not distributed admission control: tenant edge
+infrastructure still owns fairness, queueing, load shedding, and autoscaling.
 
 ## Backup, restore, and recovery verification
 
@@ -254,6 +263,13 @@ digest, one immutable signed-release config Secret per deployment, separate
 runtime and migration credential Secrets, the release rollout ID, and exact
 gateway/dependency NetworkPolicy rules.
 
+The overlay also pins
+`runtimeEdge.overloadContract=orchestra-runtime-edge-overload-v1`. Helm rejects
+an unknown or missing production contract and prevents `extraEnv` from
+overriding it. Host startup fails if that contract is paired with a model path
+other than `/v1/chat/completions`. The tenant gateway remains the owner of
+distributed overload controls.
+
 Before Helm runs, the tenant operator must create the namespace-wide
 default-deny policy and the dedicated `migration.serviceAccountName`. The chart
 creates a hook-weighted allow policy for the migration and compatibility Jobs,
@@ -266,7 +282,7 @@ Build the UBI variant with the pinned build/runtime bases:
 
 ```bash
 docker build -f deploy/reference-runtime/Dockerfile.ubi \
-  -t registry.example.com/orchestra/prometa-runtime-host-ubi9:0.18.0 .
+  -t registry.example.com/orchestra/prometa-runtime-host-ubi9:0.18.2 .
 ```
 
 Then render with customer-owned values:
@@ -485,7 +501,7 @@ gh workflow run runtime-published-upgrade-rollback.yml \
   --repo prometa-ai/orchestra-python-sdk \
   --ref main \
   -f baseline_tag=v0.18.0 \
-  -f target_tag=v0.18.1
+  -f target_tag=v0.18.2
 ```
 
 This closes the separately published release-channel transition gap only for

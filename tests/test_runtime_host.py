@@ -44,6 +44,7 @@ from prometa.runtime import (
     RuntimeHostError,
     RuntimeHostConfig,
     RuntimeKernel,
+    RUNTIME_EDGE_OVERLOAD_CONTRACT,
     RuntimePersistenceError,
     RuntimeTool,
     admit_runtime_release,
@@ -931,6 +932,40 @@ def test_host_rejects_incompatible_database_before_release_activation(
     assert caught.value.code == "runtime_schema_too_new"
 
 
+def test_reference_host_rejects_unknown_or_incompatible_edge_contract(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_config_document()), encoding="utf-8")
+    config = load_runtime_host_config(path)
+    base_environment = {
+        "PROMETA_RUNTIME_DATABASE_URL": "postgresql://unused",
+        "PROMETA_RUNTIME_API_TOKEN": API_TOKEN,
+    }
+
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            config,
+            environment={
+                **base_environment,
+                "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT": "unknown-contract",
+            },
+        )
+    assert caught.value.code == "runtime_edge_overload_contract_unsupported"
+
+    with pytest.raises(RuntimeHostError) as caught:
+        build_reference_runtime_host(
+            replace(config, model_gateway_endpoint_path="/v1/embeddings"),
+            environment={
+                **base_environment,
+                "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT": (
+                    RUNTIME_EDGE_OVERLOAD_CONTRACT
+                ),
+            },
+        )
+    assert caught.value.code == "runtime_edge_model_endpoint_unsupported"
+
+
 def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
     tmp_path, monkeypatch
 ) -> None:
@@ -957,6 +992,9 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
     environment = {
         "PROMETA_RUNTIME_DATABASE_URL": "postgresql://unused",
         "PROMETA_RUNTIME_API_TOKEN": API_TOKEN,
+        "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT": (
+            RUNTIME_EDGE_OVERLOAD_CONTRACT
+        ),
         "MODEL_GATEWAY_API_KEY": "model-key",
         "MCP_ORDERS_AUTHORIZATION": "Bearer tenant-mcp-key",
     }
@@ -987,6 +1025,10 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
         assert created is True
         assert isinstance(host.kernel.tool_broker, GovernedMcpToolBroker)
         assert host.kernel.policy.tool_timeout_seconds == 25
+        assert (
+            host.kernel.policy.overload_contract_id
+            == RUNTIME_EDGE_OVERLOAD_CONTRACT
+        )
     finally:
         host.close()
 

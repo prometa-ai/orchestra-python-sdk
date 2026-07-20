@@ -64,6 +64,8 @@ spec:
               value: "0.0.0.0"
             - name: PROMETA_RUNTIME_CONFIG
               value: {{ printf "/etc/prometa-runtime/%s" .Values.runtimeConfig.targetFile | quote }}
+            - name: PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT
+              value: {{ .Values.runtimeEdge.overloadContract | quote }}
             - name: PROMETA_RUNTIME_DATABASE_URL
               valueFrom:
                 secretKeyRef:

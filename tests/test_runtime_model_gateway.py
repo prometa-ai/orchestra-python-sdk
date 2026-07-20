@@ -7,6 +7,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -213,7 +214,36 @@ def test_http_statuses_preserve_retry_semantics_and_hide_token(monkeypatch) -> N
         asyncio.run(adapter.invoke(_request()))
     assert caught.value.code == "model_http_429"
     assert caught.value.retryable is True
+    assert caught.value.retry_after_seconds is None
     assert "do-not-print" not in str(caught.value)
+
+
+def test_retry_after_is_normalized_without_permitting_fail_open_values(
+    monkeypatch,
+) -> None:
+    def throttled(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "throttled",
+            {"Retry-After": "42"},
+            io.BytesIO(b'{}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", throttled)
+    adapter = OpenAICompatibleModelAdapter("https://models.tenant.example")
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(adapter.invoke(_request()))
+    assert caught.value.retry_after_seconds == 42
+
+    now = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    retry_at = now + timedelta(seconds=17)
+    assert adapter._retry_after_seconds(
+        {"Retry-After": retry_at.strftime("%a, %d %b %Y %H:%M:%S GMT")},
+        now=now,
+    ) == 17
+    assert adapter._retry_after_seconds({"Retry-After": "invalid"}, now=now) is None
+    assert adapter._retry_after_seconds({"Retry-After": "999999"}) == 86_400
 
 
 def test_response_size_limit_and_url_configuration_are_strict(monkeypatch) -> None:

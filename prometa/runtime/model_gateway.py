@@ -6,6 +6,8 @@ import asyncio
 import json
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -116,6 +118,32 @@ class OpenAICompatibleModelAdapter:
         return status in {408, 409, 425, 429} or status >= 500
 
     @staticmethod
+    def _retry_after_seconds(
+        headers: Mapping[str, str],
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[float]:
+        value = headers.get("Retry-After") or headers.get("retry-after")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        candidate = value.strip()
+        if candidate.isdigit():
+            seconds = float(candidate)
+        else:
+            try:
+                retry_at = parsedate_to_datetime(candidate)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            current = now or datetime.now(timezone.utc)
+            seconds = max(0.0, (retry_at - current).total_seconds())
+        # The runtime policy applies its much smaller retry budget. Preserve
+        # oversized delays as a bounded value so they fail closed instead of
+        # becoming an immediate retry.
+        return min(seconds, 86_400.0)
+
+    @staticmethod
     def _parse_response(data: bytes) -> ModelInvocationResponse:
         document = _strict_json_loads(data, "model_response_invalid_json")
         if not isinstance(document, dict):
@@ -196,10 +224,14 @@ class OpenAICompatibleModelAdapter:
             ) as response:
                 data = response.read(self.max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
+            retryable = self._retryable_status(exc.code)
             raise ModelAdapterError(
                 "model_http_%s" % exc.code,
                 "Model gateway returned HTTP %s" % exc.code,
-                retryable=self._retryable_status(exc.code),
+                retryable=retryable,
+                retry_after_seconds=(
+                    self._retry_after_seconds(exc.headers) if retryable else None
+                ),
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ModelAdapterError("model_transport_failed", retryable=True) from exc

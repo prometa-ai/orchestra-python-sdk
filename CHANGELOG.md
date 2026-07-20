@@ -9,6 +9,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Runtime edge overload contract `orchestra-runtime-edge-overload-v1`, selected
+  by the declared OpenShift profile and emitted on every kernel evidence event.
+  It freezes bounded per-request model retries for chat completions while
+  keeping distributed admission, fairness, queueing, load shedding, and
+  autoscaling at the tenant gateway/deployment edge.
+- Strict Helm and host admission for the runtime edge contract. Unknown IDs,
+  production-profile omission, environment override, and non-chat model paths
+  fail before serving requests; non-production profiles remain unrestricted.
 - Exact-tag publication of Linux AMD64 Debian and UBI9 reference-runtime images
   plus the OCI Helm chart, with immutable digest metadata, SPDX/CycloneDX SBOMs,
   keyless signatures, SBOM attestations, build provenance, and post-publish
@@ -104,6 +112,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- OpenAI-compatible model errors now normalize integer and HTTP-date
+  `Retry-After` values. The runtime honors delays inside its configured budget
+  and skips the retry when the server delay exceeds it, preventing local retry
+  amplification during model-plane overload.
 - K3d topology certification now uses verified direct image imports with
   bounded retries, preventing a successful K3d exit from masking a transient
   missing tarball or an image absent from any server or agent node.

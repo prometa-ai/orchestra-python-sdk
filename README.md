@@ -9,9 +9,12 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.18.0 adds a first tenant-deployed
+and joinable on the platform. Version 0.18.0 added a first tenant-deployed
 reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. Current source also adds a
+container around the optional Phase 2A kernel. Version 0.18.2 adds the named
+`orchestra-runtime-edge-overload-v1` production contract: bounded local model
+retries honor `Retry-After`, skip waits outside the configured budget, and emit
+the contract ID as payload-free evidence. Current source also includes a
 governed tenant-side MCP broker as a separate optional extra, strict reference
 host wiring for read-only MCP bundles, and shared PostgreSQL MCP call admission
 and payload-free audit. A separate pinned K3s profile now exercises that
@@ -58,7 +61,7 @@ to the default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.18.0**. Release history is on
+Current source version: **0.18.2**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit
@@ -211,7 +214,12 @@ profile transition, and bundles without a runtime contract remain
 integrity-verifiable but non-executable by default.
 
 The kernel bounds model/tool timeouts, retries, exponential backoff, circuit
-breaking, topology steps, cancellation, and deterministic fallback. It refuses
+breaking, topology steps, cancellation, and deterministic fallback. Under the
+optional `orchestra-runtime-edge-overload-v1` contract, retryable model errors
+may carry normalized server `Retry-After` metadata. The runtime waits for the
+greater of its local backoff and the server delay, bounded to 30 seconds by the
+reference policy; a longer server delay skips that model retry and advances to
+an explicitly signed fallback or fails. It refuses
 model retry or fallback after a tool call and rejects duplicate tool-call IDs.
 The initial kernel accepts only `single-react` bundles; other signed topology
 patterns fail admission until their execution contracts exist. It emits
@@ -526,6 +534,11 @@ the call before transport. Optional `taskRecovery` extends duplicate rejection
 across replicas and records ordered model-only lifecycle metadata. It cannot be
 combined with tool-bearing releases and does not claim exactly-once model
 invocation, TLS termination, distributed rate limiting, or overload fairness.
+The declared OpenShift profile sets
+`PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT=orchestra-runtime-edge-overload-v1`
+and accepts only `/v1/chat/completions`; development profiles remain
+unrestricted. The tenant gateway still owns admission control, distributed
+rate limits, fairness, queueing, load shedding, and autoscaling.
 
 Optional `receiptDelivery` configuration adds durable asynchronous `admitted`
 and `active` lifecycle evidence. The host commits receipts to its PostgreSQL

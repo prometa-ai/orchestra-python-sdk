@@ -11,6 +11,9 @@ productionProfile:
   # Set true only after namespace-wide default deny exists before Helm hooks.
   namespaceDefaultDenyAcknowledged: false
 
+runtimeEdge:
+  overloadContract: orchestra-runtime-edge-overload-v1
+
 fullnameOverride: orchestra-runtime
 
 image:

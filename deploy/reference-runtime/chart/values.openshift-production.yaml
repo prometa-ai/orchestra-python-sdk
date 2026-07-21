@@ -67,6 +67,23 @@ service:
   type: ClusterIP
   port: 8080
 
+# cert-manager or the tenant Secret operator owns this Secret and its rotation.
+# The base reference profile requires server TLS; mTLS remains an explicit
+# tenant choice and additionally requires serverTls.probeClient.existingSecret.
+serverTls:
+  enabled: true
+  existingSecret: ""
+  certificateKey: tls.crt
+  privateKeyKey: tls.key
+  clientCaKey: ca.crt
+  requireClientCertificate: false
+  rolloutId: ""
+  probeClient:
+    existingSecret: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
+
 autoscaling:
   enabled: true
   minReplicas: 2

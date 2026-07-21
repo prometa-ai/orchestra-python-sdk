@@ -177,9 +177,14 @@ prometa-runtime-host --config /etc/prometa-runtime/config.json
 ```
 
 `compose.yaml` demonstrates that ordering with PostgreSQL 16. Bind the request
-port only to the tenant gateway or private network in production. This first
-host does not terminate TLS, implement a distributed rate limit, or prove
-overload fairness; the tenant gateway and deployment topology own those controls.
+port only to the tenant gateway or private network in production. Plain HTTP is
+the backward-compatible default. Set `PROMETA_RUNTIME_SERVER_TLS_CERT_FILE` and
+`PROMETA_RUNTIME_SERVER_TLS_KEY_FILE` together to terminate TLS in the host.
+Optional mTLS additionally sets `PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE` and
+`PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE=true`; malformed or
+incomplete material fails startup. The bearer-token boundary remains active
+after the handshake. The host does not implement a distributed rate limit or
+prove overload fairness; the tenant gateway and deployment topology own those controls.
 When `PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT` selects
 `orchestra-runtime-edge-overload-v1`, the host accepts only the chat-completions
 model workload, honors normalized `Retry-After` delays within its 30-second
@@ -262,6 +267,15 @@ installable unchanged. A tenant overlay must provide the immutable UBI9 image
 digest, one immutable signed-release config Secret per deployment, separate
 runtime and migration credential Secrets, the release rollout ID, and exact
 gateway/dependency NetworkPolicy rules.
+
+The OpenShift profile also requires `serverTls.enabled=true`, an existing
+certificate Secret, and a bounded `serverTls.rolloutId`. The chart never creates
+certificate material. Ordinary TLS uses kubelet HTTPS probes. Enabling
+`serverTls.requireClientCertificate` additionally requires a separate
+least-privilege `serverTls.probeClient.existingSecret`; exec probes use that
+identity because kubelet HTTP probes cannot present a client certificate. The
+server and probe Secrets can be independently rotated by cert-manager or an
+external Secret operator, with rollout IDs driving process restart.
 
 The overlay also pins
 `runtimeEdge.overloadContract=orchestra-runtime-edge-overload-v1`. Helm rejects

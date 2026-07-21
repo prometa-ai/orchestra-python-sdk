@@ -55,6 +55,6 @@ USER 1001
 EXPOSE 8080
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-  CMD ["python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8080'), timeout=2).read()"]
+  CMD ["python", "-c", "import os,ssl,urllib.request;t=os.environ.get('PROMETA_RUNTIME_SERVER_TLS_CERT_FILE');c=ssl.create_default_context(cafile=os.environ.get('PROMETA_RUNTIME_PROBE_TLS_CA_FILE') or t) if t else None;t and setattr(c,'check_hostname',False);p=os.environ.get('PROMETA_RUNTIME_PROBE_TLS_CERT_FILE');p and c.load_cert_chain(p,os.environ['PROMETA_RUNTIME_PROBE_TLS_KEY_FILE']);urllib.request.urlopen(('%s://127.0.0.1:%s/healthz' % ('https' if t else 'http',os.environ.get('PORT','8080'))),timeout=2,context=c).read()"]
 
 ENTRYPOINT ["prometa-runtime-host"]

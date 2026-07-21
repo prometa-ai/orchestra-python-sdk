@@ -533,7 +533,10 @@ dependencies, credentials, egress grants, or release bindings fail startup or
 the call before transport. Optional `taskRecovery` extends duplicate rejection
 across replicas and records ordered model-only lifecycle metadata. It cannot be
 combined with tool-bearing releases and does not claim exactly-once model
-invocation, TLS termination, distributed rate limiting, or overload fairness.
+invocation, distributed rate limiting, or overload fairness. Server TLS is
+optional and fail-closed when selected; mTLS adds a tenant-owned client CA while
+the bearer-token boundary remains active. The default installation still serves
+plain HTTP for backward compatibility.
 The declared OpenShift profile sets
 `PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT=orchestra-runtime-edge-overload-v1`
 and accepts only `/v1/chat/completions`; development profiles remain

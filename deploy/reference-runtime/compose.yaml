@@ -15,7 +15,7 @@ services:
       - runtime-postgres:/var/lib/postgresql/data
 
   migrate:
-    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.2}
+    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.3}
     entrypoint: ["prometa-runtime-postgres-init"]
     environment:
       PROMETA_RUNTIME_DATABASE_URL: postgresql://runtime:${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}@postgres:5432/runtime
@@ -44,7 +44,7 @@ services:
     restart: "no"
 
   runtime:
-    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.2}
+    image: ${PROMETA_RUNTIME_IMAGE:-prometa-runtime-host:0.18.3}
     restart: unless-stopped
     environment:
       PROMETA_RUNTIME_DATABASE_URL: postgresql://runtime:${PROMETA_RUNTIME_POSTGRES_PASSWORD:?required}@postgres:5432/runtime

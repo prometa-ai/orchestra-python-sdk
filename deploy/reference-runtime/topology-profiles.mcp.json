@@ -6,8 +6,8 @@
       "workload": "mcp-read-only",
       "evidenceStatus": "reference-profile-not-production-certification",
       "networkPolicyController": "k3s-kube-router",
-      "runtimeVersion": "0.18.2",
-      "chartVersion": "0.3.3",
+      "runtimeVersion": "0.18.3",
+      "chartVersion": "0.3.4",
       "k3dVersion": "v5.8.3",
       "k3dChecksums": {
         "darwin-amd64": "fd0f8e9e8ea4d8bc3674572ca6ed0833b639bf57c43c708616d937377324cfea",

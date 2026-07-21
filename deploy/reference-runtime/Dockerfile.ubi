@@ -21,13 +21,13 @@ COPY prometa ./prometa
 RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[runtime-host,runtime-mcp]" \
  && python -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir --no-index --find-links=/wheels \
-      "prometa-sdk[runtime-host,runtime-mcp]==0.18.2"
+      "prometa-sdk[runtime-host,runtime-mcp]==0.18.3"
 
 FROM ${UBI_RUNTIME_IMAGE} AS runtime
 USER 0
 
 ARG VCS_REF=unknown
-ARG IMAGE_VERSION=0.18.2
+ARG IMAGE_VERSION=0.18.3
 
 LABEL org.opencontainers.image.title="Prometa reference tenant runtime (UBI9)" \
       org.opencontainers.image.description="Tenant-deployed host for signed Orchestra runtime releases" \

@@ -122,7 +122,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--deployment-id", required=True)
     value.add_argument("--runtime-target", default="tenant-runtime")
     value.add_argument("--runtime-id", default="tenant-runtime-01")
-    value.add_argument("--runtime-version", default="0.18.2")
+    value.add_argument("--runtime-version", default="0.18.3")
     value.add_argument("--bundle-issuer", required=True)
     value.add_argument("--bundle-key-id", required=True)
     value.add_argument("--promotion-issuer", required=True)

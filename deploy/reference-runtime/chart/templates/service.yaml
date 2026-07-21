@@ -16,7 +16,7 @@ spec:
     {{- include "prometa-runtime.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: runtime
   ports:
-    - name: http
+    - name: {{ ternary "https" "http" .Values.serverTls.enabled }}
       port: {{ .Values.service.port }}
-      targetPort: http
+      targetPort: {{ ternary "https" "http" .Values.serverTls.enabled }}
       protocol: TCP

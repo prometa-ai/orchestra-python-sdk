@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import signal
+import ssl
 import sys
 import threading
 import time
@@ -123,6 +124,16 @@ class RuntimeHostMcpConfig:
     credential_bindings: Tuple[McpCredentialBinding, ...]
     tool_timeout_seconds: float
     reservation_timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class RuntimeServerTlsConfig:
+    """Tenant-owned server certificate and optional client-authentication trust."""
+
+    certificate_file: Path
+    private_key_file: Path
+    client_ca_file: Optional[Path] = None
+    require_client_certificate: bool = False
 
 
 @dataclass(frozen=True)
@@ -1889,9 +1900,16 @@ class _RuntimeHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: Tuple[str, int], application: ReferenceRuntimeHost):
+    def __init__(
+        self,
+        address: Tuple[str, int],
+        application: ReferenceRuntimeHost,
+        ssl_context: Optional[ssl.SSLContext] = None,
+    ):
         self.application = application
         super().__init__(address, _RuntimeRequestHandler)
+        if ssl_context is not None:
+            self.socket = ssl_context.wrap_socket(self.socket, server_side=True)
 
 
 class _RuntimeRequestHandler(BaseHTTPRequestHandler):
@@ -1979,17 +1997,48 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     do_DELETE = _dispatch
 
 
+def build_runtime_server_ssl_context(
+    config: RuntimeServerTlsConfig,
+) -> ssl.SSLContext:
+    """Build the fail-closed TLS context without exposing certificate paths."""
+
+    if config.require_client_certificate and config.client_ca_file is None:
+        raise RuntimeHostError("server_tls_client_ca_required")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.options |= ssl.OP_NO_COMPRESSION
+        context.load_cert_chain(
+            certfile=str(config.certificate_file),
+            keyfile=str(config.private_key_file),
+        )
+        if config.client_ca_file is not None:
+            context.load_verify_locations(cafile=str(config.client_ca_file))
+        context.verify_mode = (
+            ssl.CERT_REQUIRED if config.require_client_certificate else ssl.CERT_NONE
+        )
+        return context
+    except (OSError, ssl.SSLError, ValueError):
+        raise RuntimeHostError("server_tls_material_invalid") from None
+
+
 def serve_reference_runtime_host(
     application: ReferenceRuntimeHost,
     *,
     bind_host: str = "0.0.0.0",
     port: int = 8080,
+    tls_config: Optional[RuntimeServerTlsConfig] = None,
 ) -> None:
     """Serve until SIGINT/SIGTERM, then drain HTTP and stop the kernel loop."""
 
     if not bind_host or not 1 <= port <= 65535:
         raise RuntimeHostError("listen_address_invalid")
-    server = _RuntimeHttpServer((bind_host, port), application)
+    ssl_context = (
+        build_runtime_server_ssl_context(tls_config)
+        if tls_config is not None
+        else None
+    )
+    server = _RuntimeHttpServer((bind_host, port), application, ssl_context)
     stopping = threading.Event()
 
     def stop(signum=None, frame=None):
@@ -2028,9 +2077,64 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--host", default=os.environ.get("PROMETA_RUNTIME_HOST", "0.0.0.0")
     )
     parser.add_argument("--port", type=int, default=os.environ.get("PORT", "8080"))
+    parser.add_argument(
+        "--tls-cert-file",
+        default=os.environ.get("PROMETA_RUNTIME_SERVER_TLS_CERT_FILE", ""),
+    )
+    parser.add_argument(
+        "--tls-key-file",
+        default=os.environ.get("PROMETA_RUNTIME_SERVER_TLS_KEY_FILE", ""),
+    )
+    parser.add_argument(
+        "--tls-client-ca-file",
+        default=os.environ.get("PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE", ""),
+    )
+    client_certificate_group = parser.add_mutually_exclusive_group()
+    client_certificate_group.add_argument(
+        "--tls-require-client-certificate",
+        dest="tls_require_client_certificate",
+        action="store_true",
+    )
+    client_certificate_group.add_argument(
+        "--tls-no-require-client-certificate",
+        dest="tls_require_client_certificate",
+        action="store_false",
+    )
+    parser.set_defaults(tls_require_client_certificate=None)
     args = parser.parse_args(argv)
     application = None
     try:
+        require_client_certificate = args.tls_require_client_certificate
+        if require_client_certificate is None:
+            raw_require_client_certificate = os.environ.get(
+                "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE", "false"
+            ).strip().lower()
+            if raw_require_client_certificate not in {"true", "false"}:
+                raise RuntimeHostError("server_tls_configuration_invalid")
+            require_client_certificate = raw_require_client_certificate == "true"
+        if bool(args.tls_cert_file) != bool(args.tls_key_file):
+            raise RuntimeHostError("server_tls_configuration_invalid")
+        if (args.tls_client_ca_file or require_client_certificate) and not args.tls_cert_file:
+            raise RuntimeHostError("server_tls_configuration_invalid")
+        tls_config = (
+            RuntimeServerTlsConfig(
+                certificate_file=Path(args.tls_cert_file),
+                private_key_file=Path(args.tls_key_file),
+                client_ca_file=(
+                    Path(args.tls_client_ca_file)
+                    if args.tls_client_ca_file
+                    else None
+                ),
+                require_client_certificate=require_client_certificate,
+            )
+            if args.tls_cert_file
+            else None
+        )
+        if tls_config is not None:
+            # Validate before release activation or the ready record. The
+            # serving path rebuilds the context so a last-moment projection
+            # replacement is also checked before accepting connections.
+            build_runtime_server_ssl_context(tls_config)
         config = load_runtime_host_config(Path(args.config))
         application, created = build_reference_runtime_host(config)
         print(
@@ -2044,12 +2148,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "deploymentId": config.deployment_id,
                     "releaseSource": application.release_source,
                     "taskRecovery": application.task_recovery_enabled,
+                    "serverTls": tls_config is not None,
+                    "clientCertificateRequired": require_client_certificate,
                 },
                 separators=(",", ":"),
             ),
             flush=True,
         )
-        serve_reference_runtime_host(application, bind_host=args.host, port=args.port)
+        serve_reference_runtime_host(
+            application,
+            bind_host=args.host,
+            port=args.port,
+            tls_config=tls_config,
+        )
         return 0
     except (
         BundleVerificationError,
@@ -2088,6 +2199,8 @@ __all__ = [
     "RuntimeHostError",
     "RuntimeHostConfig",
     "RuntimeHostResponse",
+    "RuntimeServerTlsConfig",
+    "build_runtime_server_ssl_context",
     "JsonLineEvidenceEmitter",
     "ReferenceRuntimeHost",
     "load_runtime_host_config",

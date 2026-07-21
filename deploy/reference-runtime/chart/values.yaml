@@ -82,6 +82,24 @@ service:
 
 containerPort: 8080
 
+# Optional tenant-owned server TLS. The chart references, but never creates,
+# certificate Secrets. Set rolloutId whenever the projected material changes.
+serverTls:
+  enabled: false
+  existingSecret: ""
+  certificateKey: tls.crt
+  privateKeyKey: tls.key
+  clientCaKey: ca.crt
+  requireClientCertificate: false
+  rolloutId: ""
+  # Kubernetes HTTP probes cannot present a client certificate. When mTLS is
+  # required, this separate least-privilege identity drives exec probes.
+  probeClient:
+    existingSecret: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
+
 resources:
   requests:
     cpu: 100m

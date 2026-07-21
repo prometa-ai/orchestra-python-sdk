@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Optional in-process server TLS and mTLS for the tenant runtime host, with a
+  TLS 1.2 minimum, stable fail-closed startup errors, Secret-backed Helm values,
+  certificate rollout identity, and client-authenticated exec probes. The
+  pinned OpenShift profile now requires server TLS while ordinary SDK and
+  standalone-host defaults remain unchanged.
 - Runtime edge overload contract `orchestra-runtime-edge-overload-v1`, selected
   by the declared OpenShift profile and emitted on every kernel evidence event.
   It freezes bounded per-request model retries for chat completions while

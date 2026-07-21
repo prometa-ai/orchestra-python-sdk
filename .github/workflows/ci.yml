@@ -372,6 +372,8 @@ jobs:
             --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             --set runtimeConfig.existingSecret=orchestra-runtime-release-prod-v1
             --set runtimeConfig.rolloutId=deployment-prod-v1
+            --set serverTls.existingSecret=orchestra-runtime-server-tls
+            --set serverTls.rolloutId=runtime-cert-v1
             --set credentials.existingSecret=orchestra-runtime-credentials
             --set migration.existingSecret=orchestra-runtime-migration-credentials
             --set 'networkPolicy.ingress[0].from[0].ipBlock.cidr=10.10.0.0/16'
@@ -393,6 +395,10 @@ jobs:
           grep -qF 'prometa.io/production-profile-id: "orchestra-ocp-4.20-amd64-v1"' runtime-chart-openshift.yaml
           grep -qF 'image: "registry.example.test/orchestra/prometa-runtime-host-ubi9@sha256:aaaaaaaa' runtime-chart-openshift.yaml
           grep -qF 'prometa.io/runtime-config-rollout-id: "deployment-prod-v1"' runtime-chart-openshift.yaml
+          grep -qF 'prometa.io/server-tls-rollout-id: "runtime-cert-v1"' runtime-chart-openshift.yaml
+          grep -qF 'name: PROMETA_RUNTIME_SERVER_TLS_CERT_FILE' runtime-chart-openshift.yaml
+          grep -qF 'secretName: "orchestra-runtime-server-tls"' runtime-chart-openshift.yaml
+          grep -qF 'scheme: HTTPS' runtime-chart-openshift.yaml
           grep -qF 'value: "orchestra-runtime-edge-overload-v1"' runtime-chart-openshift.yaml
           grep -qF 'secretName: "orchestra-runtime-release-prod-v1"' runtime-chart-openshift.yaml
           grep -qF 'name: "orchestra-runtime-credentials"' runtime-chart-openshift.yaml
@@ -441,6 +447,34 @@ jobs:
             --set runtimeEdge.overloadContract=unknown-contract \
             >/dev/null 2>&1; then
             echo "OpenShift runtime profile accepted an unknown overload contract" >&2
+            exit 1
+          fi
+          if helm template openshift-no-server-tls "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" --set serverTls.enabled=false \
+            --set serverTls.existingSecret= --set serverTls.rolloutId= \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted plaintext serving" >&2
+            exit 1
+          fi
+          if helm template mtls-no-probe "$chart" -f "$example" \
+            --set serverTls.enabled=true \
+            --set serverTls.existingSecret=runtime-server-tls \
+            --set serverTls.requireClientCertificate=true \
+            >/dev/null 2>&1; then
+            echo "runtime chart accepted mTLS without a probe identity" >&2
+            exit 1
+          fi
+          helm template mtls "$chart" -f "$example" \
+            --set serverTls.enabled=true \
+            --set serverTls.existingSecret=runtime-server-tls \
+            --set serverTls.requireClientCertificate=true \
+            --set serverTls.probeClient.existingSecret=runtime-probe-client \
+            >runtime-chart-mtls.yaml
+          grep -qF 'name: PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE' runtime-chart-mtls.yaml
+          grep -qF 'secretName: "runtime-probe-client"' runtime-chart-mtls.yaml
+          grep -qF 'http.client.HTTPSConnection' runtime-chart-mtls.yaml
+          if grep -qF 'scheme: HTTPS' runtime-chart-mtls.yaml; then
+            echo "mTLS probes must use their projected client identity" >&2
             exit 1
           fi
           if helm template reserved-overload-contract "$chart" -f "$example" \

@@ -180,10 +180,12 @@ from .host import (
     RuntimeHostMcpConfig,
     RuntimeHostConfig,
     RuntimeHostResponse,
+    RuntimeServerTlsConfig,
     JsonLineEvidenceEmitter,
     ReferenceRuntimeHost,
     load_runtime_host_config,
     build_reference_runtime_host,
+    build_runtime_server_ssl_context,
     serve_reference_runtime_host,
 )
 from .host_conformance import ReferenceHostConformanceDriver
@@ -338,10 +340,12 @@ __all__ = [
     "RuntimeHostMcpConfig",
     "RuntimeHostConfig",
     "RuntimeHostResponse",
+    "RuntimeServerTlsConfig",
     "JsonLineEvidenceEmitter",
     "ReferenceRuntimeHost",
     "load_runtime_host_config",
     "build_reference_runtime_host",
+    "build_runtime_server_ssl_context",
     "serve_reference_runtime_host",
     "ReferenceHostConformanceDriver",
 ]

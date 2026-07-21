@@ -78,6 +78,9 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if hasKey .Values.podAnnotations "prometa.io/production-profile-id" -}}
 {{- fail "podAnnotations cannot override prometa.io/production-profile-id" -}}
 {{- end -}}
+{{- if hasKey .Values.podAnnotations "prometa.io/server-tls-rollout-id" -}}
+{{- fail "podAnnotations cannot override prometa.io/server-tls-rollout-id" -}}
+{{- end -}}
 {{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.controlPlaneApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) -}}
 {{- fail "all credentials key names must be non-empty" -}}
 {{- end -}}
@@ -109,6 +112,19 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- if and .Values.networkPolicy.enabled (empty .Values.networkPolicy.egress) -}}
 {{- fail "networkPolicy.egress must explicitly allow the runtime database and model gateway" -}}
+{{- end -}}
+{{- if .Values.serverTls.enabled -}}
+{{- if or (empty .Values.serverTls.existingSecret) (empty .Values.serverTls.certificateKey) (empty .Values.serverTls.privateKeyKey) -}}
+{{- fail "enabled serverTls requires an existing Secret and certificate/private-key keys" -}}
+{{- end -}}
+{{- if and (not (empty .Values.serverTls.rolloutId)) (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$" .Values.serverTls.rolloutId)) -}}
+{{- fail "serverTls.rolloutId must be a bounded certificate deployment identifier" -}}
+{{- end -}}
+{{- if and .Values.serverTls.requireClientCertificate (or (empty .Values.serverTls.clientCaKey) (empty .Values.serverTls.probeClient.existingSecret) (empty .Values.serverTls.probeClient.certificateKey) (empty .Values.serverTls.probeClient.privateKeyKey) (empty .Values.serverTls.probeClient.caKey)) -}}
+{{- fail "server mTLS requires a client CA and a complete probe-client Secret reference" -}}
+{{- end -}}
+{{- else if or .Values.serverTls.existingSecret .Values.serverTls.requireClientCertificate .Values.serverTls.rolloutId .Values.serverTls.probeClient.existingSecret -}}
+{{- fail "serverTls Secret, client authentication, rollout, and probe settings require serverTls.enabled=true" -}}
 {{- end -}}
 {{- if and (not (empty .Values.runtimeEdge.overloadContract)) (ne .Values.runtimeEdge.overloadContract "orchestra-runtime-edge-overload-v1") -}}
 {{- fail "runtimeEdge.overloadContract is unsupported" -}}
@@ -188,9 +204,12 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if or .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional -}}
 {{- fail "the OpenShift runtime profile requires model-gateway and asynchronous receipt credentials" -}}
 {{- end -}}
+{{- if or (not .Values.serverTls.enabled) (empty .Values.serverTls.rolloutId) -}}
+{{- fail "the OpenShift runtime profile requires server TLS and an explicit certificate rolloutId" -}}
+{{- end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
+{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "PROMETA_RUNTIME_SERVER_TLS_CERT_FILE" "PROMETA_RUNTIME_SERVER_TLS_KEY_FILE" "PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE" "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE" "PROMETA_RUNTIME_PROBE_TLS_CERT_FILE" "PROMETA_RUNTIME_PROBE_TLS_KEY_FILE" "PROMETA_RUNTIME_PROBE_TLS_CA_FILE" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
 {{- fail (printf "extraEnv cannot override reserved variable %s" .name) -}}
 {{- end -}}
 {{- end -}}

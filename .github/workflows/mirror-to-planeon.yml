@@ -9,6 +9,15 @@ on:
     tags: ['**']
   create:
   delete:
+  # Safety net. GitHub deliberately does not trigger workflows for pushes made
+  # with the default GITHUB_TOKEN (its recursion guard), so commits landed by
+  # this repo's own automation -- a release version bump, for example -- never
+  # fire the push trigger above. Without this schedule the mirror silently
+  # drifts behind until the next human push. Observed in practice: the mirror
+  # sat one commit behind after "chore: bump to 0.18.3" (f74c079).
+  # Hourly at :17 -- off the hour, where GitHub's scheduler is most congested.
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 # Never run two mirror pushes at once; let the newest queue behind the running one.

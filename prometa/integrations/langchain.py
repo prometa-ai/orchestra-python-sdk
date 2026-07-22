@@ -42,8 +42,64 @@ def _client() -> Optional[Prometa]:
     return Prometa._current
 
 
+_UNSET = object()
+_BASE_TOOL_CLS: Any = _UNSET
+
+
+def _base_tool_cls() -> Any:
+    """Return ``langchain_core.tools.BaseTool``, or ``None`` if unavailable.
+
+    Resolved once and cached — LangChain stays an optional dependency.
+    """
+    global _BASE_TOOL_CLS
+    if _BASE_TOOL_CLS is _UNSET:
+        try:
+            from langchain_core.tools import BaseTool  # type: ignore
+
+            _BASE_TOOL_CLS = BaseTool
+        except Exception:  # pragma: no cover - LangChain not installed
+            _BASE_TOOL_CLS = None
+    return _BASE_TOOL_CLS
+
+
+def _is_tool(obj: Any) -> bool:
+    """True when ``obj`` is a LangChain tool.
+
+    ``isinstance(obj, BaseTool)`` is authoritative whenever LangChain is
+    importable. Only when it is not do we fall back to BaseTool's public
+    surface — a non-empty string ``name`` plus ``run``/``arun`` — which chat
+    models and plain runnables do not expose.
+    """
+    cls = _base_tool_cls()
+    if cls is not None:
+        try:
+            return isinstance(obj, cls)
+        except Exception:  # pragma: no cover - exotic metaclasses
+            return False
+    name = getattr(obj, "name", None)
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and callable(getattr(obj, "run", None))
+        and callable(getattr(obj, "arun", None))
+    )
+
+
+def _tool_name_of(obj: Any) -> Optional[str]:
+    """The tool's own name (``obj.name``) when ``obj`` is a tool, else None."""
+    if not _is_tool(obj):
+        return None
+    name = getattr(obj, "name", None)
+    return name if isinstance(name, str) and name else None
+
+
 def _kind_for_object(obj: Any, default: str = "tool") -> str:
     """Map a LangChain object class to a Prometa span kind."""
+    # Tools are identified by type rather than class name: a subclass such as
+    # ``LLMMathTool`` matches the "llm" branch below and would otherwise be
+    # reported as an agent.
+    if _is_tool(obj):
+        return "tool"
     cls_name = type(obj).__name__.lower()
     if "chatmodel" in cls_name or "llm" in cls_name:
         return "agent"  # Chat/LLM span types are surfaced as agents
@@ -59,6 +115,18 @@ def _attrs_for_object(obj: Any) -> dict:
         "gen_ai.framework": "langchain",
         "langchain.class": type(obj).__name__,
     }
+    # Tools carry the canonical tool-name attributes, mirroring the MCP
+    # integration, so LangChain tool spans group and filter like every other
+    # tool span. Handled before the chat-model loop below, which breaks on the
+    # first match and would otherwise label a tool exposing ``.model`` with
+    # ``gen_ai.request.model`` and never reach its name.
+    tool_name = _tool_name_of(obj)
+    if tool_name:
+        out["langchain.name"] = tool_name
+        out["gen_ai.tool.name"] = tool_name
+        out["prometa.tool_name"] = tool_name
+        out["tool.name"] = tool_name
+        return out
     # Best-effort: surface the model name if we're wrapping a chat model.
     for attr in ("model", "model_name", "name"):
         if hasattr(obj, attr):
@@ -95,7 +163,8 @@ def _wrap_method(cls: type, method_name: str, span_name: str) -> None:
             if client is None:
                 return await original(self, *args, **kwargs)
             kind = _kind_for_object(self)
-            with client._span(kind, f"{span_name}:{type(self).__name__}") as span:
+            label = f"{span_name}:{_tool_name_of(self) or type(self).__name__}"
+            with client._span(kind, label) as span:
                 span.attributes.update(_attrs_for_object(self))
                 try:
                     return await original(self, *args, **kwargs)
@@ -114,7 +183,8 @@ def _wrap_method(cls: type, method_name: str, span_name: str) -> None:
             if client is None:
                 return original(self, *args, **kwargs)
             kind = _kind_for_object(self)
-            with client._span(kind, f"{span_name}:{type(self).__name__}") as span:
+            label = f"{span_name}:{_tool_name_of(self) or type(self).__name__}"
+            with client._span(kind, label) as span:
                 span.attributes.update(_attrs_for_object(self))
                 try:
                     return original(self, *args, **kwargs)

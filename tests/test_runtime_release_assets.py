@@ -240,6 +240,7 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert workflow.count("cosign sign") == 2
     assert workflow.count("--type cyclonedx") >= 4
     assert workflow.count("actions/attest-build-provenance@v2") == 2
+    assert workflow.count("cosign-release: v3.1.1") == 3
     assert "pypi.org/pypi/prometa-sdk/%s/json" in workflow
     assert "exact PyPI package was unavailable after 10 minutes" in workflow
     assert "verify_run_id:" in workflow

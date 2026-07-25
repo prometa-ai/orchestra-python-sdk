@@ -13,7 +13,7 @@ replicaCount: 2
 
 image:
   repository: registry.example.com/orchestra/prometa-runtime-host
-  tag: "0.18.5"
+  tag: "0.18.6"
 
 serviceAccount:
   annotations:

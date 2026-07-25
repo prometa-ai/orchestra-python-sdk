@@ -66,7 +66,7 @@ runtime-host = [
     "jsonschema>=4.23,<5",
     "psycopg[binary]>=3.2,<4",
 ]
-dev = ["pytest>=7", "ruff>=0.5"]
+dev = ["pytest>=7", "ruff>=0.5,<0.16"]
 
 [project.scripts]
 prometa-runtime-conformance = "prometa.runtime.conformance:main"

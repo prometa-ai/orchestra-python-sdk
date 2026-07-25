@@ -126,6 +126,13 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- else if or .Values.serverTls.existingSecret .Values.serverTls.requireClientCertificate .Values.serverTls.rolloutId .Values.serverTls.probeClient.existingSecret -}}
 {{- fail "serverTls Secret, client authentication, rollout, and probe settings require serverTls.enabled=true" -}}
 {{- end -}}
+{{- if .Values.trustedCA.enabled -}}
+{{- if or (empty .Values.trustedCA.configMapName) (empty .Values.trustedCA.key) -}}
+{{- fail "trustedCA.enabled requires a ConfigMap name and key" -}}
+{{- end -}}
+{{- else if .Values.trustedCA.configMapName -}}
+{{- fail "trustedCA.configMapName requires trustedCA.enabled=true" -}}
+{{- end -}}
 {{- if and (not (empty .Values.runtimeEdge.overloadContract)) (ne .Values.runtimeEdge.overloadContract "orchestra-runtime-edge-overload-v1") -}}
 {{- fail "runtimeEdge.overloadContract is unsupported" -}}
 {{- end -}}
@@ -140,6 +147,81 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- if le (int .Values.gracefulShutdown.terminationGracePeriodSeconds) (int .Values.gracefulShutdown.preStopSleepSeconds) -}}
 {{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds" -}}
+{{- end -}}
+{{- if and .Values.productionProfile.enabled .Values.engineeringTrialProfile.enabled -}}
+{{- fail "productionProfile and engineeringTrialProfile are mutually exclusive" -}}
+{{- end -}}
+{{- if .Values.engineeringTrialProfile.enabled -}}
+{{- if ne .Values.engineeringTrialProfile.profileId "orchestra-ocp-sno-trial-amd64-v1" -}}
+{{- fail "the engineering trial profile ID must be orchestra-ocp-sno-trial-amd64-v1" -}}
+{{- end -}}
+{{- if ne .Values.engineeringTrialProfile.imageFlavor "ubi9" -}}
+{{- fail "the engineering trial profile requires the UBI9 image flavor" -}}
+{{- end -}}
+{{- if not .Values.engineeringTrialProfile.sourceOnlyAcknowledged -}}
+{{- fail "the engineering trial profile requires source-only acknowledgement" -}}
+{{- end -}}
+{{- if or (ne (int .Values.replicaCount) 1) .Values.autoscaling.enabled .Values.podDisruptionBudget.enabled .Values.topologySpreadConstraints -}}
+{{- fail "the engineering trial profile requires one fixed replica without HPA, PDB, or topology spread" -}}
+{{- end -}}
+{{- if or (empty .Values.image.repository) (empty .Values.image.digest) -}}
+{{- fail "the engineering trial profile requires an immutable UBI9 runtime image" -}}
+{{- end -}}
+{{- if ne .Values.runtimeEdge.overloadContract "orchestra-runtime-edge-overload-v1" -}}
+{{- fail "the engineering trial profile requires the bounded runtime edge overload contract" -}}
+{{- end -}}
+{{- if or (empty .Values.runtimeConfig.existingSecret) (not (empty .Values.runtimeConfig.existingConfigMap)) (empty .Values.runtimeConfig.rolloutId) -}}
+{{- fail "the engineering trial profile requires an immutable Secret-backed runtime config and rollout identity" -}}
+{{- end -}}
+{{- if or (empty .Values.credentials.existingSecret) .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional (not .Values.credentials.controlPlaneApiKeyOptional) -}}
+{{- fail "the engineering trial profile requires model and receipt credentials while keeping control-plane pull optional" -}}
+{{- end -}}
+{{- if or (not .Values.serverTls.enabled) (empty .Values.serverTls.existingSecret) (empty .Values.serverTls.rolloutId) -}}
+{{- fail "the engineering trial profile requires operator-provided server TLS and rollout identity" -}}
+{{- end -}}
+{{- if not .Values.trustedCA.enabled -}}
+{{- fail "the engineering trial profile requires an operator-provided outbound CA bundle" -}}
+{{- end -}}
+{{- if or (not .Values.migration.enabled) (not .Values.migration.compatibilityCheck) (eq .Values.migration.serviceAccountName "default") (empty .Values.migration.existingSecret) (eq .Values.migration.existingSecret .Values.credentials.existingSecret) -}}
+{{- fail "the engineering trial profile requires migration compatibility with a separate identity and Secret" -}}
+{{- end -}}
+{{- if or (not .Values.migration.networkPolicy.enabled) (empty .Values.migration.networkPolicy.egress) -}}
+{{- fail "the engineering trial profile requires scoped migration NetworkPolicy egress" -}}
+{{- end -}}
+{{- if or (not .Values.networkPolicy.enabled) (not .Values.networkPolicy.allowDNS) (empty .Values.networkPolicy.ingress) (empty .Values.networkPolicy.egress) -}}
+{{- fail "the engineering trial profile requires exact runtime ingress, egress, and DNS policies" -}}
+{{- end -}}
+{{- $runtimeDnsNamespace := default "" (index .Values.networkPolicy.dnsNamespaceSelector.matchLabels "kubernetes.io/metadata.name") -}}
+{{- $runtimeDnsPod := default "" (index .Values.networkPolicy.dnsPodSelector.matchLabels "dns.operator.openshift.io/daemonset-dns") -}}
+{{- $migrationDnsNamespace := default "" (index .Values.migration.networkPolicy.dnsNamespaceSelector.matchLabels "kubernetes.io/metadata.name") -}}
+{{- $migrationDnsPod := default "" (index .Values.migration.networkPolicy.dnsPodSelector.matchLabels "dns.operator.openshift.io/daemonset-dns") -}}
+{{- if or (ne $runtimeDnsNamespace "openshift-dns") (ne $runtimeDnsPod "default") (ne $migrationDnsNamespace "openshift-dns") (ne $migrationDnsPod "default") -}}
+{{- fail "the engineering trial profile requires exact OpenShift DNS selectors for runtime and migration" -}}
+{{- end -}}
+{{- if .Values.backup.enabled -}}
+{{- fail "the engineering trial profile cannot claim runtime backup coverage" -}}
+{{- end -}}
+{{- if ne .Values.service.type "ClusterIP" -}}
+{{- fail "the engineering trial profile exposes only an internal ClusterIP Service" -}}
+{{- end -}}
+{{- if .Values.serviceAccount.automountServiceAccountToken -}}
+{{- fail "the engineering trial profile forbids service-account token automount" -}}
+{{- end -}}
+{{- if or (hasKey .Values.podSecurityContext "runAsUser") (hasKey .Values.podSecurityContext "runAsGroup") (hasKey .Values.podSecurityContext "fsGroup") -}}
+{{- fail "the engineering trial profile delegates UID and GID allocation to restricted-v2" -}}
+{{- end -}}
+{{- if or (not .Values.podSecurityContext.runAsNonRoot) (ne .Values.podSecurityContext.seccompProfile.type "RuntimeDefault") -}}
+{{- fail "the engineering trial profile requires runAsNonRoot and RuntimeDefault seccomp" -}}
+{{- end -}}
+{{- if or .Values.containerSecurityContext.allowPrivilegeEscalation (not .Values.containerSecurityContext.readOnlyRootFilesystem) (not (has "ALL" .Values.containerSecurityContext.capabilities.drop)) -}}
+{{- fail "the engineering trial profile requires read-only root, no privilege escalation, and dropped capabilities" -}}
+{{- end -}}
+{{- if or (ne (toString .Values.resources.requests.cpu) "100m") (ne (toString .Values.resources.requests.memory) "128Mi") (ne (toString .Values.resources.limits.cpu) "500m") (ne (toString .Values.resources.limits.memory) "512Mi") -}}
+{{- fail "the engineering trial resources must match the locked capacity candidate" -}}
+{{- end -}}
+{{- if or (ne (toString .Values.migration.resources.requests.cpu) "50m") (ne (toString .Values.migration.resources.requests.memory) "64Mi") (ne (toString .Values.migration.resources.limits.cpu) "500m") (ne (toString .Values.migration.resources.limits.memory) "256Mi") -}}
+{{- fail "the engineering trial migration resources must remain within the locked replacement envelope" -}}
+{{- end -}}
 {{- end -}}
 {{- if .Values.productionProfile.enabled -}}
 {{- $profileId := required "productionProfile.profileId is required" .Values.productionProfile.profileId -}}
@@ -209,7 +291,7 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "PROMETA_RUNTIME_SERVER_TLS_CERT_FILE" "PROMETA_RUNTIME_SERVER_TLS_KEY_FILE" "PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE" "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE" "PROMETA_RUNTIME_PROBE_TLS_CERT_FILE" "PROMETA_RUNTIME_PROBE_TLS_KEY_FILE" "PROMETA_RUNTIME_PROBE_TLS_CA_FILE" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY") -}}
+{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "PROMETA_RUNTIME_SERVER_TLS_CERT_FILE" "PROMETA_RUNTIME_SERVER_TLS_KEY_FILE" "PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE" "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE" "PROMETA_RUNTIME_PROBE_TLS_CERT_FILE" "PROMETA_RUNTIME_PROBE_TLS_KEY_FILE" "PROMETA_RUNTIME_PROBE_TLS_CA_FILE" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY" "SSL_CERT_FILE") -}}
 {{- fail (printf "extraEnv cannot override reserved variable %s" .name) -}}
 {{- end -}}
 {{- end -}}
@@ -219,6 +301,10 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 - to:
     - namespaceSelector:
         {{- toYaml .dnsNamespaceSelector | nindent 8 }}
+      {{- with .dnsPodSelector }}
+      podSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
   ports:
     - protocol: UDP
       port: 53

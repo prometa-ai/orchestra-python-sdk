@@ -19,7 +19,7 @@ Build from the SDK repository root:
 
 ```bash
 docker build -f deploy/reference-runtime/Dockerfile \
-  -t prometa-runtime-host:0.18.2 .
+  -t prometa-runtime-host:0.18.4 .
 ```
 
 Run the combined profile through a fresh container process per case:
@@ -28,7 +28,7 @@ Run the combined profile through a fresh container process per case:
 prometa-runtime-conformance \
   --profile deployment \
   --driver-name reference-host-container \
-  --command "docker run --rm -i --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:0.18.2"
+  --command "docker run --rm -i --entrypoint prometa-runtime-host-conformance-driver prometa-runtime-host:0.18.4"
 ```
 
 A green report proves the packaged admission, execution, failure, and
@@ -41,9 +41,9 @@ Each SDK release publishes the optional tenant runtime as three independent OCI
 artifacts from the exact immutable SDK tag:
 
 ```text
-ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host:v0.18.2
-ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9:v0.18.2
-oci://ghcr.io/prometa-ai/orchestra-python-sdk/charts/prometa-runtime:0.3.3
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host:v0.18.4
+ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9:v0.18.4
+oci://ghcr.io/prometa-ai/orchestra-python-sdk/charts/prometa-runtime:0.3.5
 ```
 
 The Debian and UBI9 images are Linux AMD64 release artifacts. The workflow
@@ -259,6 +259,35 @@ helm upgrade --install tenant-runtime deploy/reference-runtime/chart \
   -f deploy/reference-runtime/chart/values.production.example.yaml
 ```
 
+### OpenShift SNO engineering trial
+
+`chart/values.openshift-sno-trial.yaml` is the source-only,
+non-certifying runtime overlay for
+`orchestra-ocp-sno-trial-amd64-v1`. It is deliberately sized for the
+single-node, budget-capped lab and is not the production profile. The overlay
+keeps one replica, disables HPA, PDB, topology spread and backups, and fixes
+runtime requests at `100m` CPU and `128Mi` memory with limits of `500m` CPU and
+`512Mi` memory.
+
+The chart refuses to render this overlay without an immutable UBI image
+digest. It also freezes Secret-backed runtime, credential, server-certificate
+and migration inputs; an external CA ConfigMap; native HTTPS serving; the
+runtime edge overload contract; a distinct migration identity; and explicit
+tenant gateway, PostgreSQL, model gateway, asynchronous receipt/telemetry,
+read-only MCP and OpenShift DNS paths. The control-plane pull credential stays
+optional so Orchestra remains outside the synchronous request path.
+
+Run the source contract locally or in CI:
+
+```bash
+deploy/reference-runtime/ci/render-sno-trial-profile.sh \
+  /tmp/orchestra-runtime-sno.yaml
+```
+
+This proves Helm rendering and negative admission cases only. It does not
+prove that a released image exists, that OpenShift admits it, or that any live
+recovery, load, restore, RPO/RTO or availability requirement passes.
+
 ### Declared OpenShift runtime profile
 
 `chart/values.openshift-production.yaml` is the fail-closed tenant-runtime
@@ -296,7 +325,7 @@ Build the UBI variant with the pinned build/runtime bases:
 
 ```bash
 docker build -f deploy/reference-runtime/Dockerfile.ubi \
-  -t registry.example.com/orchestra/prometa-runtime-host-ubi9:0.18.2 .
+  -t registry.example.com/orchestra/prometa-runtime-host-ubi9:0.18.4 .
 ```
 
 Then render with customer-owned values:
@@ -515,7 +544,7 @@ gh workflow run runtime-published-upgrade-rollback.yml \
   --repo prometa-ai/orchestra-python-sdk \
   --ref main \
   -f baseline_tag=v0.18.0 \
-  -f target_tag=v0.18.2
+  -f target_tag=v0.18.4
 ```
 
 This closes the separately published release-channel transition gap only for

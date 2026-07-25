@@ -314,6 +314,11 @@ jobs:
 
       - uses: azure/setup-helm@v4
 
+      - name: Verify source-only OpenShift SNO trial profile
+        run: >-
+          deploy/reference-runtime/ci/render-sno-trial-profile.sh
+          runtime-chart-openshift-sno.yaml
+
       - name: Lint production reference values
         run: >-
           helm lint --strict

@@ -23,6 +23,15 @@ productionProfile:
   # a namespace-wide default deny must exist before Helm starts pre-install hooks.
   namespaceDefaultDenyAcknowledged: false
 
+# Separate non-production contract for the cost-bounded single-node OpenShift
+# trial. It is source-only, never certification input, and cannot be enabled
+# with productionProfile.
+engineeringTrialProfile:
+  enabled: false
+  profileId: ""
+  imageFlavor: ""
+  sourceOnlyAcknowledged: false
+
 # The certified profile binds bounded per-request retries and server
 # backpressure handling. Distributed admission, fairness, and autoscaling stay
 # at the tenant gateway/deployment edge.
@@ -100,6 +109,13 @@ serverTls:
     privateKeyKey: tls.key
     caKey: ca.crt
 
+# Optional operator-populated public trust bundle for outbound HTTPS model,
+# MCP, telemetry, and receipt paths. The chart never creates this ConfigMap.
+trustedCA:
+  enabled: false
+  configMapName: ""
+  key: ca-bundle.crt
+
 resources:
   requests:
     cpu: 100m
@@ -157,6 +173,8 @@ migration:
     dnsNamespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: kube-system
+    dnsPodSelector:
+      matchLabels: {}
     # Rendering fails until the operator adds an explicit database rule.
     egress: []
 
@@ -210,6 +228,8 @@ backup:
     dnsNamespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: kube-system
+    dnsPodSelector:
+      matchLabels: {}
     # Rendering fails until the operator adds an explicit database rule.
     egress: []
 
@@ -222,6 +242,8 @@ networkPolicy:
   dnsNamespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: kube-system
+  dnsPodSelector:
+    matchLabels: {}
   ingress: []
   egress: []
 

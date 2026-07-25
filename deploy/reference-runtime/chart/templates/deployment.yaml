@@ -19,7 +19,7 @@ spec:
       app.kubernetes.io/component: runtime
   template:
     metadata:
-      {{- if or .Values.runtimeConfig.rolloutId .Values.serverTls.rolloutId .Values.productionProfile.enabled .Values.podAnnotations }}
+      {{- if or .Values.runtimeConfig.rolloutId .Values.serverTls.rolloutId .Values.productionProfile.enabled .Values.engineeringTrialProfile.enabled .Values.podAnnotations }}
       annotations:
         {{- with .Values.runtimeConfig.rolloutId }}
         prometa.io/runtime-config-rollout-id: {{ . | quote }}
@@ -29,6 +29,9 @@ spec:
         {{- end }}
         {{- if .Values.productionProfile.enabled }}
         prometa.io/production-profile-id: {{ .Values.productionProfile.profileId | quote }}
+        {{- end }}
+        {{- if .Values.engineeringTrialProfile.enabled }}
+        prometa.io/engineering-trial-profile-id: {{ .Values.engineeringTrialProfile.profileId | quote }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -86,6 +89,10 @@ spec:
             - name: PROMETA_RUNTIME_PROBE_TLS_CA_FILE
               value: /etc/prometa-runtime-probe-tls/ca.crt
             {{- end }}
+            {{- end }}
+            {{- if .Values.trustedCA.enabled }}
+            - name: SSL_CERT_FILE
+              value: {{ printf "/etc/prometa-runtime-ca/%s" .Values.trustedCA.key | quote }}
             {{- end }}
             - name: PROMETA_RUNTIME_DATABASE_URL
               valueFrom:
@@ -190,6 +197,11 @@ spec:
               readOnly: true
             {{- end }}
             {{- end }}
+            {{- if .Values.trustedCA.enabled }}
+            - name: trusted-ca
+              mountPath: /etc/prometa-runtime-ca
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -238,6 +250,14 @@ spec:
               - key: {{ .Values.serverTls.probeClient.caKey | quote }}
                 path: ca.crt
         {{- end }}
+        {{- end }}
+        {{- if .Values.trustedCA.enabled }}
+        - name: trusted-ca
+          configMap:
+            name: {{ .Values.trustedCA.configMapName | quote }}
+            items:
+              - key: {{ .Values.trustedCA.key | quote }}
+                path: {{ .Values.trustedCA.key | quote }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

@@ -9,6 +9,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A source-only, non-certifying OpenShift SNO engineering-trial chart overlay
+  for `orchestra-ocp-sno-trial-amd64-v1`. It pins the single-replica runtime
+  resource envelope, immutable UBI image admission, Secret-backed release and
+  credential inputs, native server TLS, outbound trust, restricted-v2
+  controls, separate migration identity, and explicit gateway, PostgreSQL,
+  model, receipt, telemetry, MCP, and OpenShift DNS NetworkPolicy paths. A
+  dedicated render harness exercises both the accepted shape and fail-closed
+  drift cases in CI.
 - Optional in-process server TLS and mTLS for the tenant runtime host, with a
   TLS 1.2 minimum, stable fail-closed startup errors, Secret-backed Helm values,
   certificate rollout identity, and client-authenticated exec probes. The

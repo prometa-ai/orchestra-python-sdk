@@ -22,7 +22,7 @@ spec:
     {{- end }}
   egress:
     {{- if .Values.networkPolicy.allowDNS }}
-    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.networkPolicy.dnsNamespaceSelector "dnsPodSelector" .Values.networkPolicy.dnsPodSelector) | nindent 4 }}
     {{- end }}
     {{- with .Values.networkPolicy.egress }}
     {{- toYaml . | nindent 4 }}
@@ -50,7 +50,7 @@ spec:
   ingress: []
   egress:
     {{- if .Values.backup.networkPolicy.allowDNS }}
-    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.backup.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.backup.networkPolicy.dnsNamespaceSelector "dnsPodSelector" .Values.backup.networkPolicy.dnsPodSelector) | nindent 4 }}
     {{- end }}
     {{- with .Values.backup.networkPolicy.egress }}
     {{- toYaml . | nindent 4 }}
@@ -84,7 +84,7 @@ spec:
   ingress: []
   egress:
     {{- if .Values.migration.networkPolicy.allowDNS }}
-    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.migration.networkPolicy.dnsNamespaceSelector) | nindent 4 }}
+    {{- include "prometa-runtime.dnsEgress" (dict "dnsNamespaceSelector" .Values.migration.networkPolicy.dnsNamespaceSelector "dnsPodSelector" .Values.migration.networkPolicy.dnsPodSelector) | nindent 4 }}
     {{- end }}
     {{- with .Values.migration.networkPolicy.egress }}
     {{- toYaml . | nindent 4 }}

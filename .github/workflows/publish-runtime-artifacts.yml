@@ -295,9 +295,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=runtime-release-${{ matrix.image }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.1.1
+          cosign-release: v3.0.6
 
       - name: Install syft
         shell: bash
@@ -460,9 +460,9 @@ jobs:
           merge-multiple: true
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.1.1
+          cosign-release: v3.0.6
 
       - name: Install syft
         shell: bash
@@ -644,9 +644,9 @@ jobs:
           version: v3.16.4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.1.1
+          cosign-release: v3.0.6
 
       - name: Resolve registry login
         id: registry

@@ -257,6 +257,11 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert 'gh release upload "$RELEASE_TAG"' in workflow
     assert "Existing release asset digest differs" in workflow
     assert "GitHub release asset digests did not converge" in workflow
+    assert workflow.index(
+        "- name: Attest image build provenance"
+    ) < workflow.index(
+        "- name: Sign digest and attest CycloneDX SBOM"
+    )
 
 
 def test_ci_can_certify_an_exact_release_ref():

@@ -11,10 +11,11 @@ automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
 and joinable on the platform. Version 0.18.0 added a first tenant-deployed
 reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. Version 0.18.2 adds the named
+container around the optional Phase 2A kernel. Version 0.18.2 added the named
 `orchestra-runtime-edge-overload-v1` production contract: bounded local model
 retries honor `Retry-After`, skip waits outside the configured budget, and emit
-the contract ID as payload-free evidence. Current source also includes a
+the contract ID as payload-free evidence. Version 0.18.4 adds a source-only,
+non-certifying OpenShift SNO engineering-trial profile. Current source also includes a
 governed tenant-side MCP broker as a separate optional extra, strict reference
 host wiring for read-only MCP bundles, and shared PostgreSQL MCP call admission
 and payload-free audit. A separate pinned K3s profile now exercises that
@@ -61,7 +62,7 @@ to the default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.18.2**. Release history is on
+Current source version: **0.18.4**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit

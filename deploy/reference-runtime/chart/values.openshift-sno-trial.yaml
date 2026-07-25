@@ -1,0 +1,205 @@
+# Source-only tenant-runtime profile for orchestra-ocp-sno-trial-amd64-v1.
+#
+# This is a non-production, non-certifying single-node render contract. It
+# references operator-created runtime/config/TLS Secrets, a public CA
+# ConfigMap, PostgreSQL, the model plane, Orchestra receipt/telemetry endpoints,
+# and one read-only synthetic MCP server but creates none of them. Rendering
+# never authorizes an install or proves that any reference or image is
+# available.
+
+engineeringTrialProfile:
+  enabled: true
+  profileId: orchestra-ocp-sno-trial-amd64-v1
+  imageFlavor: ubi9
+  sourceOnlyAcknowledged: true
+
+productionProfile:
+  enabled: false
+
+runtimeEdge:
+  overloadContract: orchestra-runtime-edge-overload-v1
+
+fullnameOverride: orchestra-runtime
+
+image:
+  repository: ghcr.io/prometa-ai/orchestra-python-sdk/prometa-runtime-host-ubi9
+  tag: ""
+  # Populate only with a release that contains this source profile.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 1
+
+# The operator creates one immutable config Secret for the admitted deployment.
+# Its model, receipt, telemetry, and read-only MCP endpoints must use HTTPS and
+# the CA mounted below. No platform-side production orchestration is enabled.
+runtimeConfig:
+  existingSecret: orchestra-runtime-trial-config
+  existingConfigMap: ""
+  key: config.json
+  targetFile: config.json
+  rolloutId: orchestra-sno-trial-runtime-config-v1
+
+credentials:
+  existingSecret: orchestra-runtime-trial-credentials
+  databaseUrlKey: database-url
+  apiTokenKey: api-token
+  modelGatewayApiKeyKey: model-gateway-api-key
+  modelGatewayApiKeyOptional: false
+  controlPlaneApiKeyKey: control-plane-api-key
+  controlPlaneApiKeyOptional: true
+  receiptApiKeyKey: receipt-api-key
+  receiptApiKeyOptional: false
+
+serviceAccount:
+  create: true
+  name: orchestra-runtime
+  annotations: {}
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 8080
+
+serverTls:
+  enabled: true
+  existingSecret: orchestra-runtime-trial-server-tls
+  certificateKey: tls.crt
+  privateKeyKey: tls.key
+  clientCaKey: ca.crt
+  requireClientCertificate: false
+  rolloutId: orchestra-sno-trial-runtime-tls-v1
+  probeClient:
+    existingSecret: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
+    caKey: ca.crt
+
+trustedCA:
+  enabled: true
+  configMapName: orchestra-runtime-trial-ca
+  key: ca-bundle.crt
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+podDisruptionBudget:
+  enabled: false
+topologySpreadConstraints: []
+
+migration:
+  enabled: true
+  compatibilityCheck: true
+  serviceAccountName: orchestra-runtime-migration
+  existingSecret: orchestra-runtime-trial-migration
+  databaseUrlKey: migration-database-url
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  networkPolicy:
+    enabled: true
+    allowDNS: true
+    dnsNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openshift-dns
+    dnsPodSelector:
+      matchLabels:
+        dns.operator.openshift.io/daemonset-dns: default
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: orchestra-dependencies
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: orchestra-trial-postgresql
+        ports:
+          - protocol: TCP
+            port: 5432
+
+backup:
+  enabled: false
+
+networkPolicy:
+  enabled: true
+  allowDNS: true
+  dnsNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-dns
+  dnsPodSelector:
+    matchLabels:
+      dns.operator.openshift.io/daemonset-dns: default
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestra-synthetic
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestra-lab-tenant-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestra-dependencies
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestra-trial-postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestra-model
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestra-inference-engine
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestra-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: app
+      ports:
+        - protocol: TCP
+          port: 3443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: orchestra-synthetic
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: orchestra-lab-mcp
+      ports:
+        - protocol: TCP
+          port: 8443

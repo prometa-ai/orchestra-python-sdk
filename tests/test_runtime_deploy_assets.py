@@ -72,6 +72,43 @@ def test_runtime_ubi_image_and_openshift_profile_are_explicitly_bounded():
     assert "orchestra-runtime-edge-overload-v1" in helpers
 
 
+def test_runtime_sno_trial_profile_is_source_only_and_fail_closed():
+    root = ROOT / "deploy/reference-runtime"
+    chart = root / "chart"
+    values = (chart / "values.yaml").read_text(encoding="utf-8")
+    profile = (chart / "values.openshift-sno-trial.yaml").read_text(
+        encoding="utf-8"
+    )
+    helpers = (chart / "templates/_helpers.tpl").read_text(encoding="utf-8")
+    deployment = (chart / "templates/deployment.yaml").read_text(
+        encoding="utf-8"
+    )
+    policy = (chart / "templates/networkpolicy.yaml").read_text(encoding="utf-8")
+    harness = root / "ci/render-sno-trial-profile.sh"
+
+    assert "engineeringTrialProfile:" in values
+    assert "trustedCA:" in values
+    assert "dnsPodSelector:" in values
+    assert "profileId: orchestra-ocp-sno-trial-amd64-v1" in profile
+    assert "sourceOnlyAcknowledged: true" in profile
+    assert 'digest: ""' in profile
+    assert "replicaCount: 1" in profile
+    assert "controlPlaneApiKeyOptional: true" in profile
+    assert "modelGatewayApiKeyOptional: false" in profile
+    assert "receiptApiKeyOptional: false" in profile
+    assert "backup:\n  enabled: false" in profile
+    assert "type: ClusterIP" in profile
+    assert "Source-only tenant-runtime profile" in profile
+    assert "non-production, non-certifying" in profile
+    assert "the engineering trial profile requires" in helpers
+    assert "productionProfile and engineeringTrialProfile are mutually exclusive" in helpers
+    assert "prometa.io/engineering-trial-profile-id" in deployment
+    assert "name: SSL_CERT_FILE" in deployment
+    assert "dnsPodSelector" in policy
+    assert harness.stat().st_mode & stat.S_IXUSR
+    assert "expect_profile_failure" in harness.read_text(encoding="utf-8")
+
+
 def test_runtime_topology_profiles_follow_current_chart_version():
     root = ROOT / "deploy/reference-runtime"
     chart = (root / "chart/Chart.yaml").read_text(encoding="utf-8")

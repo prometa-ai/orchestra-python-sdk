@@ -313,6 +313,13 @@ jobs:
           ref: ${{ env.CI_SOURCE_REF }}
 
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Verify source-only OpenShift SNO trial profile
+        run: >-
+          deploy/reference-runtime/ci/render-sno-trial-profile.sh
+          runtime-chart-openshift-sno.yaml
 
       - name: Lint production reference values
         run: >-
@@ -572,6 +579,8 @@ jobs:
           python-version: "3.12"
 
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
 
       - uses: azure/setup-kubectl@v4
         with:
@@ -609,6 +618,8 @@ jobs:
           python-version: "3.12"
 
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
 
       - uses: azure/setup-kubectl@v4
         with:

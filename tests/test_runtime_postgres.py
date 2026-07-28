@@ -1481,25 +1481,25 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (8)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (9)"
             )
         expect_code("runtime_schema_too_new")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 8"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 9"
             )
 
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 7"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 8"
             )
         expect_code("runtime_schema_too_old")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (7)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (8)"
             )
 
     try:

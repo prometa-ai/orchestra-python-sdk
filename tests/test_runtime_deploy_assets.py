@@ -205,7 +205,7 @@ def test_runtime_backup_restore_assets_are_fail_closed_and_secret_safe():
     assert "target database is not empty" in restore
     assert "restore checksum mismatch" in restore
     assert "restore basename contains unsupported characters" in restore
-    assert "PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-7" in restore
+    assert "PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-8" in restore
     assert 'profiles: ["operations"]' in compose
     assert "runtime-backups:/backups" in compose
 

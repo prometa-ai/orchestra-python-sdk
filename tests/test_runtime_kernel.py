@@ -28,6 +28,7 @@ from prometa.runtime import (
     InMemoryRuntimeStateStore,
     ModelAdapterError,
     ModelInvocationResponse,
+    ModelTokenUsage,
     ModelToolCall,
     RUNTIME_EDGE_OVERLOAD_CONTRACT,
     RuntimeAdmissionPolicy,
@@ -838,3 +839,97 @@ def test_available_capabilities_reflect_only_configured_active_components() -> N
     assert CAPABILITY_TOOL_BROKER in active
     assert CAPABILITY_GUARD_EVALUATE in active
     assert CAPABILITY_HUMAN_ESCALATION in active
+
+
+# ---------------------------------------------------------------------------
+# Token usage on evidence events
+# ---------------------------------------------------------------------------
+
+
+def _attempt_completed(emitter):
+    return [
+        event
+        for event in emitter.events
+        if event.name == "runtime.model.attempt" and event.outcome == "completed"
+    ][0]
+
+
+def test_model_usage_reaches_the_attempt_evidence_event() -> None:
+    vector, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelInvocationResponse(
+            content=json.dumps(vector["sampleOutput"]),
+            finish_reason="stop",
+            provider_model="golden-model@sha256:test",
+            usage=ModelTokenUsage(input_tokens=41, output_tokens=7),
+        )
+    )
+    kernel, emitter = _kernel(admitted, adapter)
+
+    asyncio.run(kernel.execute(vector["sampleInput"], request_id="request-usage-1"))
+
+    attributes = _attempt_completed(emitter).attributes
+    assert attributes["gen_ai.usage.input_tokens"] == 41
+    assert attributes["gen_ai.usage.output_tokens"] == 7
+
+
+def test_cached_input_tokens_are_emitted_when_present() -> None:
+    vector, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelInvocationResponse(
+            content=json.dumps(vector["sampleOutput"]),
+            finish_reason="stop",
+            usage=ModelTokenUsage(
+                input_tokens=100, output_tokens=4, cached_input_tokens=64
+            ),
+        )
+    )
+    kernel, emitter = _kernel(admitted, adapter)
+
+    asyncio.run(kernel.execute(vector["sampleInput"], request_id="request-usage-2"))
+
+    assert _attempt_completed(emitter).attributes[
+        "gen_ai.usage.cached_input_tokens"
+    ] == 64
+
+
+def test_cached_input_tokens_are_omitted_when_zero() -> None:
+    """Most providers have no prefix cache; a constant 0 on every span is noise."""
+    vector, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelInvocationResponse(
+            content=json.dumps(vector["sampleOutput"]),
+            finish_reason="stop",
+            usage=ModelTokenUsage(input_tokens=10, output_tokens=2),
+        )
+    )
+    kernel, emitter = _kernel(admitted, adapter)
+
+    asyncio.run(kernel.execute(vector["sampleInput"], request_id="request-usage-3"))
+
+    assert "gen_ai.usage.cached_input_tokens" not in _attempt_completed(emitter).attributes
+
+
+def test_absent_usage_emits_no_token_attributes() -> None:
+    """An adapter that cannot report usage must not produce a zero that reads
+    as 'no tokens were spent'."""
+    vector, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelInvocationResponse(
+            content=json.dumps(vector["sampleOutput"]),
+            finish_reason="stop",
+        )
+    )
+    kernel, emitter = _kernel(admitted, adapter)
+
+    asyncio.run(kernel.execute(vector["sampleInput"], request_id="request-usage-4"))
+
+    attributes = _attempt_completed(emitter).attributes
+    assert "gen_ai.usage.input_tokens" not in attributes
+    assert "gen_ai.usage.output_tokens" not in attributes
+
+
+def test_third_party_adapters_without_usage_stay_source_compatible() -> None:
+    """`usage` is optional — an adapter built before this field still works."""
+    response = ModelInvocationResponse(content="{}", finish_reason="stop")
+    assert response.usage is None

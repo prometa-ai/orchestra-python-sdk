@@ -1,0 +1,41 @@
+{
+  "batchId": "workflow-batch-57d831e7385a8f05462ce33a2352d85457ce086a0c01e141242934f444f6a2ff",
+  "decisions": [
+    {
+      "appliedOutcome": "deny",
+      "approvalReferences": [
+        "approval-42"
+      ],
+      "controlIds": [
+        "variance-approval"
+      ],
+      "decisionId": "workflow-decision-fb7443a082251ea29d6d52e4ae0162c35c77e2b4b3ccd2c84f71002e16985fde",
+      "evidenceReferences": [
+        "po-match-42"
+      ],
+      "factSetDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "missingFactIds": [],
+      "obligationIds": [
+        "reserve-idempotency"
+      ],
+      "occurredAt": "2026-07-28T10:00:00.000Z",
+      "ontologyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "policyDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "reasonCodes": [
+        "approval_required"
+      ],
+      "recommendedOutcome": "require_approval",
+      "requestId": "request-workflow-1",
+      "sectorSnapshotDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "staleFactIds": [],
+      "state": "matched",
+      "stateVersion": 3,
+      "taskId": "post-to-sap",
+      "transitionId": "matched-to-ready",
+      "workflowId": "invoice-to-sap",
+      "workflowInstanceId": "invoice-42",
+      "workflowVersion": 1
+    }
+  ],
+  "schema": "prometa.workflow-decision.v1"
+}

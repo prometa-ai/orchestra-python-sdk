@@ -37,6 +37,10 @@ from .admission import (
     CAPABILITY_SECURITY_DECISION_EMIT,
     CAPABILITY_SCHEMA_VALIDATE,
     CAPABILITY_TOOL_BROKER,
+    CAPABILITY_WORKFLOW_CONTEXT_RESOLVE,
+    CAPABILITY_WORKFLOW_DECISION_EMIT,
+    CAPABILITY_WORKFLOW_POLICY_EVALUATE,
+    CAPABILITY_WORKFLOW_STATE_PERSIST,
     RuntimeGuardrail,
     RuntimeModel,
     RuntimeTool,
@@ -49,6 +53,24 @@ from .security_assurance import (
     security_policy_identifier,
 )
 from .tasks import RuntimeTaskClaim
+from .workflow_ontology import (
+    RuntimeWorkflowOntology,
+    VerifiedWorkflowContext,
+    WorkflowContextRequest,
+    WorkflowContextResolver,
+    WorkflowDecisionEmitter,
+    WorkflowDecisionEvidence,
+    WorkflowExecutionContext,
+    WorkflowIndeterminateRequest,
+    WorkflowOntologyError,
+    WorkflowPolicyDecision,
+    WorkflowPostconditionRequest,
+    WorkflowPostconditionValidator,
+    WorkflowStateCommitRequest,
+    WorkflowStateStore,
+    evaluate_workflow_policy,
+    workflow_fact_set_digest,
+)
 
 
 RUNTIME_EDGE_OVERLOAD_CONTRACT = "orchestra-runtime-edge-overload-v1"
@@ -91,9 +113,7 @@ class ModelAdapterError(RuntimeExecutionError):
                 "retry_after_seconds requires a retryable non-negative number"
             )
         self.retry_after_seconds = (
-            float(retry_after_seconds)
-            if retry_after_seconds is not None
-            else None
+            float(retry_after_seconds) if retry_after_seconds is not None else None
         )
         super().__init__(code, message, retryable=retryable)
 
@@ -371,16 +391,30 @@ class _CircuitState:
     opened_at: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class _WorkflowEvaluation:
+    artifact: RuntimeWorkflowOntology
+    task: Mapping[str, Any]
+    context_request: WorkflowContextRequest
+    verified_context: VerifiedWorkflowContext
+    decision: WorkflowPolicyDecision
+    runtime_input: Mapping[str, Any]
+
+
 def available_runtime_capabilities(
     *,
     guard_evaluator: Optional[GuardEvaluator] = None,
     security_decision_emitter: Optional[SecurityDecisionEmitter] = None,
     tool_broker: Optional[ToolBroker] = None,
     human_escalation: Optional[HumanEscalation] = None,
+    workflow_context_resolver: Optional[WorkflowContextResolver] = None,
+    workflow_state_store: Optional[WorkflowStateStore] = None,
+    workflow_decision_emitter: Optional[WorkflowDecisionEmitter] = None,
 ) -> FrozenSet[str]:
     capabilities = {
         CAPABILITY_MODEL_INVOKE,
         CAPABILITY_EVIDENCE_EMIT,
+        CAPABILITY_WORKFLOW_POLICY_EVALUATE,
     }
     try:
         import jsonschema  # noqa: F401
@@ -396,6 +430,12 @@ def available_runtime_capabilities(
         capabilities.add(CAPABILITY_TOOL_BROKER)
     if human_escalation is not None:
         capabilities.add(CAPABILITY_HUMAN_ESCALATION)
+    if workflow_context_resolver is not None:
+        capabilities.add(CAPABILITY_WORKFLOW_CONTEXT_RESOLVE)
+    if workflow_state_store is not None:
+        capabilities.add(CAPABILITY_WORKFLOW_STATE_PERSIST)
+    if workflow_decision_emitter is not None:
+        capabilities.add(CAPABILITY_WORKFLOW_DECISION_EMIT)
     return frozenset(capabilities)
 
 
@@ -464,6 +504,12 @@ class RuntimeKernel:
         tool_broker: Optional[ToolBroker] = None,
         human_escalation: Optional[HumanEscalation] = None,
         state_store: Optional[RuntimeStateStore] = None,
+        workflow_context_resolver: Optional[WorkflowContextResolver] = None,
+        workflow_state_store: Optional[WorkflowStateStore] = None,
+        workflow_decision_emitter: Optional[WorkflowDecisionEmitter] = None,
+        workflow_postcondition_validator: Optional[
+            WorkflowPostconditionValidator
+        ] = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         for field_name, field_value in (
@@ -490,6 +536,10 @@ class RuntimeKernel:
         self.tool_broker = tool_broker or DenyAllToolBroker()
         self.human_escalation = human_escalation
         self.state_store = state_store
+        self.workflow_context_resolver = workflow_context_resolver
+        self.workflow_state_store = workflow_state_store
+        self.workflow_decision_emitter = workflow_decision_emitter
+        self.workflow_postcondition_validator = workflow_postcondition_validator
         self._sleep = sleep
         self._circuits: Dict[str, _CircuitState] = {}
 
@@ -498,12 +548,23 @@ class RuntimeKernel:
             security_decision_emitter=security_decision_emitter,
             tool_broker=tool_broker,
             human_escalation=human_escalation,
+            workflow_context_resolver=workflow_context_resolver,
+            workflow_state_store=workflow_state_store,
+            workflow_decision_emitter=workflow_decision_emitter,
         )
         missing = admission.config.contract.required_capabilities - available
         if missing:
             raise RuntimeExecutionError(
                 "runtime_component_missing",
                 "Missing runtime components: %s" % ", ".join(sorted(missing)),
+            )
+        if (
+            admission.config.workflow_ontologies
+            and workflow_postcondition_validator is None
+        ):
+            raise RuntimeExecutionError(
+                "runtime_component_missing",
+                "Missing runtime component: workflow postcondition validator",
             )
         self._models = self._resolve_models()
         self._emit(
@@ -587,8 +648,9 @@ class RuntimeKernel:
             {
                 "prometa.task.attempt": claim.attempt,
                 "prometa.task.sequence": claim.sequence,
-                "prometa.task.lease_expires_at": claim.lease_expires_at
-                .astimezone(timezone.utc)
+                "prometa.task.lease_expires_at": claim.lease_expires_at.astimezone(
+                    timezone.utc
+                )
                 .isoformat()
                 .replace("+00:00", "Z"),
             },
@@ -736,8 +798,7 @@ class RuntimeKernel:
         security_guardrails = tuple(
             guardrail
             for guardrail in guardrails
-            if guardrail.name in applicable
-            and guardrail.security_assurance_enabled
+            if guardrail.name in applicable and guardrail.security_assurance_enabled
         )
         if security_guardrails:
             guarded_payload = self._apply_security_assurance(
@@ -819,10 +880,9 @@ class RuntimeKernel:
             for assessment in decision.security_assessments
             if isinstance(assessment, SecurityGuardAssessment)
         }
-        if (
-            len(assessments) != len(decision.security_assessments)
-            or set(assessments) != {guardrail.name for guardrail in guardrails}
-        ):
+        if len(assessments) != len(decision.security_assessments) or set(
+            assessments
+        ) != {guardrail.name for guardrail in guardrails}:
             raise RuntimeExecutionError("security_decision_evidence_incomplete")
 
         surface = {
@@ -958,15 +1018,404 @@ class RuntimeKernel:
             raise RuntimeExecutionError("undeclared_or_ambiguous_tool")
         return matches[0]
 
+    def _workflow_artifact(
+        self, context: WorkflowExecutionContext
+    ) -> RuntimeWorkflowOntology:
+        matches = [
+            artifact
+            for artifact in self.admission.config.workflow_ontologies
+            if artifact.ontology_id == context.ontology_id
+            and artifact.version == context.version
+        ]
+        if len(matches) != 1:
+            raise RuntimeExecutionError("workflow_context_binding_mismatch")
+        return matches[0]
+
+    @staticmethod
+    def _workflow_task(
+        artifact: RuntimeWorkflowOntology, tool: RuntimeTool
+    ) -> Mapping[str, Any]:
+        matches = []
+        for task in artifact.compiled_policy["spec"].get("tasks", []):
+            binding = task.get("tool")
+            if not isinstance(binding, Mapping):
+                continue
+            if binding.get("name") not in {tool.name, tool.operation}:
+                continue
+            if tool.mcp_server is not None and binding.get("server") != tool.mcp_server:
+                continue
+            matches.append(task)
+        if len(matches) != 1:
+            raise RuntimeExecutionError("workflow_tool_mapping_ambiguous")
+        return matches[0]
+
+    @staticmethod
+    def _validate_verified_workflow_context(
+        context: Any,
+    ) -> VerifiedWorkflowContext:
+        if (
+            not isinstance(context, VerifiedWorkflowContext)
+            or not isinstance(context.current_state, str)
+            or not context.current_state
+            or type(context.state_version) is not int
+            or context.state_version < 0
+            or not isinstance(context.purpose, str)
+            or not context.purpose
+            or any(
+                not isinstance(role, str) or not role for role in context.actor_role_ids
+            )
+            or len(set(context.actor_role_ids)) != len(context.actor_role_ids)
+            or not isinstance(context.facts, Mapping)
+            or any(
+                not isinstance(fact_id, str)
+                or not fact_id
+                or not isinstance(fact, Mapping)
+                for fact_id, fact in context.facts.items()
+            )
+        ):
+            raise RuntimeExecutionError("invalid_verified_workflow_context")
+        return context
+
+    @staticmethod
+    def _workflow_runtime_input(
+        artifact: RuntimeWorkflowOntology,
+        context_request: WorkflowContextRequest,
+        verified: VerifiedWorkflowContext,
+        *,
+        phase: str,
+        transition_id: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        request = dict(context_request.request_attributes)
+        request.update(
+            {
+                "taskId": context_request.task_id,
+                "purpose": verified.purpose,
+            }
+        )
+        selected_transition = transition_id or context_request.transition_id
+        if selected_transition is not None:
+            request["transitionId"] = selected_transition
+        return {
+            "mode": artifact.mode,
+            "phase": phase,
+            "now": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "state": {
+                "current": verified.current_state,
+                "instanceId": context_request.workflow.instance_id,
+                "version": verified.state_version,
+            },
+            "request": request,
+            "actor": {
+                "opaqueRef": context_request.workflow.actor_ref,
+                "roleIds": list(verified.actor_role_ids),
+                "purpose": verified.purpose,
+            },
+            "facts": verified.facts,
+            "approvals": list(verified.approvals),
+            "evidenceRefs": list(verified.evidence_references),
+            "usedIdempotencyKeys": list(verified.used_idempotency_keys),
+        }
+
+    def _emit_workflow_decision(
+        self,
+        evaluation: _WorkflowEvaluation,
+        decision: WorkflowPolicyDecision,
+    ) -> None:
+        emitter = self.workflow_decision_emitter
+        if emitter is None:
+            raise RuntimeExecutionError("workflow_decision_emitter_missing")
+        approval_references = tuple(
+            sorted(
+                {
+                    approval.get("reference")
+                    for approval in evaluation.verified_context.approvals
+                    if isinstance(approval, Mapping)
+                    and isinstance(approval.get("reference"), str)
+                    and approval.get("reference")
+                }
+            )
+        )
+        try:
+            evidence = WorkflowDecisionEvidence(
+                request_id=evaluation.context_request.request_id,
+                workflow_id=evaluation.artifact.ontology_id,
+                workflow_version=evaluation.artifact.version,
+                workflow_instance_id=(evaluation.context_request.workflow.instance_id),
+                ontology_digest=evaluation.artifact.ontology_digest,
+                policy_digest=evaluation.artifact.policy_digest,
+                sector_snapshot_digest=evaluation.artifact.sector_snapshot_digest,
+                state=evaluation.verified_context.current_state,
+                state_version=evaluation.verified_context.state_version,
+                task_id=evaluation.context_request.task_id,
+                transition_id=decision.proposed_transition_id
+                or evaluation.context_request.transition_id,
+                recommended_outcome=decision.recommended_outcome,
+                applied_outcome=decision.applied_outcome,
+                reason_codes=decision.reason_codes,
+                control_ids=decision.matched_control_ids,
+                obligation_ids=decision.obligation_ids,
+                fact_set_digest=workflow_fact_set_digest(
+                    evaluation.verified_context.facts
+                ),
+                missing_fact_ids=decision.missing_fact_ids,
+                stale_fact_ids=decision.stale_fact_ids,
+                approval_references=approval_references,
+                evidence_references=tuple(
+                    sorted(evaluation.verified_context.evidence_references)
+                ),
+                occurred_at=datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+            )
+            emitter.emit(evidence)
+        except (RuntimeExecutionError, WorkflowOntologyError):
+            if evaluation.artifact.mode == "enforce":
+                raise
+        except Exception as exc:
+            if evaluation.artifact.mode == "enforce":
+                raise RuntimeExecutionError("workflow_decision_emit_failed") from exc
+
+    async def _evaluate_workflow_before_tool(
+        self,
+        context: Optional[WorkflowExecutionContext],
+        tool: RuntimeTool,
+        arguments: Mapping[str, Any],
+        request_id: str,
+    ) -> Optional[_WorkflowEvaluation]:
+        if not self.admission.config.workflow_ontologies:
+            if context is not None:
+                raise RuntimeExecutionError("workflow_context_not_admitted")
+            return None
+        if context is None:
+            raise RuntimeExecutionError("workflow_context_required")
+        artifact = self._workflow_artifact(context)
+        task = self._workflow_task(artifact, tool)
+        resolver = self.workflow_context_resolver
+        if resolver is None:
+            raise RuntimeExecutionError("workflow_context_resolver_missing")
+        context_request = WorkflowContextRequest(
+            request_id=request_id,
+            workflow=context,
+            task_id=task["id"],
+            transition_id=None,
+            request_attributes=dict(arguments),
+        )
+        try:
+            verified = self._validate_verified_workflow_context(
+                await resolver.resolve(context_request)
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeExecutionError:
+            raise
+        except Exception as exc:
+            raise RuntimeExecutionError("workflow_context_resolve_failed") from exc
+        runtime_input = self._workflow_runtime_input(
+            artifact,
+            context_request,
+            verified,
+            phase="pre_action",
+        )
+        decision = evaluate_workflow_policy(artifact.compiled_policy, runtime_input)
+        evaluation = _WorkflowEvaluation(
+            artifact=artifact,
+            task=task,
+            context_request=context_request,
+            verified_context=verified,
+            decision=decision,
+            runtime_input=runtime_input,
+        )
+        self._emit_workflow_decision(evaluation, decision)
+        if decision.applied_outcome != "allow":
+            raise RuntimeExecutionError(
+                "workflow_policy_%s" % decision.recommended_outcome
+            )
+        return evaluation
+
+    async def _mark_workflow_indeterminate(
+        self,
+        evaluation: _WorkflowEvaluation,
+        reason_code: str,
+    ) -> None:
+        store = self.workflow_state_store
+        if store is None:
+            raise RuntimeExecutionError("workflow_state_store_missing")
+        indeterminate = WorkflowPolicyDecision(
+            recommended_outcome="indeterminate",
+            applied_outcome="deny",
+            reason_codes=(reason_code,),
+            matched_control_ids=evaluation.decision.matched_control_ids,
+            missing_fact_ids=(),
+            stale_fact_ids=(),
+            obligation_ids=evaluation.decision.obligation_ids,
+            evidence_requirement_ids=(),
+            proposed_transition_id=evaluation.decision.proposed_transition_id,
+            proposed_state=None,
+            counterfactual_reason_codes=("reconcile_before_retry",),
+        )
+        try:
+            await store.mark_indeterminate(
+                WorkflowIndeterminateRequest(
+                    request_id=evaluation.context_request.request_id,
+                    workflow=evaluation.context_request.workflow,
+                    state=evaluation.verified_context.current_state,
+                    state_version=evaluation.verified_context.state_version,
+                    task_id=evaluation.context_request.task_id,
+                    transition_id=evaluation.decision.proposed_transition_id,
+                    reason_code=reason_code,
+                    ontology_digest=evaluation.artifact.ontology_digest,
+                    policy_digest=evaluation.artifact.policy_digest,
+                    sector_snapshot_digest=(evaluation.artifact.sector_snapshot_digest),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeExecutionError:
+            raise
+        except Exception as exc:
+            raise RuntimeExecutionError("workflow_state_store_failed") from exc
+        self._emit_workflow_decision(evaluation, indeterminate)
+
+    async def _commit_workflow_after_tool(
+        self,
+        evaluation: Optional[_WorkflowEvaluation],
+        tool: RuntimeTool,
+        result: ToolInvocationResult,
+    ) -> None:
+        if evaluation is None or evaluation.decision.proposed_state is None:
+            return
+        validator = self.workflow_postcondition_validator
+        store = self.workflow_state_store
+        if validator is None or store is None:
+            raise RuntimeExecutionError("runtime_component_missing")
+        try:
+            refreshed = self._validate_verified_workflow_context(
+                await validator.validate(
+                    WorkflowPostconditionRequest(
+                        context_request=evaluation.context_request,
+                        prior_context=evaluation.verified_context,
+                        proposed_state=evaluation.decision.proposed_state,
+                        tool_audit_reference=result.audit_reference,
+                        tool_result=result.output,
+                    )
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeExecutionError:
+            raise
+        except Exception as exc:
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    evaluation, "workflow_postcondition_unavailable"
+                )
+            raise RuntimeExecutionError(
+                "workflow_postcondition_validation_failed"
+            ) from exc
+        if (
+            refreshed.current_state != evaluation.verified_context.current_state
+            or refreshed.state_version != evaluation.verified_context.state_version
+        ):
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    evaluation, "workflow_state_changed_after_side_effect"
+                )
+            raise RuntimeExecutionError("workflow_state_conflict")
+        runtime_input = self._workflow_runtime_input(
+            evaluation.artifact,
+            evaluation.context_request,
+            refreshed,
+            phase="state_commit",
+            transition_id=evaluation.decision.proposed_transition_id,
+        )
+        decision = evaluate_workflow_policy(
+            evaluation.artifact.compiled_policy, runtime_input
+        )
+        refreshed_evaluation = _WorkflowEvaluation(
+            artifact=evaluation.artifact,
+            task=evaluation.task,
+            context_request=evaluation.context_request,
+            verified_context=refreshed,
+            decision=decision,
+            runtime_input=runtime_input,
+        )
+        self._emit_workflow_decision(refreshed_evaluation, decision)
+        if decision.applied_outcome != "allow" or decision.proposed_state is None:
+            if (
+                evaluation.artifact.mode == "observe"
+                and decision.applied_outcome == "allow"
+            ):
+                return
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    refreshed_evaluation,
+                    "workflow_postcondition_indeterminate",
+                )
+            raise RuntimeExecutionError("workflow_postcondition_denied")
+        idempotency_key = runtime_input["request"].get("idempotencyKey")
+        try:
+            committed = await store.compare_and_set(
+                WorkflowStateCommitRequest(
+                    request_id=evaluation.context_request.request_id,
+                    workflow=evaluation.context_request.workflow,
+                    expected_state=refreshed.current_state,
+                    expected_version=refreshed.state_version,
+                    next_state=decision.proposed_state,
+                    transition_id=decision.proposed_transition_id or "",
+                    ontology_digest=evaluation.artifact.ontology_digest,
+                    policy_digest=evaluation.artifact.policy_digest,
+                    sector_snapshot_digest=(evaluation.artifact.sector_snapshot_digest),
+                    approval_references=tuple(
+                        sorted(
+                            {
+                                approval.get("reference")
+                                for approval in refreshed.approvals
+                                if isinstance(approval, Mapping)
+                                and isinstance(approval.get("reference"), str)
+                            }
+                        )
+                    ),
+                    evidence_references=tuple(sorted(refreshed.evidence_references)),
+                    idempotency_key=(
+                        idempotency_key if isinstance(idempotency_key, str) else None
+                    ),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeExecutionError:
+            raise
+        except Exception as exc:
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    refreshed_evaluation, "workflow_state_store_unavailable"
+                )
+            raise RuntimeExecutionError("workflow_state_store_failed") from exc
+        if not committed:
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    refreshed_evaluation, "workflow_state_compare_and_set_failed"
+                )
+            raise RuntimeExecutionError("workflow_state_conflict")
+
     async def _invoke_tool(
         self,
         call: ModelToolCall,
         request_id: str,
         correlation: Optional[SecurityDecisionCorrelation] = None,
+        workflow_context: Optional[WorkflowExecutionContext] = None,
     ) -> ToolInvocationResult:
         tool = self._tool_by_name(call.name)
         arguments = self._validate_schema(
             "tool_input", call.arguments, tool.input_schema, request_id
+        )
+        workflow_evaluation = await self._evaluate_workflow_before_tool(
+            workflow_context,
+            tool,
+            arguments,
+            request_id,
         )
         guard_outcome = await self._guard(
             "tool",
@@ -1011,9 +1460,7 @@ class RuntimeKernel:
                         agent_id=self.admission.config.manifest.agent_id,
                         release_id=self.admission.promotion.claims["releaseId"],
                         deployment_id=self.admission.promotion.claims["deploymentId"],
-                        environment=self.admission.bundle.claims[
-                            "targetEnvironment"
-                        ],
+                        environment=self.admission.bundle.claims["targetEnvironment"],
                         granted_scopes=self.admission.config.granted_scopes,
                         approval_references=tuple(approval_references),
                     )
@@ -1023,6 +1470,10 @@ class RuntimeKernel:
             if not isinstance(result, ToolInvocationResult):
                 raise RuntimeExecutionError("invalid_tool_result")
         except asyncio.TimeoutError as exc:
+            if workflow_evaluation is not None and tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    workflow_evaluation, "tool_outcome_indeterminate"
+                )
             self._emit(
                 "runtime.tool.call",
                 "failed",
@@ -1036,6 +1487,10 @@ class RuntimeKernel:
         except asyncio.CancelledError:
             raise
         except RuntimeExecutionError as exc:
+            if workflow_evaluation is not None and tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    workflow_evaluation, "tool_outcome_indeterminate"
+                )
             self._emit(
                 "runtime.tool.call",
                 "failed",
@@ -1047,6 +1502,10 @@ class RuntimeKernel:
             )
             raise
         except Exception as exc:
+            if workflow_evaluation is not None and tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    workflow_evaluation, "tool_outcome_indeterminate"
+                )
             self._emit(
                 "runtime.tool.call",
                 "failed",
@@ -1065,6 +1524,11 @@ class RuntimeKernel:
                 "gen_ai.tool.name": tool.operation,
                 "prometa.tool.audit_reference": result.audit_reference,
             },
+        )
+        await self._commit_workflow_after_tool(
+            workflow_evaluation,
+            tool,
+            result,
         )
         return result
 
@@ -1153,6 +1617,7 @@ class RuntimeKernel:
         *,
         request_id: Optional[str] = None,
         security_correlation: Optional[SecurityDecisionCorrelation] = None,
+        workflow_context: Optional[WorkflowExecutionContext] = None,
     ) -> RuntimeExecutionResult:
         request_id = request_id or str(uuid.uuid4())
         if (
@@ -1162,6 +1627,12 @@ class RuntimeKernel:
             or len(request_id) > 256
         ):
             raise ValueError("request_id must be a trimmed string of 1-256 characters")
+        if self.admission.config.workflow_ontologies:
+            if not isinstance(workflow_context, WorkflowExecutionContext):
+                raise RuntimeExecutionError("workflow_context_required")
+            self._workflow_artifact(workflow_context)
+        elif workflow_context is not None:
+            raise RuntimeExecutionError("workflow_context_not_admitted")
         attempts = 0
         tool_calls = 0
         executed_tool = False
@@ -1294,6 +1765,7 @@ class RuntimeKernel:
                                     call,
                                     request_id,
                                     correlation=security_correlation,
+                                    workflow_context=workflow_context,
                                 )
                                 tool_calls += 1
                                 executed_tool = True

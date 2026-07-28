@@ -21,9 +21,7 @@ from typing import Any, Dict, Optional, Protocol, Tuple
 
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
-_TASK_STATUSES = frozenset(
-    {"running", "retryable", "completed", "failed", "blocked"}
-)
+_TASK_STATUSES = frozenset({"running", "retryable", "completed", "failed", "blocked"})
 _MAX_DIGEST_PAYLOAD_BYTES = 16 * 1024 * 1024
 RUNTIME_TASK_LIFECYCLE_VERSION = 1
 
@@ -401,9 +399,7 @@ class InMemoryRuntimeTaskStore:
                     exhausted = True
                     transition = event.transition
                 else:
-                    transition = (
-                        "recovered" if task.status == "running" else "retried"
-                    )
+                    transition = "recovered" if task.status == "running" else "retried"
                     task.status = "running"
                     task.attempt += 1
                     task.sequence += 1
@@ -425,9 +421,7 @@ class InMemoryRuntimeTaskStore:
             raise RuntimeTaskError("task_attempts_exhausted")
         return claim
 
-    def _owned(
-        self, claim: RuntimeTaskClaim, current: datetime
-    ) -> _InMemoryTask:
+    def _owned(self, claim: RuntimeTaskClaim, current: datetime) -> _InMemoryTask:
         if not isinstance(claim, RuntimeTaskClaim):
             raise ValueError("claim must be a RuntimeTaskClaim")
         task = self._tasks.get(claim.request_id)
@@ -493,7 +487,9 @@ class InMemoryRuntimeTaskStore:
         current = _instant(now)
         with self._lock:
             task = self._owned(claim, current)
-            can_retry = retryable and task.recoverable and task.attempt < task.max_attempts
+            can_retry = (
+                retryable and task.recoverable and task.attempt < task.max_attempts
+            )
             task.status = "retryable" if can_retry else "failed"
             task.sequence += 1
             task.claim_token = None

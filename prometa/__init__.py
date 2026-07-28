@@ -107,7 +107,7 @@ from .events import event_trigger
 from .routing import model_route
 from .sentiment import sentiment_classify
 
-__version__ = "0.18.8"
+__version__ = "0.19.0"
 __all__ = [
     "Prometa",
     "workflow",

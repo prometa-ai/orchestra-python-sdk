@@ -77,13 +77,19 @@ def _trimmed(value: str, field: str, maximum: int = 256) -> str:
         or len(value) > maximum
         or "\x00" in value
     ):
-        raise ValueError("%s must be a trimmed string of 1-%d characters" % (field, maximum))
+        raise ValueError(
+            "%s must be a trimmed string of 1-%d characters" % (field, maximum)
+        )
     return value
 
 
-def _string_tuple(values: Sequence[str], field: str, maximum: int = 256) -> Tuple[str, ...]:
+def _string_tuple(
+    values: Sequence[str], field: str, maximum: int = 256
+) -> Tuple[str, ...]:
     if isinstance(values, (str, bytes)) or len(values) > maximum:
-        raise ValueError("%s must be a sequence of at most %d strings" % (field, maximum))
+        raise ValueError(
+            "%s must be a sequence of at most %d strings" % (field, maximum)
+        )
     result = tuple(_trimmed(value, field) for value in values)
     if len(set(result)) != len(result):
         raise ValueError("%s must not contain duplicates" % field)
@@ -259,8 +265,12 @@ class McpBrokerPolicy:
             ("require_approval_for", self.require_approval_for),
             ("require_idempotency_for", self.require_idempotency_for),
         ):
-            if not isinstance(values, frozenset) or not values.issubset(MCP_SIDE_EFFECTS):
-                raise ValueError("%s contains an unsupported side-effect class" % field_name)
+            if not isinstance(values, frozenset) or not values.issubset(
+                MCP_SIDE_EFFECTS
+            ):
+                raise ValueError(
+                    "%s contains an unsupported side-effect class" % field_name
+                )
 
 
 class McpEgressPolicy(Protocol):
@@ -276,7 +286,9 @@ class ExplicitMcpEgressPolicy:
     allowed_stdio_commands: FrozenSet[str] = frozenset()
 
     def __post_init__(self) -> None:
-        origins = frozenset(_endpoint_origin(value) for value in self.allowed_http_origins)
+        origins = frozenset(
+            _endpoint_origin(value) for value in self.allowed_http_origins
+        )
         commands = frozenset(
             _trimmed(value, "allowed_stdio_commands", 500)
             for value in self.allowed_stdio_commands
@@ -292,12 +304,8 @@ class ExplicitMcpEgressPolicy:
 
 @dataclass(frozen=True)
 class McpTransportCredentials:
-    headers: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
-    environment: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         headers = dict(self.headers)
@@ -309,7 +317,12 @@ class McpTransportCredentials:
                 or name.lower() in _FORBIDDEN_CREDENTIAL_HEADERS
             ):
                 raise ValueError("invalid MCP credential header")
-            if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
+            if (
+                not isinstance(value, str)
+                or not value
+                or "\r" in value
+                or "\n" in value
+            ):
                 raise ValueError("invalid MCP credential value")
         for name, value in environment.items():
             if not isinstance(name, str) or not _ENVIRONMENT_NAME.fullmatch(name):
@@ -398,7 +411,9 @@ class EnvironmentMcpCredentialProvider:
             return value
 
         return McpTransportCredentials(
-            headers={target: read(source) for target, source in binding.http_headers.items()},
+            headers={
+                target: read(source) for target, source in binding.http_headers.items()
+            },
             environment={
                 target: read(source)
                 for target, source in binding.stdio_environment.items()
@@ -516,9 +531,7 @@ class InMemoryMcpIdempotencyStore:
             record = self._records.get(key)
             if record is not None and record.request_digest != request_digest:
                 raise ValueError("MCP idempotency digest mismatch")
-            self._records[key] = McpIdempotencyRecord(
-                request_digest, "indeterminate"
-            )
+            self._records[key] = McpIdempotencyRecord(request_digest, "indeterminate")
 
     def get(self, key: str) -> Optional[McpIdempotencyRecord]:
         with self._lock:
@@ -618,9 +631,7 @@ class OfficialMcpTransportClient:
             ) from exc
 
         if bool(getattr(result, "isError", False)):
-            raise McpTransportError(
-                "mcp_tool_reported_error", outcome_unknown=True
-            )
+            raise McpTransportError("mcp_tool_reported_error", outcome_unknown=True)
         structured = getattr(result, "structuredContent", None)
         if structured is not None:
             return structured
@@ -634,9 +645,7 @@ class OfficialMcpTransportClient:
             elif isinstance(item, Mapping):
                 rendered.append(dict(item))
             else:
-                raise McpTransportError(
-                    "mcp_response_invalid", outcome_unknown=True
-                )
+                raise McpTransportError("mcp_response_invalid", outcome_unknown=True)
         return rendered
 
 
@@ -755,9 +764,13 @@ class GovernedMcpToolBroker(ToolBroker):
         tool = request.tool
         if tool.source != "mcp" or tool.mcp_server is None:
             raise RuntimeExecutionError("mcp_tool_source_invalid")
-        agent_id = self._required_identity(request.agent_id, "mcp_agent_identity_missing")
+        agent_id = self._required_identity(
+            request.agent_id, "mcp_agent_identity_missing"
+        )
         self._required_identity(request.release_id, "mcp_release_identity_missing")
-        self._required_identity(request.deployment_id, "mcp_deployment_identity_missing")
+        self._required_identity(
+            request.deployment_id, "mcp_deployment_identity_missing"
+        )
         target_environment = _TARGET_ENVIRONMENT.get(request.environment or "")
         if target_environment is None:
             raise RuntimeExecutionError("mcp_environment_invalid")
@@ -786,9 +799,10 @@ class GovernedMcpToolBroker(ToolBroker):
             (tool.risk_level, server.risk_level, grant.risk_level),
             key=lambda value: _RISK_RANK.get(value, _RISK_RANK["critical"]),
         )
-        if _RISK_RANK.get(effective_risk, _RISK_RANK["critical"]) > _RISK_RANK[
-            self._policy.max_risk_level
-        ]:
+        if (
+            _RISK_RANK.get(effective_risk, _RISK_RANK["critical"])
+            > _RISK_RANK[self._policy.max_risk_level]
+        ):
             raise RuntimeExecutionError("mcp_risk_ceiling_exceeded")
         approval_required = bool(
             tool.approval_required
@@ -797,7 +811,9 @@ class GovernedMcpToolBroker(ToolBroker):
         valid_approvals = tuple(
             reference
             for reference in request.approval_references
-            if isinstance(reference, str) and reference and reference == reference.strip()
+            if isinstance(reference, str)
+            and reference
+            and reference == reference.strip()
         )
         if len(valid_approvals) != len(request.approval_references):
             raise RuntimeExecutionError("mcp_approval_reference_invalid")

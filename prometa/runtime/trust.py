@@ -20,7 +20,7 @@ from typing import Any, Dict, FrozenSet, Iterable, Mapping, MutableSet, Optional
 
 ENVELOPE_VERSION = 1
 ENVELOPE_CANONICALIZATION = "signed-payload-json-v1"
-SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2})
+SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 PROMOTION_ATTESTATION_VERSION = 1
 PROMOTION_ATTESTATION_TYPE = "orchestra.promotion-attestation"
 PROMOTION_ATTESTATION_CANONICALIZATION = "signed-payload-json-v1"
@@ -219,9 +219,7 @@ def _verify_ed25519(
             "Install prometa-sdk[runtime] to verify runtime artifacts",
         ) from exc
 
-    key_der = _decode_base64(
-        entry.public_key_spki_der_base64, "invalid_trust_key"
-    )
+    key_der = _decode_base64(entry.public_key_spki_der_base64, "invalid_trust_key")
     signature = _decode_base64(signature_base64, "malformed_signature")
     try:
         public_key = load_der_public_key(key_der)
@@ -306,9 +304,7 @@ def verify_bundle_envelope(
     if bundle.get("envelopeCanonicalization") != ENVELOPE_CANONICALIZATION:
         raise BundleVerificationError("unsupported_envelope_canonicalization")
 
-    signed_payload = _required_string(
-        bundle, "signedPayload", "missing_signed_payload"
-    )
+    signed_payload = _required_string(bundle, "signedPayload", "missing_signed_payload")
     envelope_signature = _required_string(
         bundle, "envelopeSignature", "missing_signature"
     )
@@ -336,17 +332,11 @@ def verify_bundle_envelope(
     key_id = _required_string(claims, "keyId", "invalid_claims")
     org_id = _required_string(claims, "orgId", "invalid_claims")
     audience = _required_string(claims, "audience", "invalid_claims")
-    environment = _required_string(
-        claims, "targetEnvironment", "invalid_claims"
-    )
+    environment = _required_string(claims, "targetEnvironment", "invalid_claims")
     subject = _required_string(claims, "subject", "invalid_claims")
     jti = _required_string(claims, "jti", "invalid_claims")
-    artifact_digest = _required_string(
-        claims, "artifactDigest", "invalid_claims"
-    )
-    content_canonical = _required_string(
-        claims, "contentCanonical", "invalid_claims"
-    )
+    artifact_digest = _required_string(claims, "artifactDigest", "invalid_claims")
+    content_canonical = _required_string(claims, "contentCanonical", "invalid_claims")
 
     if issuer != transport_issuer or key_id != transport_key_id:
         raise BundleVerificationError("trust_selector_mismatch")
@@ -386,9 +376,9 @@ def verify_bundle_envelope(
     if seen_jtis is not None and jti in seen_jtis:
         raise BundleVerificationError("replayed_bundle")
 
-    expected_digest = "sha256:" + hashlib.sha256(
-        content_canonical.encode("utf-8")
-    ).hexdigest()
+    expected_digest = (
+        "sha256:" + hashlib.sha256(content_canonical.encode("utf-8")).hexdigest()
+    )
     if not hmac.compare_digest(expected_digest, artifact_digest):
         raise BundleVerificationError("artifact_digest_mismatch")
 
@@ -554,10 +544,7 @@ def verify_promotion_attestation(
         or attestation.get("attestationVersion") != PROMOTION_ATTESTATION_VERSION
     ):
         raise BundleVerificationError("unsupported_attestation_version")
-    if (
-        attestation.get("canonicalization")
-        != PROMOTION_ATTESTATION_CANONICALIZATION
-    ):
+    if attestation.get("canonicalization") != PROMOTION_ATTESTATION_CANONICALIZATION:
         raise BundleVerificationError("unsupported_attestation_canonicalization")
 
     signed_payload = _required_string(
@@ -592,9 +579,7 @@ def verify_promotion_attestation(
     subject = _required_string(claims, "subject", "invalid_claims")
     org_id = _required_string(claims, "orgId", "invalid_claims")
     audience = _required_string(claims, "audience", "invalid_claims")
-    environment = _required_string(
-        claims, "targetEnvironment", "invalid_claims"
-    )
+    environment = _required_string(claims, "targetEnvironment", "invalid_claims")
     artifact_id = _required_string(claims, "artifactId", "invalid_claims")
     artifact_digest = _require_sha256_digest(claims, "artifactDigest")
     manifest_id = _required_string(claims, "manifestId", "invalid_claims")
@@ -604,9 +589,7 @@ def verify_promotion_attestation(
     gate_stage = _required_string(claims, "gateStage", "invalid_claims")
     policy_digest = _require_sha256_digest(claims, "policySetDigest")
     evidence_digest = _require_sha256_digest(claims, "evidenceDigest")
-    requested_runtime = _required_string(
-        claims, "requestedRuntime", "invalid_claims"
-    )
+    requested_runtime = _required_string(claims, "requestedRuntime", "invalid_claims")
     release_id = _required_string(claims, "releaseId", "invalid_claims")
     deployment_id = _required_string(claims, "deploymentId", "invalid_claims")
     jti = _required_string(claims, "jti", "invalid_claims")
@@ -657,7 +640,10 @@ def verify_promotion_attestation(
     expires_at = _parse_instant(claims, "expiresAt")
     offline_lease_expires_at = _parse_instant(claims, "offlineLeaseExpiresAt")
     if not (
-        decision_evaluated_at <= issued_at <= not_before < expires_at
+        decision_evaluated_at
+        <= issued_at
+        <= not_before
+        < expires_at
         <= decision_valid_until
     ):
         raise BundleVerificationError("invalid_validity_window")
@@ -693,15 +679,14 @@ def verify_promotion_attestation(
         signed_role_requirements = _normalize_role_requirements(
             approval_requirement.get("roleRequirements")
         )
-        separation_of_duties = approval_requirement.get(
-            "separationOfDuties", False
-        )
+        separation_of_duties = approval_requirement.get("separationOfDuties", False)
         review_request_required = approval_requirement.get(
             "reviewRequestRequired", False
         )
-        if type(separation_of_duties) is not bool or type(
-            review_request_required
-        ) is not bool:
+        if (
+            type(separation_of_duties) is not bool
+            or type(review_request_required) is not bool
+        ):
             raise BundleVerificationError("invalid_approvals")
         if sum(item[1] for item in signed_role_requirements) > signed_minimum_approvals:
             raise BundleVerificationError("invalid_approvals")
@@ -734,9 +719,7 @@ def verify_promotion_attestation(
         requester_identity = _required_string(
             approval_request, "requesterIdentity", "invalid_approval_request"
         )
-        request_policy_digest = _require_sha256_digest(
-            approval_request, "policyDigest"
-        )
+        request_policy_digest = _require_sha256_digest(approval_request, "policyDigest")
         request_requested_at = _parse_instant(approval_request, "requestedAt")
         request_expires_at = _parse_instant(approval_request, "expiresAt")
         if (
@@ -786,10 +769,7 @@ def verify_promotion_attestation(
             or approval_expires_at <= approved_at
             or approval_expires_at < expires_at
             or approval_expires_at > decision_valid_until
-            or (
-                request_requested_at is not None
-                and approved_at < request_requested_at
-            )
+            or (request_requested_at is not None and approved_at < request_requested_at)
             or (
                 request_expires_at is not None
                 and approval_expires_at > request_expires_at

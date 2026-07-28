@@ -175,7 +175,7 @@ jobs:
           test "$(docker inspect "$IMAGE" \
             --format '{{ index .Config.Labels "io.prometa.image.variant" }}')" = "$VARIANT"
           docker run --rm "${run_as[@]}" --entrypoint python "$IMAGE" \
-            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION; assert prometa.__version__ == '$version'; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 7"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION; assert prometa.__version__ == '$version'; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 8"
           prometa-runtime-conformance \
             --profile deployment \
             --driver-name "release-${VARIANT}" \

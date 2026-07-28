@@ -436,7 +436,7 @@ def test_topology_fixture_builds_two_isolated_tenant_releases(tmp_path):
             tmp_path / "wrong-version",
             PROBE_PATH,
             "prometa-runtime-host:topology-test",
-            "0.19.0",
+            "0.18.8",
         )
 
 

@@ -368,9 +368,7 @@ def validate_security_decision(value: Mapping[str, Any]) -> Dict[str, Any]:
     review_required = value.get("reviewRequired")
     if type(review_required) is not bool:
         raise SecurityDecisionError("reviewRequired must be a boolean")
-    environment = _member(
-        "environment", value.get("environment"), tuple(_ENVIRONMENTS)
-    )
+    environment = _member("environment", value.get("environment"), tuple(_ENVIRONMENTS))
 
     normalized = {
         "decisionId": _identifier("decisionId", value.get("decisionId")),
@@ -390,9 +388,7 @@ def validate_security_decision(value: Mapping[str, Any]) -> Dict[str, Any]:
             "appliedAction", value.get("appliedAction"), tuple(_ACTIONS)
         ),
         "reviewRequired": review_required,
-        "severity": _member(
-            "severity", value.get("severity"), tuple(_SEVERITIES)
-        ),
+        "severity": _member("severity", value.get("severity"), tuple(_SEVERITIES)),
         "category": _identifier("category", value.get("category"), 100),
         "policy": {
             "id": _identifier("policy.id", (policy or {}).get("id")),
@@ -402,12 +398,8 @@ def validate_security_decision(value: Mapping[str, Any]) -> Dict[str, Any]:
             "digest": _digest("policy.digest", (policy or {}).get("digest")),
         },
         "detector": {
-            "kind": _identifier(
-                "detector.kind", (detector or {}).get("kind"), 100
-            ),
-            "digest": _digest(
-                "detector.digest", (detector or {}).get("digest")
-            ),
+            "kind": _identifier("detector.kind", (detector or {}).get("kind"), 100),
+            "digest": _digest("detector.digest", (detector or {}).get("digest")),
         },
         "explanation": {
             "summary": _bounded_text(
@@ -532,9 +524,7 @@ def build_security_decision(
             ],
             "signalAgreement": assessment.signal_agreement,
             "evidenceRefs": list(assessment.evidence_refs),
-            "contentFragmentDigests": list(
-                assessment.content_fragment_digests
-            ),
+            "contentFragmentDigests": list(assessment.content_fragment_digests),
             "counterfactual": assessment.counterfactual,
             "actionRationale": assessment.action_rationale,
         },
@@ -671,8 +661,7 @@ class SecurityDecisionClient:
             detail = exc.read(1000).decode("utf-8", errors="replace")
             raise SecurityDecisionSubmissionError(
                 exc.code,
-                "Security decision batch rejected: HTTP %s: %s"
-                % (exc.code, detail),
+                "Security decision batch rejected: HTTP %s: %s" % (exc.code, detail),
             ) from exc
         except SecurityDecisionSubmissionError:
             raise
@@ -729,9 +718,7 @@ class SecurityDecisionDispatcher:
         self._poll_interval_seconds = _positive_number(
             "poll_interval_seconds", poll_interval_seconds, 300
         )
-        self._lease_seconds = _positive_number(
-            "lease_seconds", lease_seconds, 3600
-        )
+        self._lease_seconds = _positive_number("lease_seconds", lease_seconds, 3600)
         self._initial_backoff_seconds = _positive_number(
             "initial_backoff_seconds", initial_backoff_seconds, 3600
         )

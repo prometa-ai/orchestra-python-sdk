@@ -436,9 +436,7 @@ def test_reference_hosts_coordinate_durable_tasks_and_replay_status() -> None:
             },
         )
         assert repeated.status == 409
-        assert repeated.body == {
-            "error": {"code": "task_already_completed"}
-        }
+        assert repeated.body == {"error": {"code": "task_already_completed"}}
         changed = _execute(
             second_host,
             {
@@ -795,9 +793,7 @@ def _mcp_broker_document():
             {
                 "serverName": "Orders",
                 "authMode": "service-account",
-                "httpHeaders": {
-                    "Authorization": "MCP_ORDERS_AUTHORIZATION"
-                },
+                "httpHeaders": {"Authorization": "MCP_ORDERS_AUTHORIZATION"},
             }
         ],
         "toolTimeoutSeconds": 25,
@@ -817,6 +813,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert config.api_token_env == "PROMETA_RUNTIME_API_TOKEN"
     assert config.receipt_base_url is None
     assert config.security_decision_base_url is None
+    assert config.workflow_decision_base_url is None
     assert config.control_plane_base_url is None
     assert config.task_recovery_enabled is False
 
@@ -847,10 +844,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     path.write_text(json.dumps(configured), encoding="utf-8")
     receipt_config = load_runtime_host_config(path)
     assert receipt_config.receipt_base_url == "https://orchestra.example.test/control"
-    assert (
-        receipt_config.receipt_api_key_env
-        == "ORCHESTRA_RUNTIME_RECEIPT_API_KEY"
-    )
+    assert receipt_config.receipt_api_key_env == "ORCHESTRA_RUNTIME_RECEIPT_API_KEY"
     assert receipt_config.receipt_timeout_seconds == 3
     assert receipt_config.receipt_lease_seconds == 10
 
@@ -875,6 +869,28 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     )
     assert security_config.security_decision_timeout_seconds == 3
     assert security_config.security_decision_lease_seconds == 10
+
+    configured["workflowDecisionDelivery"] = {
+        "baseUrl": "https://orchestra.example.test/control",
+        "apiKeyEnv": "ORCHESTRA_WORKFLOW_DECISION_API_KEY",
+        "timeoutSeconds": 3,
+        "pollIntervalSeconds": 1,
+        "leaseSeconds": 10,
+        "initialBackoffSeconds": 2,
+        "maxBackoffSeconds": 20,
+    }
+    path.write_text(json.dumps(configured), encoding="utf-8")
+    workflow_config = load_runtime_host_config(path)
+    assert (
+        workflow_config.workflow_decision_base_url
+        == "https://orchestra.example.test/control"
+    )
+    assert (
+        workflow_config.workflow_decision_api_key_env
+        == "ORCHESTRA_WORKFLOW_DECISION_API_KEY"
+    )
+    assert workflow_config.workflow_decision_timeout_seconds == 3
+    assert workflow_config.workflow_decision_lease_seconds == 10
 
     pulled = _config_document()
     pulled.pop("bundle")
@@ -924,9 +940,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert mcp_config.mcp_broker.tool_timeout_seconds == 25
     assert mcp_config.mcp_broker.reservation_timeout_seconds == 90
     assert (
-        mcp_config.mcp_broker.credential_bindings[0].http_headers[
-            "Authorization"
-        ]
+        mcp_config.mcp_broker.credential_bindings[0].http_headers["Authorization"]
         == "MCP_ORDERS_AUTHORIZATION"
     )
 
@@ -1084,9 +1098,7 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
     environment = {
         "PROMETA_RUNTIME_DATABASE_URL": "postgresql://unused",
         "PROMETA_RUNTIME_API_TOKEN": API_TOKEN,
-        "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT": (
-            RUNTIME_EDGE_OVERLOAD_CONTRACT
-        ),
+        "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT": (RUNTIME_EDGE_OVERLOAD_CONTRACT),
         "MODEL_GATEWAY_API_KEY": "model-key",
         "MCP_ORDERS_AUTHORIZATION": "Bearer tenant-mcp-key",
     }
@@ -1095,9 +1107,7 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
         async def call_tool(self, *args, **kwargs):
             return {"ok": True}
 
-    monkeypatch.setattr(
-        host_module, "official_mcp_transport_available", lambda: False
-    )
+    monkeypatch.setattr(host_module, "official_mcp_transport_available", lambda: False)
     with pytest.raises(RuntimeHostError) as caught:
         build_reference_runtime_host(
             config,
@@ -1117,10 +1127,7 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
         assert created is True
         assert isinstance(host.kernel.tool_broker, GovernedMcpToolBroker)
         assert host.kernel.policy.tool_timeout_seconds == 25
-        assert (
-            host.kernel.policy.overload_contract_id
-            == RUNTIME_EDGE_OVERLOAD_CONTRACT
-        )
+        assert host.kernel.policy.overload_contract_id == RUNTIME_EDGE_OVERLOAD_CONTRACT
     finally:
         host.close()
 
@@ -1224,9 +1231,7 @@ def test_reference_host_executes_mcp_with_explicit_tenant_human_adapter(
         def __init__(self):
             self.calls = []
 
-        async def call_tool(
-            self, server, operation, arguments, credentials, metadata
-        ):
+        async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.calls.append(
                 (server.name, operation, arguments, credentials, metadata)
             )
@@ -1275,15 +1280,11 @@ def test_reference_host_executes_mcp_with_explicit_tenant_human_adapter(
         assert response.body["output"] == vector["sampleOutput"]
         assert response.body["toolCalls"] == 1
         assert len(transport.calls) == 1
-        server_name, operation, arguments, credentials, metadata = (
-            transport.calls[0]
-        )
+        server_name, operation, arguments, credentials, metadata = transport.calls[0]
         assert server_name == "Orders"
         assert operation == "orders.write"
         assert arguments == {"orderId": "order-host-mcp"}
-        assert credentials.headers == {
-            "Authorization": "Bearer tenant-mcp-key"
-        }
+        assert credentials.headers == {"Authorization": "Bearer tenant-mcp-key"}
         assert metadata["prometa.io/request-id"] == "request-host-mcp"
     finally:
         host.close()
@@ -1427,9 +1428,7 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             self.wfile.write(response)
 
     receipt_server = ThreadingHTTPServer(("127.0.0.1", 0), ReceiptHandler)
-    receipt_thread = threading.Thread(
-        target=receipt_server.serve_forever, daemon=True
-    )
+    receipt_thread = threading.Thread(target=receipt_server.serve_forever, daemon=True)
     receipt_thread.start()
     verification = vector["verification"]
     config = RuntimeHostConfig(
@@ -1541,9 +1540,7 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
             {"requestId": "request-first", "input": vector["sampleInput"]},
         )
         assert duplicate.status == 409
-        assert duplicate.body == {
-            "error": {"code": "task_already_completed"}
-        }
+        assert duplicate.body == {"error": {"code": "task_already_completed"}}
         assert first_response.body["output"] == vector["sampleOutput"]
         time.sleep(0.1)
         assert len(received_receipts) == 2
@@ -1561,15 +1558,15 @@ def test_reference_host_bootstrap_joins_activation_and_executes_with_postgres() 
         assert identity_events
         for event in identity_events:
             assert event.attributes["prometa.artifact.type"] == "agent-bundle"
-            assert event.attributes["prometa.artifact.digest"] == (
-                vector["bundle"]["artifactDigest"]
+            assert (
+                event.attributes["prometa.artifact.digest"]
+                == (vector["bundle"]["artifactDigest"])
             )
-            assert event.attributes["prometa.policy.digest"] == contract[
-                "policyDigest"
-            ]
-            assert event.attributes["prometa.configuration.digest"] == contract[
-                "configurationDigest"
-            ]
+            assert event.attributes["prometa.policy.digest"] == contract["policyDigest"]
+            assert (
+                event.attributes["prometa.configuration.digest"]
+                == contract["configurationDigest"]
+            )
         assert "runtime-receipt-key" not in repr(delivery_events)
     finally:
         release_receipts.set()
@@ -1691,8 +1688,7 @@ def test_reference_host_pulls_and_uses_bounded_cache_when_platform_is_down() -> 
         api_token_env="RUNTIME_TOKEN",
         request_timeout_seconds=3,
         max_request_bytes=1024,
-        control_plane_base_url="http://127.0.0.1:%d"
-        % control.server_address[1],
+        control_plane_base_url="http://127.0.0.1:%d" % control.server_address[1],
         control_plane_attestation_id=vector["attestation"]["attestationId"],
         control_plane_api_key_env="CONTROL_PLANE_KEY",
         control_plane_allow_insecure_http=True,
@@ -1730,15 +1726,17 @@ def test_reference_host_pulls_and_uses_bounded_cache_when_platform_is_down() -> 
         assert first.release_source == "control_plane"
         assert pulls == [
             (
-                "/api/runtime-releases/%s"
-                % vector["attestation"]["attestationId"],
+                "/api/runtime-releases/%s" % vector["attestation"]["attestationId"],
                 "runtime-read-key-0123456789abcdef",
             )
         ]
-        assert _execute(
-            first,
-            {"requestId": "request-pulled", "input": vector["sampleInput"]},
-        ).status == 200
+        assert (
+            _execute(
+                first,
+                {"requestId": "request-pulled", "input": vector["sampleInput"]},
+            ).status
+            == 200
+        )
         assert any(
             event.attributes["prometa.release.source"] == "control_plane"
             for event in first_evidence.events
@@ -1771,10 +1769,13 @@ def test_reference_host_pulls_and_uses_bounded_cache_when_platform_is_down() -> 
         )
         assert joined is False
         assert second.release_source == "cache"
-        assert _execute(
-            second,
-            {"requestId": "request-cached", "input": vector["sampleInput"]},
-        ).status == 200
+        assert (
+            _execute(
+                second,
+                {"requestId": "request-cached", "input": vector["sampleInput"]},
+            ).status
+            == 200
+        )
         assert any(
             event.attributes["prometa.release.source"] == "cache"
             for event in second_evidence.events

@@ -62,7 +62,7 @@ to the default observability install.
 pip install prometa-sdk
 ```
 
-Current source version: **0.18.4**. Release history is on
+Current source version: **0.19.0**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 ### Optional tenant-runtime kit

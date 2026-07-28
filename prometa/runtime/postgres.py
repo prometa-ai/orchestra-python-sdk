@@ -41,12 +41,23 @@ from .tasks import (
     _identifier as _task_identifier,
     _instant as _task_instant,
 )
+from .workflow_ontology import (
+    WorkflowIndeterminateRequest,
+    WorkflowStateCommitRequest,
+    canonical_digest as _workflow_digest,
+)
+from .workflow_decisions import (
+    MAX_WORKFLOW_DECISION_BODY_BYTES,
+    WorkflowDecisionOutboxItem,
+    validate_workflow_decision,
+)
 
 
 _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
 _MAX_RECEIPT_BYTES = 64 * 1024
 _MAX_SECURITY_DECISION_BYTES = 64 * 1024
+_MAX_WORKFLOW_DECISION_BYTES = 64 * 1024
 _MAX_RELEASE_DOCUMENT_BYTES = 12 * 1024 * 1024
 _MAX_MCP_AUDIT_BYTES = 128 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -62,9 +73,9 @@ _RECEIPT_SEQUENCE = {
     "failed": 70,
     "stopped": 80,
 }
-RUNTIME_POSTGRES_SCHEMA_VERSION = 7
+RUNTIME_POSTGRES_SCHEMA_VERSION = 8
 RUNTIME_POSTGRES_COMPATIBILITY_VERSION = 1
-RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 7
+RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 8
 RUNTIME_POSTGRES_MAX_SCHEMA_VERSION = RUNTIME_POSTGRES_SCHEMA_VERSION
 _RUNTIME_TABLES = (
     "prometa_runtime_schema_migrations",
@@ -74,11 +85,14 @@ _RUNTIME_TABLES = (
     "prometa_runtime_bundle_identity",
     "prometa_runtime_receipt_outbox",
     "prometa_runtime_security_decision_outbox",
+    "prometa_runtime_workflow_decision_outbox",
     "prometa_runtime_release_cache",
     "prometa_runtime_task",
     "prometa_runtime_task_event",
     "prometa_runtime_mcp_idempotency",
     "prometa_runtime_mcp_audit",
+    "prometa_runtime_workflow_instance",
+    "prometa_runtime_workflow_ledger",
 )
 _TASK_TABLE_COLUMNS = {
     "prometa_runtime_task": frozenset(
@@ -174,10 +188,70 @@ _SECURITY_TABLE_COLUMNS = {
         }
     )
 }
+_WORKFLOW_TABLE_COLUMNS = {
+    "prometa_runtime_workflow_decision_outbox": frozenset(
+        {
+            "tenant_id",
+            "decision_id",
+            "payload",
+            "status",
+            "attempts",
+            "available_at",
+            "leased_until",
+            "lease_token",
+            "last_error_code",
+            "delivered_at",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "prometa_runtime_workflow_instance": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "workflow_id",
+            "workflow_version",
+            "instance_id",
+            "state",
+            "state_version",
+            "quarantined",
+            "ontology_digest",
+            "policy_digest",
+            "sector_snapshot_digest",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "prometa_runtime_workflow_ledger": frozenset(
+        {
+            "tenant_id",
+            "runtime_id",
+            "event_id",
+            "request_id",
+            "workflow_id",
+            "workflow_version",
+            "instance_id",
+            "prior_state",
+            "next_state",
+            "state_version",
+            "transition_id",
+            "outcome",
+            "reason_code",
+            "ontology_digest",
+            "policy_digest",
+            "sector_snapshot_digest",
+            "approval_references",
+            "evidence_references",
+            "idempotency_key_digest",
+            "created_at",
+        }
+    ),
+}
 _INTEGRITY_TABLE_COLUMNS = {
     **_TASK_TABLE_COLUMNS,
     **_MCP_TABLE_COLUMNS,
     **_SECURITY_TABLE_COLUMNS,
+    **_WORKFLOW_TABLE_COLUMNS,
 }
 
 _SCHEMA_SQL = """
@@ -279,6 +353,28 @@ CREATE TABLE IF NOT EXISTS prometa_runtime_security_decision_outbox (
 
 CREATE INDEX IF NOT EXISTS prometa_runtime_security_decision_pending_idx
     ON prometa_runtime_security_decision_outbox (
+        tenant_id, status, available_at, created_at, decision_id
+    );
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_workflow_decision_outbox (
+    tenant_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    leased_until TIMESTAMPTZ,
+    lease_token TEXT,
+    last_error_code TEXT,
+    delivered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_workflow_decision_pending_idx
+    ON prometa_runtime_workflow_decision_outbox (
         tenant_id, status, available_at, created_at, decision_id
     );
 
@@ -422,6 +518,65 @@ CREATE INDEX IF NOT EXISTS prometa_runtime_mcp_audit_request_idx
         tenant_id, runtime_id, request_id, call_id, occurred_at
     );
 
+CREATE TABLE IF NOT EXISTS prometa_runtime_workflow_instance (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_version INTEGER NOT NULL CHECK (workflow_version >= 1),
+    instance_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    state_version BIGINT NOT NULL CHECK (state_version >= 0),
+    quarantined BOOLEAN NOT NULL DEFAULT FALSE,
+    ontology_digest TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    sector_snapshot_digest TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (
+        tenant_id, runtime_id, workflow_id, workflow_version, instance_id
+    )
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_workflow_instance_state_idx
+    ON prometa_runtime_workflow_instance (
+        tenant_id, runtime_id, workflow_id, workflow_version,
+        state, quarantined, updated_at
+    );
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_workflow_ledger (
+    tenant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_version INTEGER NOT NULL CHECK (workflow_version >= 1),
+    instance_id TEXT NOT NULL,
+    prior_state TEXT NOT NULL,
+    next_state TEXT,
+    state_version BIGINT NOT NULL CHECK (state_version >= 0),
+    transition_id TEXT,
+    outcome TEXT NOT NULL CHECK (
+        outcome IN ('committed', 'indeterminate')
+    ),
+    reason_code TEXT,
+    ontology_digest TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    sector_snapshot_digest TEXT NOT NULL,
+    approval_references JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(approval_references) = 'array'),
+    evidence_references JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(evidence_references) = 'array'),
+    idempotency_key_digest TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, runtime_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_workflow_ledger_instance_idx
+    ON prometa_runtime_workflow_ledger (
+        tenant_id, runtime_id, workflow_id, workflow_version,
+        instance_id, created_at, event_id
+    );
+
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (1)
 ON CONFLICT (version) DO NOTHING;
@@ -448,6 +603,10 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (7)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (8)
 ON CONFLICT (version) DO NOTHING;
 """
 
@@ -517,8 +676,7 @@ def _validate_identifier(
         or len(value) > max_length
     ):
         raise ValueError(
-            "%s must be a trimmed string of 1-%d characters"
-            % (name, max_length)
+            "%s must be a trimmed string of 1-%d characters" % (name, max_length)
         )
     return value
 
@@ -595,6 +753,25 @@ def _serialize_security_decision(
     )
     if len(encoded.encode("utf-8")) > _MAX_SECURITY_DECISION_BYTES:
         raise ValueError("security decision exceeds the 64 KiB limit")
+    return decision_id, encoded
+
+
+def _serialize_workflow_decision(
+    decision: Mapping[str, Any],
+) -> tuple[str, str]:
+    normalized = validate_workflow_decision(decision)
+    decision_id = _validate_identifier(
+        "decision_id", normalized["decisionId"], max_length=256
+    )
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    if len(encoded.encode("utf-8")) > _MAX_WORKFLOW_DECISION_BYTES:
+        raise ValueError("workflow decision exceeds the 64 KiB limit")
     return decision_id, encoded
 
 
@@ -710,18 +887,14 @@ def _serialize_mcp_audit(
         "transport": _mcp_audit_text(
             "transport", event.transport, required=False, maximum=64
         ),
-        "operation": _mcp_audit_text(
-            "operation", event.operation, maximum=256
-        ),
+        "operation": _mcp_audit_text("operation", event.operation, maximum=256),
         "permission": _mcp_audit_text(
             "permission", event.permission, required=False, maximum=64
         ),
         "effectiveRisk": _mcp_audit_text(
             "effective_risk", event.effective_risk, required=False, maximum=64
         ),
-        "sideEffects": _mcp_audit_text(
-            "side_effects", event.side_effects, maximum=64
-        ),
+        "sideEffects": _mcp_audit_text("side_effects", event.side_effects, maximum=64),
         "scopes": list(scopes),
         "approvalReferences": list(approvals),
         "argumentDigest": event.argument_digest,
@@ -729,9 +902,7 @@ def _serialize_mcp_audit(
         "idempotencyKey": _mcp_audit_text(
             "idempotency_key", event.idempotency_key, required=False, maximum=256
         ),
-        "reason": _mcp_audit_text(
-            "reason", event.reason, required=False, maximum=256
-        ),
+        "reason": _mcp_audit_text("reason", event.reason, required=False, maximum=256),
     }
     try:
         encoded = json.dumps(
@@ -826,9 +997,7 @@ def check_postgres_runtime_compatibility(
     except RuntimePersistenceError:
         raise
     except Exception:
-        raise RuntimePersistenceError(
-            "runtime_schema_compatibility_failed"
-        ) from None
+        raise RuntimePersistenceError("runtime_schema_compatibility_failed") from None
     return RuntimePostgresCompatibilityReport(
         schema_version=schema_version,
         migration_versions=versions,
@@ -865,9 +1034,7 @@ def verify_postgres_runtime_integrity(
                 )
                 present_tables = {str(row[0]) for row in cursor.fetchall()}
                 if present_tables != set(_RUNTIME_TABLES):
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -879,19 +1046,14 @@ def verify_postgres_runtime_integrity(
                     """,
                     (list(_INTEGRITY_TABLE_COLUMNS),),
                 )
-                columns = {
-                    table_name: set()
-                    for table_name in _INTEGRITY_TABLE_COLUMNS
-                }
+                columns = {table_name: set() for table_name in _INTEGRITY_TABLE_COLUMNS}
                 for table_name, column_name in cursor.fetchall():
                     columns[str(table_name)].add(str(column_name))
                 if any(
                     columns[table_name] != expected
                     for table_name, expected in _INTEGRITY_TABLE_COLUMNS.items()
                 ):
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -901,13 +1063,9 @@ def verify_postgres_runtime_integrity(
                     """
                 )
                 versions = tuple(int(row[0]) for row in cursor.fetchall())
-                expected_versions = tuple(
-                    range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)
-                )
+                expected_versions = tuple(range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1))
                 if versions != expected_versions:
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -954,9 +1112,39 @@ def verify_postgres_runtime_integrity(
                 )
                 row = cursor.fetchone()
                 if row is None or int(row[0]) != 0:
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_workflow_instance
+                    WHERE ontology_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR policy_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR sector_snapshot_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR state_version < 0
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_workflow_ledger
+                    WHERE ontology_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR policy_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR sector_snapshot_digest !~ '^sha256:[0-9a-f]{64}$'
+                       OR (idempotency_key_digest IS NOT NULL AND
+                           idempotency_key_digest
+                               !~ '^sha256:[0-9a-f]{64}$')
+                       OR jsonb_typeof(approval_references) <> 'array'
+                       OR jsonb_typeof(evidence_references) <> 'array'
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -978,9 +1166,7 @@ def verify_postgres_runtime_integrity(
                 )
                 row = cursor.fetchone()
                 if row is None or int(row[0]) != 0:
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -1011,9 +1197,7 @@ def verify_postgres_runtime_integrity(
                 )
                 row = cursor.fetchone()
                 if row is None or int(row[0]) != 0:
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -1030,9 +1214,24 @@ def verify_postgres_runtime_integrity(
                 )
                 row = cursor.fetchone()
                 if row is None or int(row[0]) != 0:
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_workflow_decision_outbox
+                    WHERE payload->>'decisionId' IS DISTINCT FROM decision_id
+                       OR payload ? 'prompt'
+                       OR payload ? 'results'
+                       OR payload ? 'messages'
+                       OR payload ? 'arguments'
+                       OR payload ? 'businessFacts'
+                       OR payload ? 'actorRoles'
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
 
                 cursor.execute(
                     """
@@ -1045,18 +1244,22 @@ def verify_postgres_runtime_integrity(
                         (SELECT COUNT(*) FROM prometa_runtime_receipt_outbox),
                         (SELECT COUNT(*) FROM
                             prometa_runtime_security_decision_outbox),
+                        (SELECT COUNT(*) FROM
+                            prometa_runtime_workflow_decision_outbox),
                         (SELECT COUNT(*) FROM prometa_runtime_release_cache),
                         (SELECT COUNT(*) FROM prometa_runtime_task),
                         (SELECT COUNT(*) FROM prometa_runtime_task_event),
                         (SELECT COUNT(*) FROM prometa_runtime_mcp_idempotency),
-                        (SELECT COUNT(*) FROM prometa_runtime_mcp_audit)
+                        (SELECT COUNT(*) FROM prometa_runtime_mcp_audit),
+                        (SELECT COUNT(*) FROM
+                            prometa_runtime_workflow_instance),
+                        (SELECT COUNT(*) FROM
+                            prometa_runtime_workflow_ledger)
                     """
                 )
                 count_row = cursor.fetchone()
                 if count_row is None or len(count_row) != len(_RUNTIME_TABLES):
-                    raise RuntimePersistenceError(
-                        "runtime_schema_integrity_failed"
-                    )
+                    raise RuntimePersistenceError("runtime_schema_integrity_failed")
                 counts = {
                     table_name: int(count)
                     for table_name, count in zip(_RUNTIME_TABLES, count_row)
@@ -1064,9 +1267,7 @@ def verify_postgres_runtime_integrity(
     except RuntimePersistenceError:
         raise
     except Exception:
-        raise RuntimePersistenceError(
-            "runtime_schema_verification_failed"
-        ) from None
+        raise RuntimePersistenceError("runtime_schema_verification_failed") from None
     return RuntimePostgresVerificationReport(
         schema_version=RUNTIME_POSTGRES_SCHEMA_VERSION,
         migration_versions=versions,
@@ -1313,9 +1514,7 @@ class PostgresRuntimeReceiptOutbox(_PostgresTenantStore):
         if row is None:
             return None
         try:
-            receipt_id = _validate_identifier(
-                "receipt_id", row[0], max_length=200
-            )
+            receipt_id = _validate_identifier("receipt_id", row[0], max_length=200)
             receipt = row[1]
             if isinstance(receipt, str):
                 receipt = json.loads(receipt)
@@ -1509,14 +1708,17 @@ class PostgresSecurityDecisionOutbox(_PostgresTenantStore):
                         if isinstance(payload, str):
                             payload = json.loads(payload)
                         normalized = validate_security_decision(payload)
-                        candidate_size = len(
-                            json.dumps(
-                                normalized,
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                                allow_nan=False,
-                            ).encode("utf-8")
-                        ) + 2
+                        candidate_size = (
+                            len(
+                                json.dumps(
+                                    normalized,
+                                    separators=(",", ":"),
+                                    ensure_ascii=False,
+                                    allow_nan=False,
+                                ).encode("utf-8")
+                            )
+                            + 2
+                        )
                         if (
                             selected
                             and encoded_size + candidate_size
@@ -1603,8 +1805,7 @@ class PostgresSecurityDecisionOutbox(_PostgresTenantStore):
         if status not in {"pending", "delivered", "dead_letter"}:
             raise ValueError("unsupported security decision outbox status")
         if error_code is not None and (
-            not isinstance(error_code, str)
-            or _ERROR_CODE.fullmatch(error_code) is None
+            not isinstance(error_code, str) or _ERROR_CODE.fullmatch(error_code) is None
         ):
             raise ValueError("error_code must be a bounded machine code")
         if (
@@ -1688,6 +1889,259 @@ class PostgresSecurityDecisionOutbox(_PostgresTenantStore):
         )
 
 
+class PostgresWorkflowDecisionOutbox(_PostgresTenantStore):
+    """Durable leased workflow-decision queue shared by runtime replicas."""
+
+    def enqueue(self, decision: Mapping[str, Any]) -> bool:
+        decision_id, encoded = _serialize_workflow_decision(decision)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_workflow_decision_outbox (
+                            tenant_id, decision_id, payload
+                        ) VALUES (%s, %s, %s::jsonb)
+                        ON CONFLICT (tenant_id, decision_id) DO NOTHING
+                        RETURNING decision_id
+                        """,
+                        (self.tenant_id, decision_id, encoded),
+                    )
+                    return cursor.fetchone() is not None
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "workflow_decision_outbox_unavailable"
+            ) from None
+
+    def claim_batch(
+        self,
+        lease_seconds: float,
+        maximum: int = 500,
+    ) -> Optional[WorkflowDecisionOutboxItem]:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or lease_seconds <= 0
+            or lease_seconds > 3600
+        ):
+            raise ValueError("lease_seconds must be between 0 and 3600")
+        if type(maximum) is not int or maximum < 1 or maximum > 500:
+            raise ValueError("maximum must be between 1 and 500")
+        lease_token = str(uuid.uuid4())
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT decision_id, payload, attempts
+                        FROM prometa_runtime_workflow_decision_outbox
+                        WHERE tenant_id = %s
+                          AND status = 'pending'
+                          AND available_at <= CURRENT_TIMESTAMP
+                          AND (
+                              leased_until IS NULL
+                              OR leased_until <= CURRENT_TIMESTAMP
+                          )
+                        ORDER BY created_at, decision_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                        """,
+                        (self.tenant_id, maximum),
+                    )
+                    candidates = cursor.fetchall()
+                    selected = []
+                    encoded_size = 128
+                    for row in candidates:
+                        payload = row[1]
+                        if isinstance(payload, str):
+                            payload = json.loads(payload)
+                        normalized = validate_workflow_decision(payload)
+                        candidate_size = (
+                            len(
+                                json.dumps(
+                                    normalized,
+                                    separators=(",", ":"),
+                                    ensure_ascii=False,
+                                    allow_nan=False,
+                                ).encode("utf-8")
+                            )
+                            + 2
+                        )
+                        if (
+                            selected
+                            and encoded_size + candidate_size
+                            > MAX_WORKFLOW_DECISION_BODY_BYTES
+                        ):
+                            break
+                        encoded_size += candidate_size
+                        selected.append(
+                            (
+                                _validate_identifier(
+                                    "decision_id", row[0], max_length=256
+                                ),
+                                normalized,
+                                int(row[2]),
+                            )
+                        )
+                    if not selected:
+                        return None
+                    decision_ids = [row[0] for row in selected]
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_workflow_decision_outbox
+                        SET leased_until = CURRENT_TIMESTAMP
+                                + (%s * INTERVAL '1 second'),
+                            lease_token = %s,
+                            attempts = attempts + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s
+                          AND decision_id = ANY(%s)
+                          AND status = 'pending'
+                        """,
+                        (
+                            float(lease_seconds),
+                            lease_token,
+                            self.tenant_id,
+                            decision_ids,
+                        ),
+                    )
+                    if cursor.rowcount != len(decision_ids):
+                        raise RuntimePersistenceError(
+                            "workflow_decision_outbox_lease_lost"
+                        )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "workflow_decision_outbox_unavailable"
+            ) from None
+        return WorkflowDecisionOutboxItem(
+            decision_ids=tuple(row[0] for row in selected),
+            decisions=tuple(row[1] for row in selected),
+            attempts=max(row[2] for row in selected) + 1,
+            lease_token=lease_token,
+        )
+
+    @staticmethod
+    def _validate_item(
+        item: WorkflowDecisionOutboxItem,
+    ) -> tuple[Tuple[str, ...], str]:
+        if not isinstance(item, WorkflowDecisionOutboxItem):
+            raise ValueError("item must be a WorkflowDecisionOutboxItem")
+        if not item.decision_ids or len(item.decision_ids) > 500:
+            raise ValueError("item decision IDs are invalid")
+        decision_ids = tuple(
+            _validate_identifier("decision_id", value, max_length=256)
+            for value in item.decision_ids
+        )
+        if len(set(decision_ids)) != len(decision_ids):
+            raise ValueError("item decision IDs must be unique")
+        lease_token = _validate_identifier(
+            "lease_token", item.lease_token, max_length=200
+        )
+        return decision_ids, lease_token
+
+    def _complete_lease(
+        self,
+        item: WorkflowDecisionOutboxItem,
+        *,
+        status: str,
+        error_code: Optional[str] = None,
+        delay_seconds: float = 0,
+    ) -> None:
+        decision_ids, lease_token = self._validate_item(item)
+        if status not in {"pending", "delivered", "dead_letter"}:
+            raise ValueError("unsupported workflow decision outbox status")
+        if error_code is not None and (
+            not isinstance(error_code, str) or _ERROR_CODE.fullmatch(error_code) is None
+        ):
+            raise ValueError("error_code must be a bounded machine code")
+        if (
+            isinstance(delay_seconds, bool)
+            or not isinstance(delay_seconds, (int, float))
+            or delay_seconds < 0
+            or delay_seconds > 86_400
+        ):
+            raise ValueError("delay_seconds must be between 0 and 86400")
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_workflow_decision_outbox
+                        SET status = %s,
+                            available_at = CASE
+                                WHEN %s = 'pending' THEN CURRENT_TIMESTAMP
+                                    + (%s * INTERVAL '1 second')
+                                ELSE available_at
+                            END,
+                            leased_until = NULL,
+                            lease_token = NULL,
+                            last_error_code = %s,
+                            delivered_at = CASE
+                                WHEN %s = 'delivered' THEN CURRENT_TIMESTAMP
+                                ELSE delivered_at
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s
+                          AND decision_id = ANY(%s)
+                          AND status = 'pending'
+                          AND lease_token = %s
+                        """,
+                        (
+                            status,
+                            status,
+                            float(delay_seconds),
+                            error_code,
+                            status,
+                            self.tenant_id,
+                            list(decision_ids),
+                            lease_token,
+                        ),
+                    )
+                    if cursor.rowcount != len(decision_ids):
+                        raise RuntimePersistenceError(
+                            "workflow_decision_outbox_lease_lost"
+                        )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "workflow_decision_outbox_unavailable"
+            ) from None
+
+    def mark_delivered(self, item: WorkflowDecisionOutboxItem) -> None:
+        self._complete_lease(item, status="delivered")
+
+    def reschedule(
+        self,
+        item: WorkflowDecisionOutboxItem,
+        *,
+        delay_seconds: float,
+        error_code: str,
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="pending",
+            delay_seconds=delay_seconds,
+            error_code=error_code,
+        )
+
+    def mark_dead_letter(
+        self,
+        item: WorkflowDecisionOutboxItem,
+        *,
+        error_code: str,
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="dead_letter",
+            error_code=error_code,
+        )
+
+
 class PostgresRuntimeReleaseCache(_PostgresTenantStore):
     """Persist caller-verified release material for bounded offline restart."""
 
@@ -1710,9 +2164,7 @@ class PostgresRuntimeReleaseCache(_PostgresTenantStore):
         environment = _validate_identifier(
             "target_environment", handoff.target_environment
         )
-        runtime_target = _validate_identifier(
-            "runtime_target", handoff.runtime_target
-        )
+        runtime_target = _validate_identifier("runtime_target", handoff.runtime_target)
         bundle = _serialize_release_document("bundle", handoff.bundle)
         promotion = _serialize_release_document(
             "promotion_attestation", handoff.promotion_attestation
@@ -1720,8 +2172,7 @@ class PostgresRuntimeReleaseCache(_PostgresTenantStore):
         if (
             environment not in _RUNTIME_ENVIRONMENTS
             or handoff.bundle.get("artifactDigest") != digest
-            or handoff.promotion_attestation.get("attestationId")
-            != attestation_id
+            or handoff.promotion_attestation.get("attestationId") != attestation_id
         ):
             raise ValueError("handoff release bindings are inconsistent")
         if handoff.checked_at.tzinfo is None or handoff.fetched_at.tzinfo is None:
@@ -1832,7 +2283,9 @@ class PostgresRuntimeReleaseCache(_PostgresTenantStore):
             or max_age_seconds <= 0
             or max_age_seconds > 7 * 86_400
         ):
-            raise ValueError("max_age_seconds must be greater than 0 and at most 604800")
+            raise ValueError(
+                "max_age_seconds must be greater than 0 and at most 604800"
+            )
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             raise ValueError("now must be timezone-aware")
@@ -1866,26 +2319,21 @@ class PostgresRuntimeReleaseCache(_PostgresTenantStore):
                 or checked_at.tzinfo is None
                 or not isinstance(fetched_at, datetime)
                 or fetched_at.tzinfo is None
-                or fetched_at.astimezone(timezone.utc)
-                > current + timedelta(seconds=60)
+                or fetched_at.astimezone(timezone.utc) > current + timedelta(seconds=60)
             ):
                 raise RuntimePersistenceError("release_cache_record_invalid")
-            if (
-                current - fetched_at.astimezone(timezone.utc)
-            ).total_seconds() > float(max_age_seconds):
+            if (current - fetched_at.astimezone(timezone.utc)).total_seconds() > float(
+                max_age_seconds
+            ):
                 return None
             environment = _validate_identifier("target_environment", row[4])
             if environment not in _RUNTIME_ENVIRONMENTS:
                 raise ValueError("unsupported cached target environment")
             return RuntimeReleaseHandoff(
                 attestation_id=attestation,
-                artifact_id=_validate_identifier(
-                    "artifact_id", row[0], max_length=200
-                ),
+                artifact_id=_validate_identifier("artifact_id", row[0], max_length=200),
                 artifact_digest=_validate_digest(row[1]),
-                release_id=_validate_identifier(
-                    "release_id", row[2], max_length=200
-                ),
+                release_id=_validate_identifier("release_id", row[2], max_length=200),
                 deployment_id=_validate_identifier(
                     "deployment_id", row[3], max_length=200
                 ),
@@ -1947,18 +2395,12 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
         )
 
     @staticmethod
-    def _current_time(
-        cursor: Any, supplied: Optional[datetime]
-    ) -> datetime:
+    def _current_time(cursor: Any, supplied: Optional[datetime]) -> datetime:
         if supplied is not None:
             return supplied
         cursor.execute("SELECT CURRENT_TIMESTAMP")
         row = cursor.fetchone()
-        if (
-            row is None
-            or not isinstance(row[0], datetime)
-            or row[0].tzinfo is None
-        ):
+        if row is None or not isinstance(row[0], datetime) or row[0].tzinfo is None:
             raise RuntimeTaskError("task_clock_invalid")
         return row[0].astimezone(timezone.utc)
 
@@ -2355,9 +2797,7 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
                     attempt, max_attempts, sequence, recoverable = self._owned(
                         cursor, claim, current
                     )
-                    can_retry = (
-                        retryable and recoverable and attempt < max_attempts
-                    )
+                    can_retry = retryable and recoverable and attempt < max_attempts
                     status = "retryable" if can_retry else "failed"
                     transition = "retry_scheduled" if can_retry else "failed"
                     next_sequence = sequence + 1
@@ -2469,8 +2909,7 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
                         or lease_expires_at.tzinfo is None
                     )
                 )
-                or (status == "running")
-                != isinstance(lease_expires_at, datetime)
+                or (status == "running") != isinstance(lease_expires_at, datetime)
                 or (
                     completed_at is not None
                     and (
@@ -2480,14 +2919,12 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
                 )
             ):
                 raise ValueError("invalid timestamps")
-            last_error = (
-                None if row[9] is None else _task_error_code(row[9])
-            )
-            output = None if row[10] is None else _task_digest(
-                "output_digest", row[10]
-            )
-            model = None if row[11] is None else _task_identifier(
-                "model_name", row[11], 256
+            last_error = None if row[9] is None else _task_error_code(row[9])
+            output = None if row[10] is None else _task_digest("output_digest", row[10])
+            model = (
+                None
+                if row[11] is None
+                else _task_identifier("model_name", row[11], 256)
             )
             record = RuntimeTaskRecord(
                 request_id=request,
@@ -2519,8 +2956,7 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
                     record.used_fallback is not None
                     and type(record.used_fallback) is not bool
                 )
-                or (record.status == "completed")
-                != (record.output_digest is not None)
+                or (record.status == "completed") != (record.output_digest is not None)
                 or (record.status in {"completed", "failed"})
                 != (record.completed_at is not None)
             ):
@@ -2529,9 +2965,7 @@ class PostgresRuntimeTaskStore(_PostgresTenantStore):
             for event_row in reversed(event_rows):
                 occurred_at = event_row[4]
                 reason = (
-                    None
-                    if event_row[5] is None
-                    else _task_error_code(event_row[5])
+                    None if event_row[5] is None else _task_error_code(event_row[5])
                 )
                 if (
                     event_row[2] not in _TASK_STATUSES
@@ -2600,9 +3034,7 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
             or reservation_timeout_seconds <= 0
             or reservation_timeout_seconds > 86_400
         ):
-            raise ValueError(
-                "reservation_timeout_seconds must be between 0 and 86400"
-            )
+            raise ValueError("reservation_timeout_seconds must be between 0 and 86400")
         self.reservation_timeout_seconds = float(reservation_timeout_seconds)
 
     async def reserve(self, key: str, request_digest: str) -> str:
@@ -2648,9 +3080,7 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
                     )
                     existing = cursor.fetchone()
                     if existing is None:
-                        raise RuntimePersistenceError(
-                            "mcp_idempotency_record_missing"
-                        )
+                        raise RuntimePersistenceError("mcp_idempotency_record_missing")
                     if existing[0] != request_digest:
                         return "conflict"
                     status = str(existing[1])
@@ -2673,28 +3103,20 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
                         if cursor.fetchone() is not None:
                             return "indeterminate"
                     if status not in {"reserved", "completed", "indeterminate"}:
-                        raise RuntimePersistenceError(
-                            "mcp_idempotency_record_invalid"
-                        )
+                        raise RuntimePersistenceError("mcp_idempotency_record_invalid")
                     return status
         except RuntimePersistenceError:
             raise
         except Exception:
-            raise RuntimePersistenceError(
-                "mcp_idempotency_store_unavailable"
-            ) from None
+            raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
 
-    async def complete(
-        self, key: str, request_digest: str, output_digest: str
-    ) -> None:
+    async def complete(self, key: str, request_digest: str, output_digest: str) -> None:
         identity = _validate_identifier("idempotency_key", key, 256)
         request = _validate_digest(request_digest)
         output = _validate_digest(output_digest)
         await asyncio.to_thread(self._complete_sync, identity, request, output)
 
-    def _complete_sync(
-        self, key: str, request_digest: str, output_digest: str
-    ) -> None:
+    def _complete_sync(self, key: str, request_digest: str, output_digest: str) -> None:
         try:
             with self._connect(self._dsn) as connection:
                 with connection.cursor() as cursor:
@@ -2726,9 +3148,7 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
         except RuntimePersistenceError:
             raise
         except Exception:
-            raise RuntimePersistenceError(
-                "mcp_idempotency_store_unavailable"
-            ) from None
+            raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
 
     async def release(self, key: str, request_digest: str) -> None:
         identity = _validate_identifier("idempotency_key", key, 256)
@@ -2770,15 +3190,11 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
                     existing = cursor.fetchone()
                     if existing is None:
                         return
-                    raise RuntimePersistenceError(
-                        "mcp_idempotency_transition_invalid"
-                    )
+                    raise RuntimePersistenceError("mcp_idempotency_transition_invalid")
         except RuntimePersistenceError:
             raise
         except Exception:
-            raise RuntimePersistenceError(
-                "mcp_idempotency_store_unavailable"
-            ) from None
+            raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
 
     async def mark_indeterminate(self, key: str, request_digest: str) -> None:
         identity = _validate_identifier("idempotency_key", key, 256)
@@ -2819,13 +3235,9 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
                     )
                     existing = cursor.fetchone()
                     if existing is None:
-                        raise RuntimePersistenceError(
-                            "mcp_idempotency_record_missing"
-                        )
+                        raise RuntimePersistenceError("mcp_idempotency_record_missing")
                     if existing[0] != request_digest:
-                        raise RuntimePersistenceError(
-                            "mcp_idempotency_digest_mismatch"
-                        )
+                        raise RuntimePersistenceError("mcp_idempotency_digest_mismatch")
                     cursor.execute(
                         """
                         UPDATE prometa_runtime_mcp_idempotency
@@ -2841,9 +3253,7 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
         except RuntimePersistenceError:
             raise
         except Exception:
-            raise RuntimePersistenceError(
-                "mcp_idempotency_store_unavailable"
-            ) from None
+            raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
 
     async def get(self, key: str) -> Optional[McpIdempotencyRecord]:
         identity = _validate_identifier("idempotency_key", key, 256)
@@ -2866,9 +3276,7 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
         except RuntimePersistenceError:
             raise
         except Exception:
-            raise RuntimePersistenceError(
-                "mcp_idempotency_store_unavailable"
-            ) from None
+            raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
         if row is None:
             return None
         request_digest, status, output_digest = row
@@ -2961,6 +3369,362 @@ class PostgresMcpAuditSink(_PostgresTenantStore):
             raise
         except Exception:
             raise RuntimePersistenceError("mcp_audit_store_unavailable") from None
+
+
+class PostgresWorkflowStateStore(_PostgresTenantStore):
+    """Multi-replica workflow CAS and append-only minimized state ledger."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        tenant_id: str,
+        runtime_id: str,
+        connect: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        super().__init__(dsn, tenant_id=tenant_id, connect=connect)
+        self.runtime_id = _validate_identifier("runtime_id", runtime_id)
+
+    @staticmethod
+    def _references(value: Sequence[str], name: str) -> str:
+        if (
+            len(value) > 256
+            or len(set(value)) != len(value)
+            or any(
+                not isinstance(item, str)
+                or not item
+                or item != item.strip()
+                or len(item) > 512
+                for item in value
+            )
+        ):
+            raise ValueError("%s must contain unique bounded references" % name)
+        return json.dumps(
+            sorted(value),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _event_id(
+        request_id: str,
+        workflow_id: str,
+        workflow_version: int,
+        instance_id: str,
+        state_version: int,
+        outcome: str,
+    ) -> str:
+        identity = "\x00".join(
+            (
+                request_id,
+                workflow_id,
+                str(workflow_version),
+                instance_id,
+                str(state_version),
+                outcome,
+            )
+        )
+        return "workflow-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _identity(request):
+        workflow = request.workflow
+        return (
+            _validate_identifier("request_id", request.request_id, 256),
+            _validate_identifier("workflow_id", workflow.ontology_id, 256),
+            workflow.version,
+            _validate_identifier("workflow_instance_id", workflow.instance_id, 256),
+        )
+
+    @staticmethod
+    def _digests(request) -> Tuple[str, str, str]:
+        values = (
+            request.ontology_digest,
+            request.policy_digest,
+            request.sector_snapshot_digest,
+        )
+        if any(
+            not isinstance(value, str) or _SHA256_DIGEST.fullmatch(value) is None
+            for value in values
+        ):
+            raise ValueError("workflow digests must be lowercase sha256 values")
+        return values
+
+    async def compare_and_set(self, request: WorkflowStateCommitRequest) -> bool:
+        if not isinstance(request, WorkflowStateCommitRequest):
+            raise ValueError("request must be WorkflowStateCommitRequest")
+        return await asyncio.to_thread(self._compare_and_set_sync, request)
+
+    def _compare_and_set_sync(self, request: WorkflowStateCommitRequest) -> bool:
+        request_id, workflow_id, workflow_version, instance_id = self._identity(request)
+        if type(workflow_version) is not int or workflow_version < 1:
+            raise ValueError("workflow_version must be positive")
+        if type(request.expected_version) is not int or request.expected_version < 0:
+            raise ValueError("expected_version must not be negative")
+        prior_state = _validate_identifier(
+            "workflow_state", request.expected_state, 128
+        )
+        next_state = _validate_identifier("workflow_state", request.next_state, 128)
+        transition_id = _validate_identifier(
+            "workflow_transition_id", request.transition_id, 128
+        )
+        ontology_digest, policy_digest, sector_digest = self._digests(request)
+        approval_references = self._references(
+            request.approval_references, "approval_references"
+        )
+        evidence_references = self._references(
+            request.evidence_references, "evidence_references"
+        )
+        idempotency_digest = (
+            _workflow_digest(request.idempotency_key)
+            if request.idempotency_key is not None
+            else None
+        )
+        next_version = request.expected_version + 1
+        event_id = self._event_id(
+            request_id,
+            workflow_id,
+            workflow_version,
+            instance_id,
+            next_version,
+            "committed",
+        )
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    if request.expected_version == 0:
+                        cursor.execute(
+                            """
+                            INSERT INTO prometa_runtime_workflow_instance (
+                                tenant_id, runtime_id, workflow_id,
+                                workflow_version, instance_id, state,
+                                state_version, quarantined, ontology_digest,
+                                policy_digest, sector_snapshot_digest
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, 0, FALSE,
+                                %s, %s, %s
+                            )
+                            ON CONFLICT (
+                                tenant_id, runtime_id, workflow_id,
+                                workflow_version, instance_id
+                            ) DO NOTHING
+                            """,
+                            (
+                                self.tenant_id,
+                                self.runtime_id,
+                                workflow_id,
+                                workflow_version,
+                                instance_id,
+                                prior_state,
+                                ontology_digest,
+                                policy_digest,
+                                sector_digest,
+                            ),
+                        )
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_workflow_instance
+                        SET state = %s,
+                            state_version = state_version + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s AND runtime_id = %s
+                          AND workflow_id = %s AND workflow_version = %s
+                          AND instance_id = %s
+                          AND state = %s AND state_version = %s
+                          AND quarantined = FALSE
+                          AND ontology_digest = %s
+                          AND policy_digest = %s
+                          AND sector_snapshot_digest = %s
+                        RETURNING state_version
+                        """,
+                        (
+                            next_state,
+                            self.tenant_id,
+                            self.runtime_id,
+                            workflow_id,
+                            workflow_version,
+                            instance_id,
+                            prior_state,
+                            request.expected_version,
+                            ontology_digest,
+                            policy_digest,
+                            sector_digest,
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return False
+                    if int(row[0]) != next_version:
+                        raise RuntimePersistenceError("workflow_state_version_invalid")
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_workflow_ledger (
+                            tenant_id, runtime_id, event_id, request_id,
+                            workflow_id, workflow_version, instance_id,
+                            prior_state, next_state, state_version,
+                            transition_id, outcome, reason_code,
+                            ontology_digest, policy_digest,
+                            sector_snapshot_digest, approval_references,
+                            evidence_references, idempotency_key_digest
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, 'committed', NULL,
+                            %s, %s, %s, %s::jsonb, %s::jsonb, %s
+                        )
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            event_id,
+                            request_id,
+                            workflow_id,
+                            workflow_version,
+                            instance_id,
+                            prior_state,
+                            next_state,
+                            next_version,
+                            transition_id,
+                            ontology_digest,
+                            policy_digest,
+                            sector_digest,
+                            approval_references,
+                            evidence_references,
+                            idempotency_digest,
+                        ),
+                    )
+            return True
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("workflow_state_store_unavailable") from None
+
+    async def mark_indeterminate(self, request: WorkflowIndeterminateRequest) -> None:
+        if not isinstance(request, WorkflowIndeterminateRequest):
+            raise ValueError("request must be WorkflowIndeterminateRequest")
+        await asyncio.to_thread(self._mark_indeterminate_sync, request)
+
+    def _mark_indeterminate_sync(self, request: WorkflowIndeterminateRequest) -> None:
+        request_id, workflow_id, workflow_version, instance_id = self._identity(request)
+        if (
+            type(workflow_version) is not int
+            or workflow_version < 1
+            or type(request.state_version) is not int
+            or request.state_version < 0
+        ):
+            raise ValueError("workflow versions must be valid")
+        state = _validate_identifier("workflow_state", request.state, 128)
+        _validate_identifier("workflow_task_id", request.task_id, 128)
+        transition_id = (
+            _validate_identifier("workflow_transition_id", request.transition_id, 128)
+            if request.transition_id is not None
+            else None
+        )
+        if (
+            not isinstance(request.reason_code, str)
+            or _ERROR_CODE.fullmatch(request.reason_code) is None
+        ):
+            raise ValueError("reason_code must be a bounded machine code")
+        reason_code = request.reason_code
+        ontology_digest, policy_digest, sector_digest = self._digests(request)
+        event_id = self._event_id(
+            request_id,
+            workflow_id,
+            workflow_version,
+            instance_id,
+            request.state_version,
+            "indeterminate",
+        )
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_workflow_instance (
+                            tenant_id, runtime_id, workflow_id,
+                            workflow_version, instance_id, state,
+                            state_version, quarantined, ontology_digest,
+                            policy_digest, sector_snapshot_digest
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, TRUE,
+                            %s, %s, %s
+                        )
+                        ON CONFLICT (
+                            tenant_id, runtime_id, workflow_id,
+                            workflow_version, instance_id
+                        ) DO UPDATE SET
+                            quarantined = TRUE,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE
+                            prometa_runtime_workflow_instance.state =
+                                EXCLUDED.state
+                            AND
+                            prometa_runtime_workflow_instance.state_version =
+                                EXCLUDED.state_version
+                            AND
+                            prometa_runtime_workflow_instance.ontology_digest =
+                                EXCLUDED.ontology_digest
+                            AND
+                            prometa_runtime_workflow_instance.policy_digest =
+                                EXCLUDED.policy_digest
+                            AND
+                            prometa_runtime_workflow_instance.sector_snapshot_digest =
+                                EXCLUDED.sector_snapshot_digest
+                        RETURNING state_version
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            workflow_id,
+                            workflow_version,
+                            instance_id,
+                            state,
+                            request.state_version,
+                            ontology_digest,
+                            policy_digest,
+                            sector_digest,
+                        ),
+                    )
+                    if cursor.fetchone() is None:
+                        raise RuntimePersistenceError("workflow_state_conflict")
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_workflow_ledger (
+                            tenant_id, runtime_id, event_id, request_id,
+                            workflow_id, workflow_version, instance_id,
+                            prior_state, next_state, state_version,
+                            transition_id, outcome, reason_code,
+                            ontology_digest, policy_digest,
+                            sector_snapshot_digest, approval_references,
+                            evidence_references, idempotency_key_digest
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, NULL, %s, %s, 'indeterminate', %s,
+                            %s, %s, %s, '[]'::jsonb, '[]'::jsonb, NULL
+                        )
+                        ON CONFLICT (tenant_id, runtime_id, event_id)
+                        DO NOTHING
+                        """,
+                        (
+                            self.tenant_id,
+                            self.runtime_id,
+                            event_id,
+                            request_id,
+                            workflow_id,
+                            workflow_version,
+                            instance_id,
+                            state,
+                            request.state_version,
+                            transition_id,
+                            reason_code,
+                            ontology_digest,
+                            policy_digest,
+                            sector_digest,
+                        ),
+                    )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError("workflow_state_store_unavailable") from None
 
 
 class PostgresRuntimeStateStore(_PostgresTenantStore):
@@ -3160,8 +3924,10 @@ __all__ = [
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
     "PostgresSecurityDecisionOutbox",
+    "PostgresWorkflowDecisionOutbox",
     "PostgresRuntimeReleaseCache",
     "PostgresRuntimeTaskStore",
+    "PostgresWorkflowStateStore",
     "PostgresRuntimeStateStore",
     "main",
     "compatibility_main",

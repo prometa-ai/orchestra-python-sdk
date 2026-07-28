@@ -32,6 +32,8 @@ from prometa.runtime import (
     PostgresSecurityDecisionOutbox,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
+    PostgresWorkflowDecisionOutbox,
+    PostgresWorkflowStateStore,
     RuntimeReleaseHandoff,
     RuntimePersistenceError,
     RuntimeExecutionError,
@@ -39,6 +41,11 @@ from prometa.runtime import (
     RuntimeTaskError,
     RuntimeTool,
     ToolInvocationRequest,
+    WorkflowExecutionContext,
+    WorkflowIndeterminateRequest,
+    WorkflowStateCommitRequest,
+    workflow_decision_from_evidence,
+    WorkflowDecisionEvidence,
     SecurityGuardAssessment,
     SecuritySignal,
     build_security_decision,
@@ -174,6 +181,35 @@ def _security_decision(*, decision_id=None):
     if decision_id is not None:
         decision["decisionId"] = decision_id
     return decision
+
+
+def _workflow_decision():
+    return workflow_decision_from_evidence(
+        WorkflowDecisionEvidence(
+            request_id="request-workflow-postgres",
+            workflow_id="workflow-postgres",
+            workflow_version=1,
+            workflow_instance_id="instance-postgres",
+            ontology_digest="sha256:" + "a" * 64,
+            policy_digest="sha256:" + "b" * 64,
+            sector_snapshot_digest="sha256:" + "c" * 64,
+            state="received",
+            state_version=0,
+            task_id="extract",
+            transition_id="extract-transition",
+            recommended_outcome="allow",
+            applied_outcome="allow",
+            reason_codes=("valid",),
+            control_ids=(),
+            obligation_ids=(),
+            fact_set_digest="sha256:" + "d" * 64,
+            missing_fact_ids=(),
+            stale_fact_ids=(),
+            approval_references=(),
+            evidence_references=(),
+            occurred_at="2026-07-28T10:00:00.000Z",
+        )
+    )
 
 
 class _StaticCursor:
@@ -333,6 +369,16 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert caught.value.code == "security_decision_outbox_unavailable"
     assert "password" not in str(caught.value)
 
+    workflow_outbox = PostgresWorkflowDecisionOutbox(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        connect=_unavailable,
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        workflow_outbox.enqueue(_workflow_decision())
+    assert caught.value.code == "workflow_decision_outbox_unavailable"
+    assert "password" not in str(caught.value)
+
     cache = PostgresRuntimeReleaseCache(
         "postgresql://secret:password@db.example/runtime",
         tenant_id="tenant-1",
@@ -412,12 +458,12 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert caught.value.code == "runtime_schema_uninitialized"
 
     with pytest.raises(RuntimePersistenceError) as caught:
-            check_postgres_runtime_compatibility(
-                "postgresql://unused",
-                connect=lambda dsn: _CompatibilityConnection(
-                    (1, 2, 3, 4, 5, 6, 7),
-                    ("prometa_runtime_schema_migrations",),
-                ),
+        check_postgres_runtime_compatibility(
+            "postgresql://unused",
+            connect=lambda dsn: _CompatibilityConnection(
+                tuple(range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)),
+                ("prometa_runtime_schema_migrations",),
+            ),
         )
     assert caught.value.code == "runtime_schema_incompatible"
 
@@ -433,6 +479,65 @@ def test_state_validation_is_finite_and_bounded() -> None:
         asyncio.run(state.save("request-1", {"score": float("nan")}))
     with pytest.raises(ValueError, match="1 MiB"):
         asyncio.run(state.save("request-1", {"payload": "x" * 1_048_576}))
+
+
+def test_workflow_state_store_validates_before_connecting() -> None:
+    store = PostgresWorkflowStateStore(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        runtime_id="runtime-1",
+        connect=_unavailable,
+    )
+    workflow = WorkflowExecutionContext(
+        ontology_id="workflow-1",
+        version=1,
+        instance_id="instance-1",
+        actor_ref="actor-opaque",
+    )
+    commit = WorkflowStateCommitRequest(
+        request_id="request-1",
+        workflow=workflow,
+        expected_state="received",
+        expected_version=0,
+        next_state="extracted",
+        transition_id="extract",
+        ontology_digest="sha256:" + "a" * 64,
+        policy_digest="sha256:" + "b" * 64,
+        sector_snapshot_digest="sha256:" + "c" * 64,
+        approval_references=(),
+        evidence_references=("document-ref-1",),
+        idempotency_key="opaque-idempotency-key",
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        asyncio.run(store.compare_and_set(commit))
+    assert caught.value.code == "workflow_state_store_unavailable"
+    assert "password" not in str(caught.value)
+
+    with pytest.raises(ValueError, match="workflow digests"):
+        asyncio.run(
+            store.compare_and_set(
+                WorkflowStateCommitRequest(
+                    **{**commit.__dict__, "policy_digest": "not-a-digest"}
+                )
+            )
+        )
+    with pytest.raises(ValueError, match="reason_code"):
+        asyncio.run(
+            store.mark_indeterminate(
+                WorkflowIndeterminateRequest(
+                    request_id="request-1",
+                    workflow=workflow,
+                    state="received",
+                    state_version=0,
+                    task_id="extract-invoice",
+                    transition_id="extract",
+                    reason_code="Not Machine Readable",
+                    ontology_digest="sha256:" + "a" * 64,
+                    policy_digest="sha256:" + "b" * 64,
+                    sector_snapshot_digest="sha256:" + "c" * 64,
+                )
+            )
+        )
 
 
 def test_malformed_state_rows_fail_with_a_stable_code() -> None:
@@ -683,12 +788,8 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
     first_outbox.mark_dead_letter(dead_letter_lease, error_code="http_403")
     assert second_outbox.claim_next(30) is None
 
-    first_security_outbox = PostgresSecurityDecisionOutbox(
-        dsn, tenant_id=tenant_id
-    )
-    second_security_outbox = PostgresSecurityDecisionOutbox(
-        dsn, tenant_id=tenant_id
-    )
+    first_security_outbox = PostgresSecurityDecisionOutbox(dsn, tenant_id=tenant_id)
+    second_security_outbox = PostgresSecurityDecisionOutbox(dsn, tenant_id=tenant_id)
     decision_one = _security_decision(decision_id="decision-postgres-1")
     decision_two = _security_decision(decision_id="decision-postgres-2")
     assert first_security_outbox.enqueue(decision_one) is True
@@ -714,6 +815,29 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
     assert caught.value.code == "security_decision_outbox_lease_lost"
     second_security_outbox.mark_delivered(security_retry)
     assert first_security_outbox.claim_batch(30) is None
+
+    first_workflow_outbox = PostgresWorkflowDecisionOutbox(dsn, tenant_id=tenant_id)
+    second_workflow_outbox = PostgresWorkflowDecisionOutbox(dsn, tenant_id=tenant_id)
+    workflow_decision = _workflow_decision()
+    assert first_workflow_outbox.enqueue(workflow_decision) is True
+    assert second_workflow_outbox.enqueue(workflow_decision) is False
+    workflow_lease = first_workflow_outbox.claim_batch(30)
+    assert workflow_lease is not None
+    assert workflow_lease.decision_ids == (workflow_decision["decisionId"],)
+    assert second_workflow_outbox.claim_batch(30) is None
+    first_workflow_outbox.reschedule(
+        workflow_lease,
+        delay_seconds=0,
+        error_code="transport",
+    )
+    workflow_retry = second_workflow_outbox.claim_batch(30)
+    assert workflow_retry is not None
+    assert workflow_retry.attempts == 2
+    with pytest.raises(RuntimePersistenceError) as caught:
+        first_workflow_outbox.mark_delivered(workflow_lease)
+    assert caught.value.code == "workflow_decision_outbox_lease_lost"
+    second_workflow_outbox.mark_delivered(workflow_retry)
+    assert first_workflow_outbox.claim_batch(30) is None
 
     with pytest.raises(RuntimePersistenceError) as caught:
         activations.activate_or_join(
@@ -814,9 +938,7 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
             self.release = asyncio.Event()
             self.calls = 0
 
-        async def call_tool(
-            self, server, operation, arguments, credentials, metadata
-        ):
+        async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.calls += 1
             self.started.set()
             await self.release.wait()
@@ -898,9 +1020,7 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
 
         class UncertainTransport:
             async def call_tool(self, *args, **kwargs):
-                raise McpTransportError(
-                    "mcp_transport_failed", outcome_unknown=True
-                )
+                raise McpTransportError("mcp_transport_failed", outcome_unknown=True)
 
         uncertain = broker(tenant_id, UncertainTransport())
         with pytest.raises(RuntimeExecutionError) as caught:
@@ -1118,6 +1238,132 @@ def test_postgres_task_leases_recover_and_replay_ordered_history() -> None:
     not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
     reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
 )
+def test_postgres_workflow_state_cas_allows_one_replica_and_quarantines() -> None:
+    import psycopg
+
+    dsn = os.environ["PROMETA_RUNTIME_TEST_POSTGRES_DSN"]
+    install_postgres_runtime_schema(dsn)
+    tenant_id = "workflow-cas-%s" % uuid.uuid4().hex
+    runtime_id = "runtime-workflow"
+    workflow = WorkflowExecutionContext(
+        ontology_id="invoice-to-sap",
+        version=1,
+        instance_id="invoice-instance",
+        actor_ref="opaque-actor",
+    )
+    stores = (
+        PostgresWorkflowStateStore(
+            dsn,
+            tenant_id=tenant_id,
+            runtime_id=runtime_id,
+        ),
+        PostgresWorkflowStateStore(
+            dsn,
+            tenant_id=tenant_id,
+            runtime_id=runtime_id,
+        ),
+    )
+
+    def commit(index: int) -> bool:
+        return asyncio.run(
+            stores[index].compare_and_set(
+                WorkflowStateCommitRequest(
+                    request_id="request-%d" % index,
+                    workflow=workflow,
+                    expected_state="received",
+                    expected_version=0,
+                    next_state="extracted-%d" % index,
+                    transition_id="extract-%d" % index,
+                    ontology_digest="sha256:" + "a" * 64,
+                    policy_digest="sha256:" + "b" * 64,
+                    sector_snapshot_digest="sha256:" + "c" * 64,
+                    approval_references=("approval-ref",),
+                    evidence_references=("evidence-ref",),
+                    idempotency_key="private-idempotency-key",
+                )
+            )
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(commit, range(2)))
+        assert sorted(results) == [False, True]
+        winner = results.index(True)
+        winner_state = "extracted-%d" % winner
+
+        asyncio.run(
+            stores[winner].mark_indeterminate(
+                WorkflowIndeterminateRequest(
+                    request_id="request-indeterminate",
+                    workflow=workflow,
+                    state=winner_state,
+                    state_version=1,
+                    task_id="post-to-sap",
+                    transition_id="post",
+                    reason_code="tool_outcome_unknown",
+                    ontology_digest="sha256:" + "a" * 64,
+                    policy_digest="sha256:" + "b" * 64,
+                    sector_snapshot_digest="sha256:" + "c" * 64,
+                )
+            )
+        )
+
+        with psycopg.connect(dsn) as connection:
+            instance = connection.execute(
+                """
+                SELECT state, state_version, quarantined
+                FROM prometa_runtime_workflow_instance
+                WHERE tenant_id = %s AND runtime_id = %s
+                  AND workflow_id = %s AND workflow_version = %s
+                  AND instance_id = %s
+                """,
+                (
+                    tenant_id,
+                    runtime_id,
+                    workflow.ontology_id,
+                    workflow.version,
+                    workflow.instance_id,
+                ),
+            ).fetchone()
+            ledger = connection.execute(
+                """
+                SELECT outcome, idempotency_key_digest
+                FROM prometa_runtime_workflow_ledger
+                WHERE tenant_id = %s AND runtime_id = %s
+                ORDER BY created_at, event_id
+                """,
+                (tenant_id, runtime_id),
+            ).fetchall()
+        assert instance == (winner_state, 1, True)
+        assert sorted(row[0] for row in ledger) == [
+            "committed",
+            "indeterminate",
+        ]
+        committed_digest = next(row[1] for row in ledger if row[0] == "committed")
+        assert committed_digest is not None
+        assert "private-idempotency-key" not in repr(ledger)
+    finally:
+        with psycopg.connect(dsn) as connection:
+            connection.execute(
+                """
+                DELETE FROM prometa_runtime_workflow_ledger
+                WHERE tenant_id = %s AND runtime_id = %s
+                """,
+                (tenant_id, runtime_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM prometa_runtime_workflow_instance
+                WHERE tenant_id = %s AND runtime_id = %s
+                """,
+                (tenant_id, runtime_id),
+            )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PROMETA_RUNTIME_TEST_POSTGRES_DSN"),
+    reason="PROMETA_RUNTIME_TEST_POSTGRES_DSN is not configured",
+)
 def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
     monkeypatch, capsys
 ) -> None:
@@ -1155,7 +1401,9 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
     try:
         report = verify_postgres_runtime_integrity(dsn)
         assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-        assert report.migration_versions == (1, 2, 3, 4, 5, 6, 7)
+        assert report.migration_versions == tuple(
+            range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)
+        )
         assert report.table_counts["prometa_runtime_task"] >= 1
         assert report.table_counts["prometa_runtime_task_event"] >= 2
         assert "private input" not in repr(report)
@@ -1165,7 +1413,7 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
         assert postgres_verify_main(["--dsn-env", "RUNTIME_VERIFY_DSN"]) == 0
         output = json.loads(capsys.readouterr().out)
         assert output["integrity"] == "verified"
-        assert output["schemaVersion"] == 7
+        assert output["schemaVersion"] == RUNTIME_POSTGRES_SCHEMA_VERSION
         assert "private" not in repr(output)
 
         with psycopg.connect(dsn) as connection:
@@ -1204,7 +1452,9 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     install_postgres_runtime_schema(dsn)
     report = check_postgres_runtime_compatibility(dsn)
     assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-    assert report.migration_versions == (1, 2, 3, 4, 5, 6, 7)
+    assert report.migration_versions == tuple(
+        range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)
+    )
     assert report.minimum_schema_version == RUNTIME_POSTGRES_MIN_SCHEMA_VERSION
     assert report.maximum_schema_version == RUNTIME_POSTGRES_MAX_SCHEMA_VERSION
     assert report.as_dict()["compatibilityVersion"] == (
@@ -1212,20 +1462,15 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     )
 
     monkeypatch.setenv("RUNTIME_COMPATIBILITY_DSN", dsn)
-    assert (
-        postgres_compatibility_main(
-            ["--dsn-env", "RUNTIME_COMPATIBILITY_DSN"]
-        )
-        == 0
-    )
+    assert postgres_compatibility_main(["--dsn-env", "RUNTIME_COMPATIBILITY_DSN"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output == {
         "compatibility": "compatible",
         "compatibilityVersion": 1,
-        "maximumSchemaVersion": 7,
-        "migrationVersions": [1, 2, 3, 4, 5, 6, 7],
-        "minimumSchemaVersion": 7,
-        "schemaVersion": 7,
+        "maximumSchemaVersion": RUNTIME_POSTGRES_MAX_SCHEMA_VERSION,
+        "migrationVersions": list(range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)),
+        "minimumSchemaVersion": RUNTIME_POSTGRES_MIN_SCHEMA_VERSION,
+        "schemaVersion": RUNTIME_POSTGRES_SCHEMA_VERSION,
     }
 
     def expect_code(code: str) -> None:

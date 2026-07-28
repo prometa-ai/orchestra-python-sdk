@@ -226,9 +226,7 @@ class RuntimeControlPlaneClient:
             raise RuntimeControlPlaneError(
                 _http_error_code(exc),
                 status=status,
-                retryable=(
-                    status in _RETRYABLE_HTTP_STATUSES or status >= 500
-                ),
+                retryable=(status in _RETRYABLE_HTTP_STATUSES or status >= 500),
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise RuntimeControlPlaneError(
@@ -246,9 +244,7 @@ class RuntimeControlPlaneClient:
         artifact_id = _identifier("artifact_id", document.get("artifactId"))
         artifact_digest = document.get("artifactDigest")
         release_id = _identifier("release_id", document.get("releaseId"))
-        deployment_id = _identifier(
-            "deployment_id", document.get("deploymentId")
-        )
+        deployment_id = _identifier("deployment_id", document.get("deploymentId"))
         target_environment = _identifier(
             "target_environment", document.get("targetEnvironment")
         )
@@ -266,7 +262,10 @@ class RuntimeControlPlaneClient:
             (expected_environment, target_environment),
             (expected_runtime, runtime_target),
         )
-        if any(expected is not None and expected != actual for expected, actual in expected_bindings):
+        if any(
+            expected is not None and expected != actual
+            for expected, actual in expected_bindings
+        ):
             raise RuntimeControlPlaneError("control_plane_binding_mismatch")
 
         bundle = document.get("bundle")

@@ -9,6 +9,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Runtime contract v3 admission and local Company Workflow Ontology
+  enforcement, while retaining v1/v2 compatibility. The runtime verifies exact
+  ontology, compiled-policy, sector-snapshot and bundle digest bindings before
+  activation.
+- A deterministic closed-AST workflow policy evaluator with cross-language
+  golden vectors, tenant-owned verified context/fact resolution, pre-tool
+  authorization, postcondition validation and compare-and-set state
+  transitions. Observe mode records recommendations without blocking;
+  enforcement fails closed on indeterminate state.
+- PostgreSQL schema v8 with an append-only workflow-instance ledger and durable,
+  payload-free workflow-decision outbox. Side-effect uncertainty is quarantined
+  as `INDETERMINATE` and is never automatically replayed.
+- Strict `prometa.workflow-decision.v1` batch emission and a reference
+  dispatcher that rejects raw prompts, arguments, results, messages, business
+  facts, unknown fields and mutable decision identifiers.
+- Optional `workflowContext` on `POST /v1/runtime/execute`, limited to immutable
+  workflow/version/instance identity and an opaque actor reference. Caller
+  roles and authorization facts remain forbidden.
+
 - A source-only, non-certifying OpenShift SNO engineering-trial chart overlay
   for `orchestra-ocp-sno-trial-amd64-v1`. It pins the single-replica runtime
   resource envelope, immutable UBI image admission, Secret-backed release and

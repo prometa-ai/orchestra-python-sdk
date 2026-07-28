@@ -553,7 +553,9 @@ def test_source_baseline_upgrade_and_fresh_prior_bundle_rollback(tmp_path) -> No
             if index == 1:
                 install_postgres_runtime_schema(dsn)
                 report = check_postgres_runtime_compatibility(dsn)
-                assert report.migration_versions == (1, 2, 3, 4, 5, 6, 7)
+                assert report.migration_versions == tuple(
+                    range(1, RUNTIME_POSTGRES_SCHEMA_VERSION + 1)
+                )
             attestation = _attestation(
                 bundle,
                 label=label,

@@ -32,10 +32,15 @@ from .trust import (
     verify_bundle_envelope,
     verify_promotion_attestation,
 )
+from .workflow_ontology import (
+    RuntimeWorkflowOntology,
+    WorkflowOntologyError,
+    parse_workflow_ontology_artifact,
+)
 
 
-RUNTIME_CONTRACT_VERSION = 2
-SUPPORTED_RUNTIME_CONTRACT_VERSIONS = frozenset({1, RUNTIME_CONTRACT_VERSION})
+RUNTIME_CONTRACT_VERSION = 3
+SUPPORTED_RUNTIME_CONTRACT_VERSIONS = frozenset({1, 2, RUNTIME_CONTRACT_VERSION})
 CAPABILITY_MODEL_INVOKE = "model.invoke.v1"
 CAPABILITY_EVIDENCE_EMIT = "evidence.emit.v1"
 CAPABILITY_SCHEMA_VALIDATE = "schema.validate.v1"
@@ -43,6 +48,10 @@ CAPABILITY_GUARD_EVALUATE = "guard.evaluate.v1"
 CAPABILITY_SECURITY_DECISION_EMIT = "security.decision.emit.v1"
 CAPABILITY_TOOL_BROKER = "tool.broker.v1"
 CAPABILITY_HUMAN_ESCALATION = "human.escalation.v1"
+CAPABILITY_WORKFLOW_POLICY_EVALUATE = "workflow.policy.evaluate.v1"
+CAPABILITY_WORKFLOW_CONTEXT_RESOLVE = "workflow.context.resolve.v1"
+CAPABILITY_WORKFLOW_STATE_PERSIST = "workflow.state.persist.v1"
+CAPABILITY_WORKFLOW_DECISION_EMIT = "workflow.decision.emit.v1"
 BASE_RUNTIME_CAPABILITIES = frozenset(
     {CAPABILITY_MODEL_INVOKE, CAPABILITY_EVIDENCE_EMIT}
 )
@@ -55,6 +64,10 @@ KNOWN_RUNTIME_CAPABILITIES = frozenset(
         CAPABILITY_SECURITY_DECISION_EMIT,
         CAPABILITY_TOOL_BROKER,
         CAPABILITY_HUMAN_ESCALATION,
+        CAPABILITY_WORKFLOW_POLICY_EVALUATE,
+        CAPABILITY_WORKFLOW_CONTEXT_RESOLVE,
+        CAPABILITY_WORKFLOW_STATE_PERSIST,
+        CAPABILITY_WORKFLOW_DECISION_EMIT,
     }
 )
 
@@ -150,6 +163,7 @@ class RuntimeBundleConfig:
     mcp_servers: Tuple[str, ...] = ()
     required_scopes: Tuple[str, ...] = ()
     granted_scopes: Tuple[str, ...] = ()
+    workflow_ontologies: Tuple[RuntimeWorkflowOntology, ...] = ()
 
     @property
     def max_iterations(self) -> int:
@@ -269,9 +283,7 @@ class InMemoryRuntimeActivationStore:
                 existing_identity, activated_at = existing
                 if existing_identity != identity:
                     raise BundleVerificationError("runtime_activation_conflict")
-                return RuntimeActivationResult(
-                    created=False, activated_at=activated_at
-                )
+                return RuntimeActivationResult(created=False, activated_at=activated_at)
             known_digest = self._bundle_jtis.get(bundle_jti)
             if known_digest is not None and known_digest != artifact_digest:
                 raise BundleVerificationError("runtime_activation_conflict")
@@ -487,6 +499,7 @@ def _verify_runtime_contract_digests(
     contract: Mapping[str, Any],
     input_schema: Optional[Mapping[str, Any]],
     output_schema: Optional[Mapping[str, Any]],
+    contract_version: int,
 ) -> Tuple[str, str]:
     policy_digest = contract.get("policyDigest")
     configuration_digest = contract.get("configurationDigest")
@@ -499,43 +512,43 @@ def _verify_runtime_contract_digests(
         raise BundleVerificationError("invalid_runtime_contract_digest")
 
     raw_tools = _sequence(content.get("tools", []), "invalid_runtime_tools", 128)
-    tool_mappings = [
-        _mapping(tool, "invalid_runtime_tool") for tool in raw_tools
-    ]
-    expected_policy = _canonical_digest(
-        {
-            "guardrails": content.get("guardrails", []),
-            "identity": content.get("identity"),
-            "tools": [_selected(tool, _TOOL_POLICY_KEYS) for tool in tool_mappings],
-            "requiredScopes": content.get("requiredScopes", []),
-            "grantedScopes": content.get("grantedScopes", []),
-        }
-    )
+    tool_mappings = [_mapping(tool, "invalid_runtime_tool") for tool in raw_tools]
+    policy_projection = {
+        "guardrails": content.get("guardrails", []),
+        "identity": content.get("identity"),
+        "tools": [_selected(tool, _TOOL_POLICY_KEYS) for tool in tool_mappings],
+        "requiredScopes": content.get("requiredScopes", []),
+        "grantedScopes": content.get("grantedScopes", []),
+    }
+    if contract_version >= 3:
+        policy_projection["workflowOntologies"] = content.get("workflowOntologies", [])
+    expected_policy = _canonical_digest(policy_projection)
     if policy_digest != expected_policy:
         raise BundleVerificationError("runtime_policy_digest_mismatch")
 
-    expected_configuration = _canonical_digest(
-        {
-            "manifest": content.get("manifest"),
-            "systemPrompt": content.get("systemPrompt"),
-            "models": content.get("models"),
-            "primaryModel": content.get("primaryModel"),
-            "topology": content.get("topology"),
-            "tools": [
-                _selected(tool, _TOOL_CONFIGURATION_KEYS) for tool in tool_mappings
-            ],
-            "skills": content.get("skills", []),
-            "knowledge": content.get("knowledge", []),
-            "memory": content.get("memory", []),
-            "subAgents": content.get("subAgents", []),
-            "workflows": content.get("workflows", []),
-            "triggers": content.get("triggers", []),
-            "evaluation": content.get("evaluation", []),
-            "inputSchema": input_schema,
-            "outputSchema": output_schema,
-            "mcpServers": content.get("mcpServers", []),
-        }
-    )
+    configuration_projection = {
+        "manifest": content.get("manifest"),
+        "systemPrompt": content.get("systemPrompt"),
+        "models": content.get("models"),
+        "primaryModel": content.get("primaryModel"),
+        "topology": content.get("topology"),
+        "tools": [_selected(tool, _TOOL_CONFIGURATION_KEYS) for tool in tool_mappings],
+        "skills": content.get("skills", []),
+        "knowledge": content.get("knowledge", []),
+        "memory": content.get("memory", []),
+        "subAgents": content.get("subAgents", []),
+        "workflows": content.get("workflows", []),
+        "triggers": content.get("triggers", []),
+        "evaluation": content.get("evaluation", []),
+        "inputSchema": input_schema,
+        "outputSchema": output_schema,
+        "mcpServers": content.get("mcpServers", []),
+    }
+    if contract_version >= 3:
+        configuration_projection["workflowOntologies"] = content.get(
+            "workflowOntologies", []
+        )
+    expected_configuration = _canonical_digest(configuration_projection)
     if configuration_digest != expected_configuration:
         raise BundleVerificationError("runtime_configuration_digest_mismatch")
     return policy_digest, configuration_digest
@@ -751,6 +764,71 @@ def parse_runtime_bundle(
             content.get("guardrails", []), "invalid_runtime_guardrails", 128
         )
     )
+    try:
+        workflow_ontologies = tuple(
+            parse_workflow_ontology_artifact(value)
+            for value in _sequence(
+                content.get("workflowOntologies", []),
+                "invalid_workflow_ontologies",
+                64,
+            )
+        )
+    except WorkflowOntologyError as exc:
+        raise BundleVerificationError(exc.code) from exc
+    workflow_identities = {
+        (workflow.ontology_id, workflow.version) for workflow in workflow_ontologies
+    }
+    if len(workflow_identities) != len(workflow_ontologies):
+        raise BundleVerificationError("ambiguous_workflow_ontology")
+    workflow_bindings = []
+    for value in _sequence(
+        content.get("workflows", []),
+        "invalid_runtime_workflows",
+        128,
+    ):
+        workflow = _mapping(value, "invalid_runtime_workflow")
+        config = _mapping(workflow.get("config"), "invalid_runtime_workflow")
+        if config.get("workflowType") != "company-process":
+            continue
+        if set(workflow) != {"name", "config"} or set(config) != {
+            "workflowType",
+            "ontologyId",
+            "ontologyVersion",
+            "ontologyDigest",
+            "mode",
+        }:
+            raise BundleVerificationError("invalid_company_workflow_binding")
+        version = config.get("ontologyVersion")
+        mode = config.get("mode")
+        if (
+            type(version) is not int
+            or version < 1
+            or mode not in {"observe", "enforce"}
+        ):
+            raise BundleVerificationError("invalid_company_workflow_binding")
+        workflow_bindings.append(
+            (
+                _string(config, "ontologyId", "invalid_company_workflow_binding"),
+                version,
+                _string(
+                    config,
+                    "ontologyDigest",
+                    "invalid_company_workflow_binding",
+                ),
+                mode,
+            )
+        )
+    if len(set(workflow_bindings)) != len(workflow_bindings):
+        raise BundleVerificationError("ambiguous_company_workflow_binding")
+    artifact_bindings = {
+        (
+            workflow.ontology_id,
+            workflow.version,
+            workflow.ontology_digest,
+            workflow.mode,
+        )
+        for workflow in workflow_ontologies
+    }
     tool_identifiers = {}
     for index, tool in enumerate(tools):
         for identifier in {tool.name, tool.operation}:
@@ -781,6 +859,8 @@ def parse_runtime_bundle(
 
     raw_contract = content.get("runtimeContract")
     if raw_contract is None:
+        if workflow_bindings or workflow_ontologies or "workflowOntologies" in content:
+            raise BundleVerificationError("workflow_ontology_requires_runtime_v3")
         if require_runtime_contract:
             raise BundleVerificationError("runtime_contract_missing")
         legacy_required = set(BASE_RUNTIME_CAPABILITIES)
@@ -808,6 +888,14 @@ def parse_runtime_bundle(
         contract_version = contract_value.get("contractVersion")
         if contract_version not in SUPPORTED_RUNTIME_CONTRACT_VERSIONS:
             raise BundleVerificationError("unsupported_runtime_contract")
+        if contract_version < 3 and (
+            workflow_bindings or workflow_ontologies or "workflowOntologies" in content
+        ):
+            raise BundleVerificationError("workflow_ontology_requires_runtime_v3")
+        if contract_version == 3 and not workflow_ontologies:
+            raise BundleVerificationError("runtime_v3_workflow_ontology_missing")
+        if set(workflow_bindings) != artifact_bindings:
+            raise BundleVerificationError("company_workflow_binding_mismatch")
         requirements = _string_tuple(
             contract_value.get("requiredCapabilities"),
             "invalid_runtime_capabilities",
@@ -837,13 +925,22 @@ def parse_runtime_bundle(
             for guardrail in guardrails
         ):
             inferred.add(CAPABILITY_HUMAN_ESCALATION)
+        if workflow_ontologies:
+            inferred.update(
+                {
+                    CAPABILITY_WORKFLOW_POLICY_EVALUATE,
+                    CAPABILITY_WORKFLOW_CONTEXT_RESOLVE,
+                    CAPABILITY_WORKFLOW_STATE_PERSIST,
+                    CAPABILITY_WORKFLOW_DECISION_EMIT,
+                }
+            )
         if not inferred.issubset(required):
             raise BundleVerificationError("runtime_capability_downgrade")
         capability_requirements = ()
         policy_digest = None
         configuration_digest = None
         secret_references = ()
-        if contract_version == RUNTIME_CONTRACT_VERSION:
+        if contract_version >= 2:
             capability_requirements = _parse_capability_requirements(
                 contract_value.get("capabilityRequirements"), required
             )
@@ -855,6 +952,7 @@ def parse_runtime_bundle(
                 contract_value,
                 input_schema,
                 output_schema,
+                contract_version,
             )
         contract = RuntimeContract(
             contract_version=contract_version,
@@ -877,12 +975,12 @@ def parse_runtime_bundle(
     if unknown_supported:
         raise BundleVerificationError("unknown_local_runtime_capability")
     missing = contract.required_capabilities - supported
-    if contract.contract_version < RUNTIME_CONTRACT_VERSION and missing:
+    if contract.contract_version == 1 and missing:
         raise BundleVerificationError(
             "unsupported_runtime_capability",
             "Unsupported runtime capabilities: %s" % ", ".join(sorted(missing)),
         )
-    if contract.contract_version == RUNTIME_CONTRACT_VERSION:
+    if contract.contract_version >= 2:
         supported_versions = {}
         for capability in supported:
             name, version = _capability_parts(capability)
@@ -914,6 +1012,7 @@ def parse_runtime_bundle(
         granted_scopes=granted_scopes,
         guardrails=guardrails,
         contract=contract,
+        workflow_ontologies=workflow_ontologies,
     )
 
 
@@ -1096,6 +1195,10 @@ __all__ = [
     "CAPABILITY_SECURITY_DECISION_EMIT",
     "CAPABILITY_TOOL_BROKER",
     "CAPABILITY_HUMAN_ESCALATION",
+    "CAPABILITY_WORKFLOW_POLICY_EVALUATE",
+    "CAPABILITY_WORKFLOW_CONTEXT_RESOLVE",
+    "CAPABILITY_WORKFLOW_STATE_PERSIST",
+    "CAPABILITY_WORKFLOW_DECISION_EMIT",
     "BASE_RUNTIME_CAPABILITIES",
     "KNOWN_RUNTIME_CAPABILITIES",
     "RuntimeManifest",

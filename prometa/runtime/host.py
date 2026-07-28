@@ -74,6 +74,8 @@ from .postgres import (
     PostgresSecurityDecisionOutbox,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
+    PostgresWorkflowDecisionOutbox,
+    PostgresWorkflowStateStore,
     RuntimePersistenceError,
     check_postgres_runtime_compatibility,
 )
@@ -97,6 +99,20 @@ from .tasks import (
     canonical_payload_digest,
 )
 from .trust import BundleTrustEntry, BundleTrustStore, BundleVerificationError
+from .workflow_ontology import (
+    WorkflowContextResolver,
+    WorkflowDecisionEmitter,
+    WorkflowExecutionContext,
+    WorkflowOntologyError,
+    WorkflowPostconditionValidator,
+    WorkflowStateStore,
+    parse_workflow_execution_context,
+)
+from .workflow_decisions import (
+    DurableWorkflowDecisionEmitter,
+    WorkflowDecisionClient,
+    WorkflowDecisionDispatcher,
+)
 
 
 HOST_CONFIG_VERSION = 1
@@ -188,6 +204,13 @@ class RuntimeHostConfig:
     security_decision_lease_seconds: float = 30.0
     security_decision_initial_backoff_seconds: float = 1.0
     security_decision_max_backoff_seconds: float = 300.0
+    workflow_decision_base_url: Optional[str] = None
+    workflow_decision_api_key_env: Optional[str] = None
+    workflow_decision_timeout_seconds: float = 5.0
+    workflow_decision_poll_interval_seconds: float = 2.0
+    workflow_decision_lease_seconds: float = 30.0
+    workflow_decision_initial_backoff_seconds: float = 1.0
+    workflow_decision_max_backoff_seconds: float = 300.0
     task_recovery_enabled: bool = False
     task_recovery_lease_seconds: float = 90.0
     task_recovery_max_attempts: int = 3
@@ -296,9 +319,7 @@ def _boolean(name: str, value: Any) -> bool:
     return value
 
 
-def _service_base_url(
-    name: str, value: Any, allow_insecure_http: bool
-) -> str:
+def _service_base_url(name: str, value: Any, allow_insecure_http: bool) -> str:
     candidate = _bounded_string("%s_base_url" % name, value, 2048)
     parsed = urllib.parse.urlsplit(candidate)
     if (
@@ -332,9 +353,7 @@ def _string_tuple_value(
 ) -> Tuple[str, ...]:
     if not isinstance(value, list) or len(value) > maximum_items:
         raise RuntimeHostError("invalid_%s" % name)
-    result = tuple(
-        _bounded_string(name, child, maximum_length) for child in value
-    )
+    result = tuple(_bounded_string(name, child, maximum_length) for child in value)
     if len(set(result)) != len(result):
         raise RuntimeHostError("invalid_%s" % name)
     return result
@@ -428,9 +447,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
                     environment=_identifier(
                         "mcp_server_environment", item["environment"], 64
                     ),
-                    auth_mode=_identifier(
-                        "mcp_server_auth_mode", item["authMode"], 64
-                    ),
+                    auth_mode=_identifier("mcp_server_auth_mode", item["authMode"], 64),
                     scopes=_string_tuple_value(
                         "mcp_server_scopes", item["scopes"], maximum_length=256
                     ),
@@ -461,9 +478,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
                         if item.get("workingDirectory") is not None
                         else None
                     ),
-                    enabled=_boolean(
-                        "mcp_server_enabled", item.get("enabled", True)
-                    ),
+                    enabled=_boolean("mcp_server_enabled", item.get("enabled", True)),
                     allow_insecure_http=_boolean(
                         "mcp_server_allow_insecure_http",
                         item.get("allowInsecureHttp", False),
@@ -506,9 +521,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
         )
         try:
             grant = McpToolGrant(
-                tool_name=_bounded_string(
-                    "mcp_grant_tool_name", item["toolName"], 200
-                ),
+                tool_name=_bounded_string("mcp_grant_tool_name", item["toolName"], 200),
                 agent_ids=_string_tuple_value(
                     "mcp_grant_agent_ids",
                     item.get("agentIds", []),
@@ -635,9 +648,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
                 server_name=_bounded_string(
                     "mcp_credential_server_name", item["serverName"], 120
                 ),
-                auth_mode=_identifier(
-                    "mcp_credential_auth_mode", item["authMode"], 64
-                ),
+                auth_mode=_identifier("mcp_credential_auth_mode", item["authMode"], 64),
                 http_headers=dict(http_headers),
                 stdio_environment=dict(stdio_environment),
             )
@@ -673,9 +684,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
         raise RuntimeHostError("mcp_tool_timeout_too_short")
     reservation_timeout_seconds = _positive_number(
         "mcp_reservation_timeout_seconds",
-        document.get(
-            "reservationTimeoutSeconds", max(300, tool_timeout_seconds + 30)
-        ),
+        document.get("reservationTimeoutSeconds", max(300, tool_timeout_seconds + 30)),
         86_400,
     )
     if reservation_timeout_seconds <= tool_timeout_seconds:
@@ -729,6 +738,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "controlPlanePull",
             "receiptDelivery",
             "securityDecisionDelivery",
+            "workflowDecisionDelivery",
             "taskRecovery",
             "mcpBroker",
         ),
@@ -745,10 +755,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
     has_promotion = "promotionAttestation" in document
     has_embedded_release = has_bundle and has_promotion
     has_control_plane_pull = "controlPlanePull" in document
-    if (
-        has_bundle != has_promotion
-        or has_embedded_release == has_control_plane_pull
-    ):
+    if has_bundle != has_promotion or has_embedded_release == has_control_plane_pull:
         raise RuntimeHostError("release_source_invalid")
     model = _mapping(document["modelGateway"], "model_gateway_config_invalid")
     _exact_keys(
@@ -990,6 +997,75 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             < security_decision_initial_backoff_seconds
         ):
             raise RuntimeHostError("security_decision_backoff_invalid")
+    workflow_decision_base_url = None
+    workflow_decision_api_key_env = None
+    workflow_decision_timeout_seconds = 5.0
+    workflow_decision_poll_interval_seconds = 2.0
+    workflow_decision_lease_seconds = 30.0
+    workflow_decision_initial_backoff_seconds = 1.0
+    workflow_decision_max_backoff_seconds = 300.0
+    if document.get("workflowDecisionDelivery") is not None:
+        workflow = _mapping(
+            document["workflowDecisionDelivery"],
+            "workflow_decision_delivery_config_invalid",
+        )
+        _exact_keys(
+            workflow,
+            required=("baseUrl", "apiKeyEnv"),
+            optional=(
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "pollIntervalSeconds",
+                "leaseSeconds",
+                "initialBackoffSeconds",
+                "maxBackoffSeconds",
+            ),
+            code="workflow_decision_delivery_config_invalid",
+        )
+        allow_insecure_http = _boolean(
+            "workflow_decision_allow_insecure_http",
+            workflow.get("allowInsecureHttp", False),
+        )
+        workflow_decision_base_url = _service_base_url(
+            "workflow_decision",
+            workflow["baseUrl"],
+            allow_insecure_http,
+        )
+        workflow_decision_api_key_env = _environment_name(
+            "workflow_decision_api_key_env", workflow["apiKeyEnv"]
+        )
+        workflow_decision_timeout_seconds = _positive_number(
+            "workflow_decision_timeout_seconds",
+            workflow.get("timeoutSeconds", 5),
+            60,
+        )
+        workflow_decision_poll_interval_seconds = _positive_number(
+            "workflow_decision_poll_interval_seconds",
+            workflow.get("pollIntervalSeconds", 2),
+            300,
+        )
+        workflow_decision_lease_seconds = _positive_number(
+            "workflow_decision_lease_seconds",
+            workflow.get("leaseSeconds", 30),
+            3600,
+        )
+        workflow_decision_initial_backoff_seconds = _positive_number(
+            "workflow_decision_initial_backoff_seconds",
+            workflow.get("initialBackoffSeconds", 1),
+            3600,
+        )
+        workflow_decision_max_backoff_seconds = _positive_number(
+            "workflow_decision_max_backoff_seconds",
+            workflow.get("maxBackoffSeconds", 300),
+            86_400,
+        )
+        if workflow_decision_lease_seconds <= workflow_decision_timeout_seconds:
+            raise RuntimeHostError("workflow_decision_lease_too_short")
+        if (
+            workflow_decision_max_backoff_seconds
+            < workflow_decision_initial_backoff_seconds
+        ):
+            raise RuntimeHostError("workflow_decision_backoff_invalid")
     return RuntimeHostConfig(
         tenant_id=_identifier("tenant_id", document["tenantId"]),
         runtime_id=_identifier("runtime_id", document["runtimeId"]),
@@ -1005,9 +1081,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             else None
         ),
         promotion_attestation=(
-            _mapping(
-                document["promotionAttestation"], "promotion_config_invalid"
-            )
+            _mapping(document["promotionAttestation"], "promotion_config_invalid")
             if has_embedded_release
             else None
         ),
@@ -1052,12 +1126,8 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         control_plane_allow_insecure_http=control_plane_allow_insecure_http,
         control_plane_timeout_seconds=control_plane_timeout_seconds,
         control_plane_max_response_bytes=control_plane_max_response_bytes,
-        control_plane_max_clock_skew_seconds=(
-            control_plane_max_clock_skew_seconds
-        ),
-        control_plane_max_cache_age_seconds=(
-            control_plane_max_cache_age_seconds
-        ),
+        control_plane_max_clock_skew_seconds=(control_plane_max_clock_skew_seconds),
+        control_plane_max_cache_age_seconds=(control_plane_max_cache_age_seconds),
         receipt_base_url=receipt_base_url,
         receipt_api_key_env=receipt_api_key_env,
         receipt_timeout_seconds=receipt_timeout_seconds,
@@ -1075,9 +1145,18 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         security_decision_initial_backoff_seconds=(
             security_decision_initial_backoff_seconds
         ),
-        security_decision_max_backoff_seconds=(
-            security_decision_max_backoff_seconds
+        security_decision_max_backoff_seconds=(security_decision_max_backoff_seconds),
+        workflow_decision_base_url=workflow_decision_base_url,
+        workflow_decision_api_key_env=workflow_decision_api_key_env,
+        workflow_decision_timeout_seconds=workflow_decision_timeout_seconds,
+        workflow_decision_poll_interval_seconds=(
+            workflow_decision_poll_interval_seconds
         ),
+        workflow_decision_lease_seconds=workflow_decision_lease_seconds,
+        workflow_decision_initial_backoff_seconds=(
+            workflow_decision_initial_backoff_seconds
+        ),
+        workflow_decision_max_backoff_seconds=(workflow_decision_max_backoff_seconds),
         task_recovery_enabled=task_recovery_enabled,
         task_recovery_lease_seconds=task_recovery_lease_seconds,
         task_recovery_max_attempts=task_recovery_max_attempts,
@@ -1144,6 +1223,7 @@ class _KernelLoop:
         request_id: str,
         timeout_seconds: float,
         security_correlation: Optional[SecurityDecisionCorrelation] = None,
+        workflow_context: Optional[WorkflowExecutionContext] = None,
     ) -> RuntimeExecutionResult:
         if self._closed:
             raise RuntimeHostError("runtime_host_stopped")
@@ -1152,6 +1232,7 @@ class _KernelLoop:
                 payload,
                 request_id=request_id,
                 security_correlation=security_correlation,
+                workflow_context=workflow_context,
             ),
             self._loop,
         )
@@ -1182,9 +1263,8 @@ class ReferenceRuntimeHost:
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         receipt_dispatcher: Optional[RuntimeReceiptDispatcher] = None,
-        security_decision_dispatcher: Optional[
-            SecurityDecisionDispatcher
-        ] = None,
+        security_decision_dispatcher: Optional[SecurityDecisionDispatcher] = None,
+        workflow_decision_dispatcher: Optional[WorkflowDecisionDispatcher] = None,
         release_source: str = "embedded",
         task_store: Optional[RuntimeTaskStore] = None,
         task_lease_seconds: float = 90.0,
@@ -1206,6 +1286,7 @@ class ReferenceRuntimeHost:
         self._closing = False
         self._receipt_dispatcher = receipt_dispatcher
         self._security_decision_dispatcher = security_decision_dispatcher
+        self._workflow_decision_dispatcher = workflow_decision_dispatcher
         if release_source not in {"embedded", "control_plane", "cache"}:
             raise RuntimeHostError("release_source_invalid")
         self.release_source = release_source
@@ -1411,16 +1492,18 @@ class ReferenceRuntimeHost:
             _exact_keys(
                 request,
                 required=("requestId", "input"),
+                optional=("workflowContext",),
                 code="request_invalid",
             )
             request_id = _identifier("request_id", request["requestId"], 256)
+            workflow_context = (
+                parse_workflow_execution_context(request["workflowContext"])
+                if "workflowContext" in request
+                else None
+            )
             campaign_values = {
-                "campaign_id": normalized_headers.get(
-                    "x-prometa-campaign-id"
-                ),
-                "campaign_run_id": normalized_headers.get(
-                    "x-prometa-campaign-run-id"
-                ),
+                "campaign_id": normalized_headers.get("x-prometa-campaign-id"),
+                "campaign_run_id": normalized_headers.get("x-prometa-campaign-run-id"),
                 "probe_id": normalized_headers.get("x-prometa-probe-id"),
             }
             correlation = None
@@ -1454,7 +1537,7 @@ class ReferenceRuntimeHost:
                         else None
                     ),
                 )
-        except RuntimeHostError as exc:
+        except (RuntimeHostError, WorkflowOntologyError) as exc:
             return self._error(400, exc.code)
         with self._inflight_condition:
             if self._closing:
@@ -1471,11 +1554,14 @@ class ReferenceRuntimeHost:
             claim = self._claim_task(request_id, request["input"])
             if claim is not None:
                 self.kernel.emit_task_claim(claim)
+            runner_options = {"security_correlation": correlation}
+            if workflow_context is not None:
+                runner_options["workflow_context"] = workflow_context
             result = self._runner.execute(
                 request["input"],
                 request_id,
                 self.request_timeout_seconds,
-                security_correlation=correlation,
+                **runner_options,
             )
         except (RuntimePersistenceError, RuntimeTaskError) as exc:
             failure = self._task_error(exc)
@@ -1488,9 +1574,28 @@ class ReferenceRuntimeHost:
         except RuntimeExecutionError as exc:
             if exc.code in {"input_schema_invalid", "request_payload_not_json"}:
                 status = 422
+            elif exc.code in {
+                "workflow_context_required",
+                "workflow_context_not_admitted",
+                "workflow_context_binding_mismatch",
+            }:
+                status = 422
+            elif exc.code.startswith("workflow_policy_") or exc.code in {
+                "workflow_postcondition_denied",
+                "workflow_state_conflict",
+            }:
+                status = 409
             elif exc.retryable or exc.code in {
                 "state_store_failed",
                 "evidence_emit_failed",
+                "runtime_component_missing",
+                "workflow_context_resolver_missing",
+                "workflow_context_resolve_failed",
+                "workflow_decision_emitter_missing",
+                "workflow_decision_emit_failed",
+                "workflow_state_store_missing",
+                "workflow_state_store_failed",
+                "workflow_postcondition_validation_failed",
                 "gateway_unavailable",
                 "model_transport_failed",
                 "circuit_open",
@@ -1574,8 +1679,12 @@ class ReferenceRuntimeHost:
                 if self._receipt_dispatcher is not None:
                     self._receipt_dispatcher.close()
             finally:
-                if self._security_decision_dispatcher is not None:
-                    self._security_decision_dispatcher.close()
+                try:
+                    if self._security_decision_dispatcher is not None:
+                        self._security_decision_dispatcher.close()
+                finally:
+                    if self._workflow_decision_dispatcher is not None:
+                        self._workflow_decision_dispatcher.close()
         if not drained:
             raise RuntimeHostError("runtime_shutdown_timeout")
 
@@ -1638,9 +1747,7 @@ def _resolve_release_material(
             api_key,
             timeout_seconds=config.control_plane_timeout_seconds,
             max_response_bytes=config.control_plane_max_response_bytes,
-            max_clock_skew_seconds=(
-                config.control_plane_max_clock_skew_seconds
-            ),
+            max_clock_skew_seconds=(config.control_plane_max_clock_skew_seconds),
             allow_insecure_http=config.control_plane_allow_insecure_http,
         )
         handoff = client.fetch_release(
@@ -1698,9 +1805,7 @@ _MCP_TARGET_ENVIRONMENT = {
 def _validate_mcp_release_binding(
     config: RuntimeHostConfig, admitted: AdmittedRuntimeRelease
 ) -> None:
-    mcp_tools = tuple(
-        tool for tool in admitted.config.tools if tool.source == "mcp"
-    )
+    mcp_tools = tuple(tool for tool in admitted.config.tools if tool.source == "mcp")
     local = config.mcp_broker
     if local is None:
         if mcp_tools:
@@ -1718,9 +1823,7 @@ def _validate_mcp_release_binding(
     signed_operations = {tool.operation for tool in mcp_tools}
     if any(grant.tool_name not in signed_operations for grant in local.grants):
         raise RuntimeHostError("mcp_grant_tool_unknown")
-    risk_rank = {
-        name: index for index, name in enumerate(MCP_RISK_LEVELS, start=1)
-    }
+    risk_rank = {name: index for index, name in enumerate(MCP_RISK_LEVELS, start=1)}
     max_risk = risk_rank[local.policy.max_risk_level]
     agent_id = admitted.config.manifest.agent_id
     for tool in mcp_tools:
@@ -1775,6 +1878,10 @@ def build_reference_runtime_host(
     evidence_emitter: Optional[EvidenceEmitter] = None,
     guard_evaluator: Optional[GuardEvaluator] = None,
     human_escalation: Optional[HumanEscalation] = None,
+    workflow_context_resolver: Optional[WorkflowContextResolver] = None,
+    workflow_state_store: Optional[WorkflowStateStore] = None,
+    workflow_decision_emitter: Optional[WorkflowDecisionEmitter] = None,
+    workflow_postcondition_validator: Optional[WorkflowPostconditionValidator] = None,
     mcp_transport_client: Optional[McpTransportClient] = None,
     now: Optional[datetime] = None,
 ) -> Tuple[ReferenceRuntimeHost, bool]:
@@ -1814,9 +1921,7 @@ def build_reference_runtime_host(
     if config.security_decision_base_url is not None:
         if config.security_decision_api_key_env is None:
             raise RuntimeHostError("security_decision_api_key_env_missing")
-        security_decision_api_key = env.get(
-            config.security_decision_api_key_env, ""
-        )
+        security_decision_api_key = env.get(config.security_decision_api_key_env, "")
         if not security_decision_api_key:
             raise RuntimeHostError("security_decision_api_key_missing")
         if (
@@ -1824,6 +1929,18 @@ def build_reference_runtime_host(
             <= config.security_decision_timeout_seconds
         ):
             raise RuntimeHostError("security_decision_lease_too_short")
+    workflow_decision_api_key = None
+    if config.workflow_decision_base_url is not None:
+        if config.workflow_decision_api_key_env is None:
+            raise RuntimeHostError("workflow_decision_api_key_env_missing")
+        workflow_decision_api_key = env.get(config.workflow_decision_api_key_env, "")
+        if not workflow_decision_api_key:
+            raise RuntimeHostError("workflow_decision_api_key_missing")
+        if (
+            config.workflow_decision_lease_seconds
+            <= config.workflow_decision_timeout_seconds
+        ):
+            raise RuntimeHostError("workflow_decision_lease_too_short")
     model_api_key = None
     if config.model_gateway_api_key_env is not None:
         model_api_key = env.get(config.model_gateway_api_key_env, "")
@@ -1838,10 +1955,7 @@ def build_reference_runtime_host(
     )
     tool_broker = None
     if config.mcp_broker is not None:
-        if (
-            mcp_transport_client is None
-            and not official_mcp_transport_available()
-        ):
+        if mcp_transport_client is None and not official_mcp_transport_available():
             raise RuntimeHostError("mcp_dependency_missing")
         tool_broker = GovernedMcpToolBroker(
             servers=config.mcp_broker.servers,
@@ -1852,9 +1966,7 @@ def build_reference_runtime_host(
                 config.mcp_broker.credential_bindings,
                 environ=env,
             ),
-            transport_client=(
-                mcp_transport_client or OfficialMcpTransportClient()
-            ),
+            transport_client=(mcp_transport_client or OfficialMcpTransportClient()),
             audit_sink=PostgresMcpAuditSink(
                 dsn,
                 tenant_id=config.tenant_id,
@@ -1889,9 +2001,7 @@ def build_reference_runtime_host(
             tenant_id=config.tenant_id,
         )
 
-        def security_decision_status(
-            outcome: str, details: Mapping[str, str]
-        ) -> None:
+        def security_decision_status(outcome: str, details: Mapping[str, str]) -> None:
             attributes = {
                 "prometa.runtime.id": config.runtime_id,
                 "prometa.runtime.version": config.runtime_version,
@@ -1902,9 +2012,7 @@ def build_reference_runtime_host(
                 "prometa.security.decision_count": details["decisionCount"],
             }
             if "errorCode" in details:
-                attributes["prometa.security.error_code"] = details[
-                    "errorCode"
-                ]
+                attributes["prometa.security.error_code"] = details["errorCode"]
             emitter.emit(
                 RuntimeEvidenceEvent(
                     name="runtime.security_decision.delivery",
@@ -1923,16 +2031,10 @@ def build_reference_runtime_host(
                 security_decision_api_key,
                 timeout=config.security_decision_timeout_seconds,
             ),
-            poll_interval_seconds=(
-                config.security_decision_poll_interval_seconds
-            ),
+            poll_interval_seconds=(config.security_decision_poll_interval_seconds),
             lease_seconds=config.security_decision_lease_seconds,
-            initial_backoff_seconds=(
-                config.security_decision_initial_backoff_seconds
-            ),
-            max_backoff_seconds=(
-                config.security_decision_max_backoff_seconds
-            ),
+            initial_backoff_seconds=(config.security_decision_initial_backoff_seconds),
+            max_backoff_seconds=(config.security_decision_max_backoff_seconds),
             shutdown_timeout_seconds=min(
                 300, config.security_decision_timeout_seconds + 2
             ),
@@ -1942,6 +2044,66 @@ def build_reference_runtime_host(
             security_decision_outbox,
             security_decision_dispatcher,
         )
+    workflow_decision_dispatcher = None
+    effective_workflow_decision_emitter = workflow_decision_emitter
+    if (
+        effective_workflow_decision_emitter is None
+        and config.workflow_decision_base_url is not None
+        and workflow_decision_api_key is not None
+    ):
+        workflow_decision_outbox = PostgresWorkflowDecisionOutbox(
+            dsn,
+            tenant_id=config.tenant_id,
+        )
+
+        def workflow_decision_status(outcome: str, details: Mapping[str, str]) -> None:
+            attributes = {
+                "prometa.runtime.id": config.runtime_id,
+                "prometa.runtime.version": config.runtime_version,
+                "prometa.release.id": config.release_id,
+                "prometa.deployment.id": config.deployment_id,
+                "prometa.environment": config.environment,
+                "prometa.workflow.batch_id": details["batchId"],
+                "prometa.workflow.decision_count": details["decisionCount"],
+            }
+            if "errorCode" in details:
+                attributes["prometa.workflow.error_code"] = details["errorCode"]
+            emitter.emit(
+                RuntimeEvidenceEvent(
+                    name="runtime.workflow_decision.delivery",
+                    outcome=outcome,
+                    occurred_at=datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    attributes=attributes,
+                )
+            )
+
+        workflow_decision_dispatcher = WorkflowDecisionDispatcher(
+            workflow_decision_outbox,
+            WorkflowDecisionClient(
+                config.workflow_decision_base_url,
+                workflow_decision_api_key,
+                timeout=config.workflow_decision_timeout_seconds,
+            ),
+            poll_interval_seconds=(config.workflow_decision_poll_interval_seconds),
+            lease_seconds=config.workflow_decision_lease_seconds,
+            initial_backoff_seconds=(config.workflow_decision_initial_backoff_seconds),
+            max_backoff_seconds=config.workflow_decision_max_backoff_seconds,
+            shutdown_timeout_seconds=min(
+                300, config.workflow_decision_timeout_seconds + 2
+            ),
+            on_status=workflow_decision_status,
+        )
+        effective_workflow_decision_emitter = DurableWorkflowDecisionEmitter(
+            workflow_decision_outbox,
+            workflow_decision_dispatcher,
+        )
+    effective_workflow_state_store = workflow_state_store or PostgresWorkflowStateStore(
+        dsn,
+        tenant_id=config.tenant_id,
+        runtime_id=config.runtime_id,
+    )
     policy = RuntimeAdmissionPolicy(
         expected_org_id=config.org_id,
         expected_environment=config.environment,
@@ -1953,6 +2115,9 @@ def build_reference_runtime_host(
             security_decision_emitter=security_decision_emitter,
             tool_broker=tool_broker,
             human_escalation=human_escalation,
+            workflow_context_resolver=workflow_context_resolver,
+            workflow_state_store=effective_workflow_state_store,
+            workflow_decision_emitter=effective_workflow_decision_emitter,
         ),
     )
     admitted, activation = activate_runtime_release(
@@ -2019,9 +2184,7 @@ def build_reference_runtime_host(
             lease_seconds=config.receipt_lease_seconds,
             initial_backoff_seconds=config.receipt_initial_backoff_seconds,
             max_backoff_seconds=config.receipt_max_backoff_seconds,
-            shutdown_timeout_seconds=min(
-                300, config.receipt_timeout_seconds + 2
-            ),
+            shutdown_timeout_seconds=min(300, config.receipt_timeout_seconds + 2),
             on_status=receipt_status,
         )
     kernel = RuntimeKernel(
@@ -2048,6 +2211,10 @@ def build_reference_runtime_host(
             tenant_id=config.tenant_id,
             runtime_id=config.runtime_id,
         ),
+        workflow_context_resolver=workflow_context_resolver,
+        workflow_state_store=effective_workflow_state_store,
+        workflow_decision_emitter=effective_workflow_decision_emitter,
+        workflow_postcondition_validator=workflow_postcondition_validator,
     )
     emitter.emit(
         RuntimeEvidenceEvent(
@@ -2071,6 +2238,7 @@ def build_reference_runtime_host(
         max_request_bytes=config.max_request_bytes,
         receipt_dispatcher=receipt_dispatcher,
         security_decision_dispatcher=security_decision_dispatcher,
+        workflow_decision_dispatcher=workflow_decision_dispatcher,
         release_source=material.source,
         task_store=(
             PostgresRuntimeTaskStore(
@@ -2134,6 +2302,9 @@ def build_reference_runtime_host(
     if security_decision_dispatcher is not None:
         security_decision_dispatcher.start()
         security_decision_dispatcher.wake()
+    if workflow_decision_dispatcher is not None:
+        workflow_decision_dispatcher.start()
+        workflow_decision_dispatcher.wake()
     return host, activation.created
 
 
@@ -2190,10 +2361,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         response = None
         protected_request = (
             self.command == "POST" and path == "/v1/runtime/execute"
-        ) or (
-            self.command == "GET"
-            and path.startswith("/v1/runtime/tasks/")
-        )
+        ) or (self.command == "GET" and path.startswith("/v1/runtime/tasks/"))
         if protected_request:
             authorizations = self.headers.get_all("authorization", [])
             if len(authorizations) != 1 or not self.server.application._authorized(
@@ -2275,9 +2443,7 @@ def serve_reference_runtime_host(
     if not bind_host or not 1 <= port <= 65535:
         raise RuntimeHostError("listen_address_invalid")
     ssl_context = (
-        build_runtime_server_ssl_context(tls_config)
-        if tls_config is not None
-        else None
+        build_runtime_server_ssl_context(tls_config) if tls_config is not None else None
     )
     server = _RuntimeHttpServer((bind_host, port), application, ssl_context)
     stopping = threading.Event()
@@ -2347,24 +2513,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         require_client_certificate = args.tls_require_client_certificate
         if require_client_certificate is None:
-            raw_require_client_certificate = os.environ.get(
-                "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE", "false"
-            ).strip().lower()
+            raw_require_client_certificate = (
+                os.environ.get(
+                    "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE", "false"
+                )
+                .strip()
+                .lower()
+            )
             if raw_require_client_certificate not in {"true", "false"}:
                 raise RuntimeHostError("server_tls_configuration_invalid")
             require_client_certificate = raw_require_client_certificate == "true"
         if bool(args.tls_cert_file) != bool(args.tls_key_file):
             raise RuntimeHostError("server_tls_configuration_invalid")
-        if (args.tls_client_ca_file or require_client_certificate) and not args.tls_cert_file:
+        if (
+            args.tls_client_ca_file or require_client_certificate
+        ) and not args.tls_cert_file:
             raise RuntimeHostError("server_tls_configuration_invalid")
         tls_config = (
             RuntimeServerTlsConfig(
                 certificate_file=Path(args.tls_cert_file),
                 private_key_file=Path(args.tls_key_file),
                 client_ca_file=(
-                    Path(args.tls_client_ca_file)
-                    if args.tls_client_ca_file
-                    else None
+                    Path(args.tls_client_ca_file) if args.tls_client_ca_file else None
                 ),
                 require_client_certificate=require_client_certificate,
             )

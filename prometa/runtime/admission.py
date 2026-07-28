@@ -40,6 +40,7 @@ CAPABILITY_MODEL_INVOKE = "model.invoke.v1"
 CAPABILITY_EVIDENCE_EMIT = "evidence.emit.v1"
 CAPABILITY_SCHEMA_VALIDATE = "schema.validate.v1"
 CAPABILITY_GUARD_EVALUATE = "guard.evaluate.v1"
+CAPABILITY_SECURITY_DECISION_EMIT = "security.decision.emit.v1"
 CAPABILITY_TOOL_BROKER = "tool.broker.v1"
 CAPABILITY_HUMAN_ESCALATION = "human.escalation.v1"
 BASE_RUNTIME_CAPABILITIES = frozenset(
@@ -51,6 +52,7 @@ KNOWN_RUNTIME_CAPABILITIES = frozenset(
         CAPABILITY_EVIDENCE_EMIT,
         CAPABILITY_SCHEMA_VALIDATE,
         CAPABILITY_GUARD_EVALUATE,
+        CAPABILITY_SECURITY_DECISION_EMIT,
         CAPABILITY_TOOL_BROKER,
         CAPABILITY_HUMAN_ESCALATION,
     }
@@ -98,6 +100,14 @@ class RuntimeGuardrail:
     guardrail_type: str
     on_violation: str
     applies_to: Optional[str]
+    enforcement_mode: Optional[str] = None
+    review_threshold: Optional[float] = None
+    enforce_threshold: Optional[float] = None
+    decision_action: Optional[str] = None
+
+    @property
+    def security_assurance_enabled(self) -> bool:
+        return self.enforcement_mode is not None
 
 
 @dataclass(frozen=True)
@@ -312,6 +322,20 @@ def _optional_number(value: Mapping[str, Any], key: str, code: str) -> Optional[
         raise BundleVerificationError(code)
     numeric = float(candidate)
     if not 0 <= numeric <= 2:
+        raise BundleVerificationError(code)
+    return numeric
+
+
+def _optional_unit_interval(
+    value: Mapping[str, Any], key: str, code: str
+) -> Optional[float]:
+    candidate = value.get(key)
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise BundleVerificationError(code)
+    numeric = float(candidate)
+    if not 0 <= numeric <= 1:
         raise BundleVerificationError(code)
     return numeric
 
@@ -632,11 +656,42 @@ def _parse_guardrail(value: Any) -> RuntimeGuardrail:
     applies_to = _optional_string(guardrail, "appliesTo", "invalid_runtime_guardrail")
     if applies_to not in {None, "input", "output", "tool-calls", "all"}:
         raise BundleVerificationError("invalid_runtime_guardrail")
+    enforcement_mode = _optional_string(
+        guardrail, "enforcementMode", "invalid_runtime_guardrail"
+    )
+    review_threshold = _optional_unit_interval(
+        guardrail, "reviewThreshold", "invalid_runtime_guardrail"
+    )
+    enforce_threshold = _optional_unit_interval(
+        guardrail, "enforceThreshold", "invalid_runtime_guardrail"
+    )
+    decision_action = _optional_string(
+        guardrail, "decisionAction", "invalid_runtime_guardrail"
+    )
+    assurance_fields = (
+        enforcement_mode,
+        review_threshold,
+        enforce_threshold,
+        decision_action,
+    )
+    if any(field is not None for field in assurance_fields):
+        if any(field is None for field in assurance_fields):
+            raise BundleVerificationError("incomplete_security_assurance_guardrail")
+        if enforcement_mode not in {"observe", "review", "enforce"}:
+            raise BundleVerificationError("invalid_runtime_guardrail")
+        if decision_action not in {"allow", "deny", "mask", "rewrite"}:
+            raise BundleVerificationError("invalid_runtime_guardrail")
+        if review_threshold > enforce_threshold:
+            raise BundleVerificationError("invalid_security_assurance_thresholds")
     return RuntimeGuardrail(
         name=_string(guardrail, "name", "invalid_runtime_guardrail"),
         guardrail_type=guardrail_type,
         on_violation=on_violation,
         applies_to=applies_to,
+        enforcement_mode=enforcement_mode,
+        review_threshold=review_threshold,
+        enforce_threshold=enforce_threshold,
+        decision_action=decision_action,
     )
 
 
@@ -734,6 +789,8 @@ def parse_runtime_bundle(
             legacy_required.add(CAPABILITY_TOOL_BROKER)
         if guardrails or any(tool.required_guardrails for tool in tools):
             legacy_required.add(CAPABILITY_GUARD_EVALUATE)
+        if any(guardrail.security_assurance_enabled for guardrail in guardrails):
+            legacy_required.add(CAPABILITY_SECURITY_DECISION_EMIT)
         if any(tool.approval_required for tool in tools) or any(
             guardrail.on_violation == "escalate"
             or guardrail.guardrail_type == "human-approval"
@@ -772,6 +829,8 @@ def parse_runtime_bundle(
             inferred.add(CAPABILITY_TOOL_BROKER)
         if guardrails or any(tool.required_guardrails for tool in tools):
             inferred.add(CAPABILITY_GUARD_EVALUATE)
+        if any(guardrail.security_assurance_enabled for guardrail in guardrails):
+            inferred.add(CAPABILITY_SECURITY_DECISION_EMIT)
         if any(tool.approval_required for tool in tools) or any(
             guardrail.on_violation == "escalate"
             or guardrail.guardrail_type == "human-approval"
@@ -807,6 +866,11 @@ def parse_runtime_bundle(
             configuration_digest=configuration_digest,
             secret_references=secret_references,
         )
+
+    if CAPABILITY_SECURITY_DECISION_EMIT in contract.required_capabilities and any(
+        not guardrail.security_assurance_enabled for guardrail in guardrails
+    ):
+        raise BundleVerificationError("incomplete_security_assurance_guardrail")
 
     supported = frozenset(supported_capabilities)
     unknown_supported = supported - KNOWN_RUNTIME_CAPABILITIES
@@ -1029,6 +1093,7 @@ __all__ = [
     "CAPABILITY_EVIDENCE_EMIT",
     "CAPABILITY_SCHEMA_VALIDATE",
     "CAPABILITY_GUARD_EVALUATE",
+    "CAPABILITY_SECURITY_DECISION_EMIT",
     "CAPABILITY_TOOL_BROKER",
     "CAPABILITY_HUMAN_ESCALATION",
     "BASE_RUNTIME_CAPABILITIES",

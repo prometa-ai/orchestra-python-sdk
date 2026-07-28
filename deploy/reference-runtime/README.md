@@ -93,6 +93,9 @@ provider:
   `controlPlanePull.apiKeyEnv` names it; use a narrow `runtime:read` key.
 - `ORCHESTRA_RUNTIME_RECEIPT_API_KEY`: required only when the optional
   `receiptDelivery.apiKeyEnv` names it; use a narrow `runtime:write` key.
+- `ORCHESTRA_SECURITY_DECISION_API_KEY`: required when a guarded v2 release
+  uses `securityDecisionDelivery.apiKeyEnv`; use a key limited to
+  `security-decisions:write`.
 - MCP credential variables such as `MCP_INTEGRATION_AUTHORIZATION`: required
   only when named by `mcpBroker.credentialBindings`; values stay in a workload
   secret and out of the mounted configuration.
@@ -130,6 +133,35 @@ The host durably enqueues deterministic deployment-level `admitted` and
 readiness or request execution, while permanent 4xx responses are retained as
 dead letters with payload-free evidence. Pod termination does not emit a
 deployment-level `stopped` receipt.
+
+Guarded bundles declare `security.decision.emit.v1` and will not admit unless
+the host has a durable decision emitter. Add the delivery block below and
+provision its separately scoped key:
+
+```json
+{
+  "securityDecisionDelivery": {
+    "baseUrl": "https://orchestra.example.com",
+    "apiKeyEnv": "ORCHESTRA_SECURITY_DECISION_API_KEY",
+    "timeoutSeconds": 5,
+    "pollIntervalSeconds": 2,
+    "leaseSeconds": 30,
+    "initialBackoffSeconds": 1,
+    "maxBackoffSeconds": 300
+  }
+}
+```
+
+The request path evaluates and applies the signed mode, thresholds, and action
+without a Prometa call. It commits one strict, content-minimized decision per
+applicable guardrail to
+`prometa_runtime_security_decision_outbox`; a background worker then posts
+batches to `/api/security/decision-batches`. Network failures back off without
+changing readiness, while a local persistence failure fails the guarded
+request because the declared evidence capability could not be satisfied.
+Campaign callers may supply `X-Prometa-Campaign-Id`,
+`X-Prometa-Campaign-Run-Id`, and `X-Prometa-Probe-Id`; only these bounded IDs
+are retained for cross-plane correlation.
 
 Pull mode is bootstrap-only. The host refuses redirects, requires HTTPS unless
 local/test configuration explicitly opts into HTTP, and rejects a stale
@@ -207,8 +239,9 @@ PROMETA_RUNTIME_BACKUP_FILE=/backups/runtime-20260712T020000Z.dump \
 ```
 
 A full runtime database backup is sensitive even though the task ledger is
-payload-free: release-cache documents, request-state snapshots, and receipt
-outbox records may contain tenant configuration or evidence. Store archives
+payload-free: release-cache documents, request-state snapshots, receipt outbox
+records, and minimized security-decision evidence may contain tenant
+configuration or operational metadata. Store archives
 only on tenant-approved encrypted storage with restricted backup credentials,
 retention, replication, deletion, and audit controls. The optional Helm backup
 CronJob requires an explicit sensitive-data acknowledgement, a separately
@@ -223,7 +256,7 @@ Restore is deliberately fresh-database-only:
    `PROMETA_RUNTIME_RESTORE_CONFIRM=restore-tenant-runtime`, then run
    `operations/restore-postgres.sh` with matching PostgreSQL client tools.
 4. Point `PROMETA_RUNTIME_DATABASE_URL` at the restored database and run
-   `prometa-runtime-postgres-verify`. The verifier checks schema v6, required
+   `prometa-runtime-postgres-verify`. The verifier checks schema v7, required
    payload-free task and MCP columns, migration continuity, lease/status
    projections, ordered task history, and payload-free MCP audit while returning
    only table counts.
@@ -318,8 +351,9 @@ default-deny policy and the dedicated `migration.serviceAccountName`. The chart
 creates a hook-weighted allow policy for the migration and compatibility Jobs,
 but it does not create that pre-install ServiceAccount or any Secret. The
 profile keeps the runtime behind an internal ClusterIP; the tenant gateway owns
-the request edge. Asynchronous receipt delivery may call Orchestra, but
-Orchestra remains outside the synchronous production request path.
+the request edge. Asynchronous receipt and security-decision delivery may call
+Orchestra, but Orchestra remains outside the synchronous production request
+path.
 
 Build the UBI variant with the pinned build/runtime bases:
 
@@ -350,8 +384,9 @@ provision the separately referenced MCP credential Secret. The chart never
 creates, copies, or renders that credential.
 
 The credential Secret must expose the configured runtime database, request API
-token, optional model/control-plane/receipt API keys, and migration database
-keys. Use an external secret manager or sealed-secret workflow; do not commit
+token, optional model/control-plane/receipt/security-decision API keys, and
+migration database keys. Use an external secret manager or sealed-secret
+workflow; do not commit
 the rendered Secret. Embedded mode stores the exact signed pair in the runtime
 config; pull mode stores only the selected attestation ID and non-secret trust
 configuration. Use one immutable, versioned config object per deployment and set
@@ -380,8 +415,9 @@ Security defaults are deliberately fail-closed:
 
 The production example opens only tenant-gateway ingress plus PostgreSQL and
 model-gateway egress. The MCP example adds only the declared tenant-tools pod
-and port. Add control-plane, telemetry, or receipt-endpoint egress only when the
-corresponding path is configured. For external services use a tightly scoped
+and port. Add control-plane, telemetry, receipt, or security-decision endpoint
+egress only when the corresponding path is configured. For external services
+use a tightly scoped
 `ipBlock` or a CNI-supported FQDN policy; Kubernetes NetworkPolicy does not
 natively express DNS names.
 
@@ -429,8 +465,8 @@ deploy/reference-runtime/ci/upgrade-rollback-drill.sh
 ```
 
 `compatibility-baselines.json` pins chart `0.1.0` commit `51e2faa` at schema v2.
-The drill starts release A on that source, migrates to v6 and starts release B on
-current code, then starts the baseline host against v6 with release A's exact
+The drill starts release A on that source, migrates to v7 and starts release B on
+current code, then starts the baseline host against v7 with release A's exact
 bundle bytes and a fresh rollback promotion/deployment. It verifies three
 immutable activation rows and zero synchronous control-plane calls. Because the
 baseline was not a separately published artifact, this is not release-channel,

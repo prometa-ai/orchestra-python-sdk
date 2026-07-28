@@ -116,6 +116,12 @@ spec:
                   name: {{ .Values.credentials.existingSecret | quote }}
                   key: {{ .Values.credentials.receiptApiKeyKey | quote }}
                   optional: {{ .Values.credentials.receiptApiKeyOptional }}
+            - name: ORCHESTRA_SECURITY_DECISION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret | quote }}
+                  key: {{ .Values.credentials.securityDecisionApiKeyKey | quote }}
+                  optional: {{ .Values.credentials.securityDecisionApiKeyOptional }}
             - name: ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY
               valueFrom:
                 secretKeyRef:

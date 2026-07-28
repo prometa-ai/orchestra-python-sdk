@@ -34,11 +34,19 @@ from .admission import (
     CAPABILITY_GUARD_EVALUATE,
     CAPABILITY_HUMAN_ESCALATION,
     CAPABILITY_MODEL_INVOKE,
+    CAPABILITY_SECURITY_DECISION_EMIT,
     CAPABILITY_SCHEMA_VALIDATE,
     CAPABILITY_TOOL_BROKER,
     RuntimeGuardrail,
     RuntimeModel,
     RuntimeTool,
+)
+from .security_assurance import (
+    SecurityDecisionCorrelation,
+    SecurityDecisionEmitter,
+    SecurityGuardAssessment,
+    build_security_decision,
+    security_policy_identifier,
 )
 from .tasks import RuntimeTaskClaim
 
@@ -212,6 +220,7 @@ class GuardDecision:
     reason: str = ""
     evaluated_guardrails: Tuple[str, ...] = ()
     transformed_payload: Any = None
+    security_assessments: Tuple[SecurityGuardAssessment, ...] = ()
 
 
 class GuardEvaluator(Protocol):
@@ -365,6 +374,7 @@ class _CircuitState:
 def available_runtime_capabilities(
     *,
     guard_evaluator: Optional[GuardEvaluator] = None,
+    security_decision_emitter: Optional[SecurityDecisionEmitter] = None,
     tool_broker: Optional[ToolBroker] = None,
     human_escalation: Optional[HumanEscalation] = None,
 ) -> FrozenSet[str]:
@@ -380,6 +390,8 @@ def available_runtime_capabilities(
         pass
     if guard_evaluator is not None:
         capabilities.add(CAPABILITY_GUARD_EVALUATE)
+    if security_decision_emitter is not None:
+        capabilities.add(CAPABILITY_SECURITY_DECISION_EMIT)
     if tool_broker is not None and not isinstance(tool_broker, DenyAllToolBroker):
         capabilities.add(CAPABILITY_TOOL_BROKER)
     if human_escalation is not None:
@@ -448,6 +460,7 @@ class RuntimeKernel:
         runtime_version: str,
         execution_policy: Optional[RuntimeExecutionPolicy] = None,
         guard_evaluator: Optional[GuardEvaluator] = None,
+        security_decision_emitter: Optional[SecurityDecisionEmitter] = None,
         tool_broker: Optional[ToolBroker] = None,
         human_escalation: Optional[HumanEscalation] = None,
         state_store: Optional[RuntimeStateStore] = None,
@@ -473,6 +486,7 @@ class RuntimeKernel:
         self.runtime_version = runtime_version
         self.policy = execution_policy or RuntimeExecutionPolicy()
         self.guard_evaluator = guard_evaluator
+        self.security_decision_emitter = security_decision_emitter
         self.tool_broker = tool_broker or DenyAllToolBroker()
         self.human_escalation = human_escalation
         self.state_store = state_store
@@ -481,6 +495,7 @@ class RuntimeKernel:
 
         available = available_runtime_capabilities(
             guard_evaluator=guard_evaluator,
+            security_decision_emitter=security_decision_emitter,
             tool_broker=tool_broker,
             human_escalation=human_escalation,
         )
@@ -665,6 +680,7 @@ class RuntimeKernel:
         request_id: str,
         *,
         tool: Optional[RuntimeTool] = None,
+        correlation: Optional[SecurityDecisionCorrelation] = None,
     ) -> _GuardOutcome:
         guardrails = self.admission.config.guardrails
         required = set(tool.required_guardrails if tool else ())
@@ -717,6 +733,38 @@ class RuntimeKernel:
                 "prometa.guardrail.evaluated": ",".join(sorted(evaluated)),
             },
         )
+        security_guardrails = tuple(
+            guardrail
+            for guardrail in guardrails
+            if guardrail.name in applicable
+            and guardrail.security_assurance_enabled
+        )
+        if security_guardrails:
+            guarded_payload = self._apply_security_assurance(
+                decision,
+                security_guardrails,
+                stage=stage,
+                request_id=request_id,
+                correlation=correlation,
+                original_payload=payload,
+            )
+            requires_human = any(
+                guardrail.guardrail_type == "human-approval"
+                for guardrail in security_guardrails
+            )
+            if requires_human:
+                human_decision = await self._human_review(
+                    request_id,
+                    stage,
+                    "Signed human-approval guardrail",
+                    tool,
+                    guarded_payload,
+                )
+                return _GuardOutcome(
+                    guarded_payload,
+                    (human_decision.reviewer_reference,),
+                )
+            return _GuardOutcome(guarded_payload)
         if decision.allowed:
             guarded_payload = (
                 decision.transformed_payload
@@ -751,6 +799,102 @@ class RuntimeKernel:
             )
             return _GuardOutcome(payload, (human_decision.reviewer_reference,))
         raise RuntimeExecutionError("guard_denied")
+
+    def _apply_security_assurance(
+        self,
+        decision: GuardDecision,
+        guardrails: Tuple[RuntimeGuardrail, ...],
+        *,
+        stage: str,
+        request_id: str,
+        correlation: Optional[SecurityDecisionCorrelation],
+        original_payload: Any,
+    ) -> Any:
+        emitter = self.security_decision_emitter
+        policy_digest = self.admission.config.contract.policy_digest
+        if emitter is None or policy_digest is None:
+            raise RuntimeExecutionError("security_decision_emitter_missing")
+        assessments = {
+            assessment.guardrail_name: assessment
+            for assessment in decision.security_assessments
+            if isinstance(assessment, SecurityGuardAssessment)
+        }
+        if (
+            len(assessments) != len(decision.security_assessments)
+            or set(assessments) != {guardrail.name for guardrail in guardrails}
+        ):
+            raise RuntimeExecutionError("security_decision_evidence_incomplete")
+
+        surface = {
+            "input": "input",
+            "output": "output",
+            "tool": "tool_request",
+        }.get(stage)
+        if surface is None:
+            raise RuntimeExecutionError("security_decision_surface_unsupported")
+        applied_actions = []
+        for guardrail in guardrails:
+            assessment = assessments[guardrail.name]
+            mode = guardrail.enforcement_mode or "observe"
+            review_threshold = guardrail.review_threshold
+            enforce_threshold = guardrail.enforce_threshold
+            recommended = guardrail.decision_action or "allow"
+            if review_threshold is None or enforce_threshold is None:
+                raise RuntimeExecutionError("security_decision_policy_incomplete")
+            if not assessment.violated:
+                recommended = "allow"
+                applied = "allow"
+            elif mode == "enforce" and (
+                assessment.confidence_score >= enforce_threshold
+            ):
+                applied = recommended
+                if (
+                    applied in {"mask", "rewrite"}
+                    and decision.transformed_payload is None
+                ):
+                    # A transformation policy must never release the original
+                    # payload when its adapter omitted the transformed value.
+                    applied = "deny"
+            else:
+                applied = "allow"
+            review_required = (
+                assessment.violated
+                and mode == "review"
+                and assessment.confidence_score >= review_threshold
+            )
+            runtime_decision = build_security_decision(
+                request_id=request_id,
+                agent_id=self.admission.config.manifest.agent_id,
+                environment=self.admission.bundle.claims["targetEnvironment"],
+                release_id=self.admission.promotion.claims["releaseId"],
+                deployment_id=self.admission.promotion.claims["deploymentId"],
+                surface=surface,
+                policy_id=security_policy_identifier(guardrail.name),
+                policy_version=str(self.admission.config.manifest.version),
+                policy_digest=policy_digest,
+                enforcement_mode=mode,
+                recommended_action=recommended,
+                applied_action=applied,
+                review_required=review_required,
+                assessment=assessment,
+                correlation=correlation,
+            )
+            try:
+                emitter.emit(runtime_decision)
+            except RuntimeExecutionError:
+                raise
+            except Exception as exc:
+                raise RuntimeExecutionError(
+                    "security_decision_emit_failed", retryable=True
+                ) from exc
+            applied_actions.append(applied)
+        if "deny" in applied_actions:
+            raise RuntimeExecutionError("guard_denied")
+        if any(action in {"mask", "rewrite"} for action in applied_actions):
+            if decision.transformed_payload is None:
+                raise RuntimeExecutionError("guard_transform_missing")
+            return decision.transformed_payload
+        return original_payload
 
     async def _human_review(
         self,
@@ -815,13 +959,22 @@ class RuntimeKernel:
         return matches[0]
 
     async def _invoke_tool(
-        self, call: ModelToolCall, request_id: str
+        self,
+        call: ModelToolCall,
+        request_id: str,
+        correlation: Optional[SecurityDecisionCorrelation] = None,
     ) -> ToolInvocationResult:
         tool = self._tool_by_name(call.name)
         arguments = self._validate_schema(
             "tool_input", call.arguments, tool.input_schema, request_id
         )
-        guard_outcome = await self._guard("tool", arguments, request_id, tool=tool)
+        guard_outcome = await self._guard(
+            "tool",
+            arguments,
+            request_id,
+            tool=tool,
+            correlation=correlation,
+        )
         arguments = guard_outcome.payload
         approval_references = list(guard_outcome.approval_references)
         if self.admission.config.guardrails or tool.required_guardrails:
@@ -999,6 +1152,7 @@ class RuntimeKernel:
         payload: Any,
         *,
         request_id: Optional[str] = None,
+        security_correlation: Optional[SecurityDecisionCorrelation] = None,
     ) -> RuntimeExecutionResult:
         request_id = request_id or str(uuid.uuid4())
         if (
@@ -1022,7 +1176,12 @@ class RuntimeKernel:
                 request_id,
             )
             runtime_input = (
-                await self._guard("input", runtime_input, request_id)
+                await self._guard(
+                    "input",
+                    runtime_input,
+                    request_id,
+                    correlation=security_correlation,
+                )
             ).payload
             if self.admission.config.guardrails:
                 runtime_input = self._validate_schema(
@@ -1131,7 +1290,11 @@ class RuntimeKernel:
                             assistant_calls = []
                             tool_messages = []
                             for call in response.tool_calls:
-                                result = await self._invoke_tool(call, request_id)
+                                result = await self._invoke_tool(
+                                    call,
+                                    request_id,
+                                    correlation=security_correlation,
+                                )
                                 tool_calls += 1
                                 executed_tool = True
                                 assistant_calls.append(
@@ -1175,7 +1338,12 @@ class RuntimeKernel:
                             request_id,
                         )
                         output = (
-                            await self._guard("output", output, request_id)
+                            await self._guard(
+                                "output",
+                                output,
+                                request_id,
+                                correlation=security_correlation,
+                            )
                         ).payload
                         if self.admission.config.guardrails:
                             output = self._validate_schema(

@@ -64,6 +64,7 @@ def test_runtime_ubi_image_and_openshift_profile_are_explicitly_bounded():
     assert "namespaceDefaultDenyAcknowledged: false" in profile
     assert "modelGatewayApiKeyOptional: false" in profile
     assert "receiptApiKeyOptional: false" in profile
+    assert "securityDecisionApiKeyOptional: false" in profile
     assert "backup:\n  enabled: false" in profile
     assert "the OpenShift runtime profile requires" in helpers
     assert "a separate migration credential Secret" in helpers
@@ -96,6 +97,7 @@ def test_runtime_sno_trial_profile_is_source_only_and_fail_closed():
     assert "controlPlaneApiKeyOptional: true" in profile
     assert "modelGatewayApiKeyOptional: false" in profile
     assert "receiptApiKeyOptional: false" in profile
+    assert "securityDecisionApiKeyOptional: false" in profile
     assert "backup:\n  enabled: false" in profile
     assert "type: ClusterIP" in profile
     assert "Source-only tenant-runtime profile" in profile
@@ -203,7 +205,7 @@ def test_runtime_backup_restore_assets_are_fail_closed_and_secret_safe():
     assert "target database is not empty" in restore
     assert "restore checksum mismatch" in restore
     assert "restore basename contains unsupported characters" in restore
-    assert "PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-6" in restore
+    assert "PROMETA_RUNTIME_EXPECTED_SCHEMA_VERSION:-7" in restore
     assert 'profiles: ["operations"]' in compose
     assert "runtime-backups:/backups" in compose
 

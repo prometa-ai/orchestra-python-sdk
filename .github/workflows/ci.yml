@@ -241,7 +241,7 @@ jobs:
           version=$(python -c 'import prometa; print(prometa.__version__)')
           test "$(docker run --rm --entrypoint id prometa-runtime-host:${{ github.sha }} -u)" = "10001"
           docker run --rm --entrypoint python prometa-runtime-host:${{ github.sha }} \
-            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresMcpAuditSink, PostgresMcpIdempotencyStore, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, official_mcp_transport_available, verify_postgres_runtime_integrity; assert prometa.__version__ == '$version'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 6; assert official_mcp_transport_available(); assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
+            -c "import prometa; from prometa.runtime import RUNTIME_POSTGRES_SCHEMA_VERSION, RUNTIME_TASK_LIFECYCLE_VERSION, PostgresMcpAuditSink, PostgresMcpIdempotencyStore, PostgresRuntimeTaskStore, ReferenceRuntimeHost, check_postgres_runtime_compatibility, official_mcp_transport_available, verify_postgres_runtime_integrity; assert prometa.__version__ == '$version'; assert RUNTIME_TASK_LIFECYCLE_VERSION == 1; assert RUNTIME_POSTGRES_SCHEMA_VERSION == 7; assert official_mcp_transport_available(); assert callable(check_postgres_runtime_compatibility); assert callable(verify_postgres_runtime_integrity)"
 
       - name: Run deployment profile through fresh host containers
         run: >-
@@ -443,6 +443,13 @@ jobs:
             echo "OpenShift runtime profile accepted optional receipt credentials" >&2
             exit 1
           fi
+          if helm template openshift-optional-security-decisions "$chart" -f "$openshift" \
+            "${OPENSHIFT_ARGS[@]}" \
+            --set credentials.securityDecisionApiKeyOptional=true \
+            >/dev/null 2>&1; then
+            echo "OpenShift runtime profile accepted optional security decision credentials" >&2
+            exit 1
+          fi
           if helm template openshift-invalid-digest "$chart" -f "$openshift" \
             "${OPENSHIFT_ARGS[@]}" --set image.digest=sha256:ABC \
             >/dev/null 2>&1; then
@@ -507,6 +514,8 @@ jobs:
           grep -q 'control-plane-api-key' runtime-chart.yaml
           grep -q 'name: ORCHESTRA_RUNTIME_RECEIPT_API_KEY' runtime-chart.yaml
           grep -q 'receipt-api-key' runtime-chart.yaml
+          grep -q 'name: ORCHESTRA_SECURITY_DECISION_API_KEY' runtime-chart.yaml
+          grep -q 'security-decision-api-key' runtime-chart.yaml
           grep -q 'tenant-runtime-encrypted-backups' runtime-chart.yaml
           grep -q 'tenant-runtime-backup-database' runtime-chart.yaml
           if grep -q '^kind: Secret$' runtime-chart.yaml; then
@@ -555,6 +564,13 @@ jobs:
             --set 'extraEnv[0].name=ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY' \
             --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
             echo "chart allowed the reserved control-plane API key override" >&2
+            exit 1
+          fi
+
+          if helm template reserved-security-decision-env "$chart" -f "$example" \
+            --set 'extraEnv[0].name=ORCHESTRA_SECURITY_DECISION_API_KEY' \
+            --set 'extraEnv[0].value=shadow' >/dev/null 2>&1; then
+            echo "chart allowed the reserved security decision API key override" >&2
             exit 1
           fi
 

@@ -83,6 +83,8 @@ credentials:
   controlPlaneApiKeyOptional: true
   receiptApiKeyKey: receipt-api-key
   receiptApiKeyOptional: true
+  securityDecisionApiKeyKey: security-decision-api-key
+  securityDecisionApiKeyOptional: true
 
 service:
   type: ClusterIP

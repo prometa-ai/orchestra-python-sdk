@@ -37,6 +37,15 @@
     "timeoutSeconds": 30,
     "maxResponseBytes": 4194304
   },
+  "securityDecisionDelivery": {
+    "baseUrl": "https://orchestra.example/",
+    "apiKeyEnv": "ORCHESTRA_SECURITY_DECISION_API_KEY",
+    "timeoutSeconds": 5,
+    "pollIntervalSeconds": 2,
+    "leaseSeconds": 30,
+    "initialBackoffSeconds": 1,
+    "maxBackoffSeconds": 300
+  },
   "databaseDsnEnv": "PROMETA_RUNTIME_DATABASE_URL",
   "apiTokenEnv": "PROMETA_RUNTIME_API_TOKEN",
   "requestTimeoutSeconds": 60,

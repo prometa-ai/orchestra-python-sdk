@@ -124,6 +124,7 @@ def _start_host_process(
     environment = os.environ.copy()
     environment.update(
         {
+            "PYTHONPATH": str(ROOT),
             "RECOVERY_DATABASE_DSN": dsn,
             "RECOVERY_TENANT_ID": tenant_id,
             "RECOVERY_RUNTIME_ID": runtime_id,
@@ -253,6 +254,7 @@ def _cleanup_tenant(dsn: str, tenant_id: str) -> None:
         "prometa_runtime_task",
         "prometa_runtime_request_state",
         "prometa_runtime_receipt_outbox",
+        "prometa_runtime_security_decision_outbox",
         "prometa_runtime_release_cache",
         "prometa_runtime_release_activation",
         "prometa_runtime_bundle_identity",

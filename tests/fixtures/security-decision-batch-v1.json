@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "batchId": "cross-plane-security-batch-v1",
+  "decisions": [
+    {
+      "decisionId": "cross-plane-security-decision-v1",
+      "eventAt": "2026-07-28T10:00:00.000Z",
+      "agentId": "agent-cross-plane",
+      "solutionId": "solution-cross-plane",
+      "traceId": "request-cross-plane",
+      "environment": "staging",
+      "releaseId": "release-cross-plane",
+      "deploymentId": "deployment-cross-plane",
+      "surface": "tool_request",
+      "enforcementMode": "enforce",
+      "recommendedAction": "mask",
+      "appliedAction": "mask",
+      "reviewRequired": false,
+      "severity": "high",
+      "category": "secret_exposure",
+      "subcategory": "api_key",
+      "policy": {
+        "id": "secret-policy",
+        "version": "7",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "detector": {
+        "kind": "rules+classifier",
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "explanation": {
+        "summary": "Credential-like value detected.",
+        "reasonCodes": ["credential_pattern"],
+        "signals": [
+          {
+            "kind": "regex",
+            "score": 1.0
+          }
+        ],
+        "signalAgreement": "single",
+        "evidenceRefs": ["trace:request-cross-plane"],
+        "contentFragmentDigests": [
+          "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "counterfactual": "A non-secret identifier would be allowed.",
+        "actionRationale": "Masked before the tenant tool received it."
+      },
+      "confidence": {
+        "score": 0.96,
+        "band": "high"
+      },
+      "campaignId": "campaign-cross-plane",
+      "campaignRunId": "campaign-run-cross-plane",
+      "probeId": "probe-cross-plane"
+    }
+  ]
+}

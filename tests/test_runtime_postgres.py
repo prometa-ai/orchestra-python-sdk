@@ -29,6 +29,7 @@ from prometa.runtime import (
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
+    PostgresSecurityDecisionOutbox,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
     RuntimeReleaseHandoff,
@@ -38,6 +39,9 @@ from prometa.runtime import (
     RuntimeTaskError,
     RuntimeTool,
     ToolInvocationRequest,
+    SecurityGuardAssessment,
+    SecuritySignal,
+    build_security_decision,
     build_runtime_receipt,
     canonical_payload_digest,
     check_postgres_runtime_compatibility,
@@ -135,6 +139,41 @@ def _mcp_tool_request(*, request_id="request-postgres", call_id="call-postgres")
         granted_scopes=("orders.write",),
         approval_references=("review-postgres",),
     )
+
+
+def _security_decision(*, decision_id=None):
+    decision = build_security_decision(
+        request_id="request-security-postgres",
+        agent_id="agent-postgres",
+        environment="prod",
+        release_id="release-postgres",
+        deployment_id="deployment-postgres",
+        surface="tool_request",
+        policy_id="secret-policy",
+        policy_version="7",
+        policy_digest="sha256:" + "a" * 64,
+        enforcement_mode="enforce",
+        recommended_action="mask",
+        applied_action="mask",
+        review_required=False,
+        assessment=SecurityGuardAssessment(
+            guardrail_name="Secret policy",
+            violated=True,
+            confidence_score=0.96,
+            severity="high",
+            category="secret_exposure",
+            detector_kind="rules",
+            detector_digest="sha256:" + "b" * 64,
+            summary="Credential-like value detected.",
+            reason_codes=("credential_pattern",),
+            signals=(SecuritySignal(kind="regex", score=1.0),),
+            counterfactual="A non-secret identifier would be allowed.",
+            action_rationale="Masked before the tool received it.",
+        ),
+    )
+    if decision_id is not None:
+        decision["decisionId"] = decision_id
+    return decision
 
 
 class _StaticCursor:
@@ -284,6 +323,16 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert caught.value.code == "receipt_outbox_unavailable"
     assert "password" not in str(caught.value)
 
+    security_outbox = PostgresSecurityDecisionOutbox(
+        "postgresql://secret:password@db.example/runtime",
+        tenant_id="tenant-1",
+        connect=_unavailable,
+    )
+    with pytest.raises(RuntimePersistenceError) as caught:
+        security_outbox.enqueue(_security_decision())
+    assert caught.value.code == "security_decision_outbox_unavailable"
+    assert "password" not in str(caught.value)
+
     cache = PostgresRuntimeReleaseCache(
         "postgresql://secret:password@db.example/runtime",
         tenant_id="tenant-1",
@@ -363,12 +412,12 @@ def test_postgres_adapters_validate_inputs_before_connecting() -> None:
     assert caught.value.code == "runtime_schema_uninitialized"
 
     with pytest.raises(RuntimePersistenceError) as caught:
-        check_postgres_runtime_compatibility(
-            "postgresql://unused",
-            connect=lambda dsn: _CompatibilityConnection(
-                (1, 2, 3, 4, 5, 6),
-                ("prometa_runtime_schema_migrations",),
-            ),
+            check_postgres_runtime_compatibility(
+                "postgresql://unused",
+                connect=lambda dsn: _CompatibilityConnection(
+                    (1, 2, 3, 4, 5, 6, 7),
+                    ("prometa_runtime_schema_migrations",),
+                ),
         )
     assert caught.value.code == "runtime_schema_incompatible"
 
@@ -633,6 +682,39 @@ def test_postgres_replay_and_state_are_shared_across_replicas() -> None:
     assert dead_letter_lease is not None
     first_outbox.mark_dead_letter(dead_letter_lease, error_code="http_403")
     assert second_outbox.claim_next(30) is None
+
+    first_security_outbox = PostgresSecurityDecisionOutbox(
+        dsn, tenant_id=tenant_id
+    )
+    second_security_outbox = PostgresSecurityDecisionOutbox(
+        dsn, tenant_id=tenant_id
+    )
+    decision_one = _security_decision(decision_id="decision-postgres-1")
+    decision_two = _security_decision(decision_id="decision-postgres-2")
+    assert first_security_outbox.enqueue(decision_one) is True
+    assert second_security_outbox.enqueue(decision_one) is False
+    assert first_security_outbox.enqueue(decision_two) is True
+    security_lease = first_security_outbox.claim_batch(30)
+    assert security_lease is not None
+    assert set(security_lease.decision_ids) == {
+        "decision-postgres-1",
+        "decision-postgres-2",
+    }
+    assert second_security_outbox.claim_batch(30) is None
+    first_security_outbox.reschedule(
+        security_lease,
+        delay_seconds=0,
+        error_code="transport",
+    )
+    security_retry = second_security_outbox.claim_batch(30)
+    assert security_retry is not None
+    assert security_retry.attempts == 2
+    with pytest.raises(RuntimePersistenceError) as caught:
+        first_security_outbox.mark_delivered(security_lease)
+    assert caught.value.code == "security_decision_outbox_lease_lost"
+    second_security_outbox.mark_delivered(security_retry)
+    assert first_security_outbox.claim_batch(30) is None
+
     with pytest.raises(RuntimePersistenceError) as caught:
         activations.activate_or_join(
             **{
@@ -1073,7 +1155,7 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
     try:
         report = verify_postgres_runtime_integrity(dsn)
         assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-        assert report.migration_versions == (1, 2, 3, 4, 5, 6)
+        assert report.migration_versions == (1, 2, 3, 4, 5, 6, 7)
         assert report.table_counts["prometa_runtime_task"] >= 1
         assert report.table_counts["prometa_runtime_task_event"] >= 2
         assert "private input" not in repr(report)
@@ -1083,7 +1165,7 @@ def test_postgres_restore_integrity_verifier_is_payload_free_and_fail_closed(
         assert postgres_verify_main(["--dsn-env", "RUNTIME_VERIFY_DSN"]) == 0
         output = json.loads(capsys.readouterr().out)
         assert output["integrity"] == "verified"
-        assert output["schemaVersion"] == 6
+        assert output["schemaVersion"] == 7
         assert "private" not in repr(output)
 
         with psycopg.connect(dsn) as connection:
@@ -1122,7 +1204,7 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     install_postgres_runtime_schema(dsn)
     report = check_postgres_runtime_compatibility(dsn)
     assert report.schema_version == RUNTIME_POSTGRES_SCHEMA_VERSION
-    assert report.migration_versions == (1, 2, 3, 4, 5, 6)
+    assert report.migration_versions == (1, 2, 3, 4, 5, 6, 7)
     assert report.minimum_schema_version == RUNTIME_POSTGRES_MIN_SCHEMA_VERSION
     assert report.maximum_schema_version == RUNTIME_POSTGRES_MAX_SCHEMA_VERSION
     assert report.as_dict()["compatibilityVersion"] == (
@@ -1140,10 +1222,10 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     assert output == {
         "compatibility": "compatible",
         "compatibilityVersion": 1,
-        "maximumSchemaVersion": 6,
-        "migrationVersions": [1, 2, 3, 4, 5, 6],
-        "minimumSchemaVersion": 6,
-        "schemaVersion": 6,
+        "maximumSchemaVersion": 7,
+        "migrationVersions": [1, 2, 3, 4, 5, 6, 7],
+        "minimumSchemaVersion": 7,
+        "schemaVersion": 7,
     }
 
     def expect_code(code: str) -> None:
@@ -1154,25 +1236,25 @@ def test_postgres_compatibility_contract_is_payload_free_and_fail_closed(
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (7)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (8)"
             )
         expect_code("runtime_schema_too_new")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 7"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 8"
             )
 
     try:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 6"
+                "DELETE FROM prometa_runtime_schema_migrations WHERE version = 7"
             )
         expect_code("runtime_schema_too_old")
     finally:
         with psycopg.connect(dsn) as connection:
             connection.execute(
-                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (6)"
+                "INSERT INTO prometa_runtime_schema_migrations (version) VALUES (7)"
             )
 
     try:

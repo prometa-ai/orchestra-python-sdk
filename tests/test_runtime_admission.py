@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from prometa.runtime import (
     CAPABILITY_GUARD_EVALUATE,
     CAPABILITY_HUMAN_ESCALATION,
     CAPABILITY_SCHEMA_VALIDATE,
+    CAPABILITY_SECURITY_DECISION_EMIT,
     CAPABILITY_TOOL_BROKER,
     BundleTrustEntry,
     BundleTrustStore,
@@ -135,6 +137,62 @@ def _public_key_base64(private_key) -> str:
     return base64.b64encode(der).decode("ascii")
 
 
+def _canonical_digest(value) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _add_security_guardrail(content, *, complete=True) -> None:
+    guardrail = {
+        "name": "Prompt defense",
+        "guardrailType": "input-filter",
+        "onViolation": "block",
+        "appliesTo": "all",
+        "enforcementMode": "review",
+        "reviewThreshold": 0.6,
+        "enforceThreshold": 0.9,
+        "decisionAction": "deny",
+    }
+    if not complete:
+        guardrail.pop("enforceThreshold")
+    content["guardrails"] = [guardrail]
+    contract = content["runtimeContract"]
+    contract["requiredCapabilities"] = sorted(
+        {
+            *contract["requiredCapabilities"],
+            CAPABILITY_GUARD_EVALUATE,
+            CAPABILITY_SECURITY_DECISION_EMIT,
+        }
+    )
+    contract["capabilityRequirements"] = sorted(
+        [
+            *contract["capabilityRequirements"],
+            {"name": "guard.evaluate", "minVersion": 1, "maxVersion": 1},
+            {
+                "name": "security.decision.emit",
+                "minVersion": 1,
+                "maxVersion": 1,
+            },
+        ],
+        key=lambda value: value["name"],
+    )
+    contract["policyDigest"] = _canonical_digest(
+        {
+            "guardrails": content["guardrails"],
+            "identity": content.get("identity"),
+            "tools": [],
+            "requiredScopes": content.get("requiredScopes", []),
+            "grantedScopes": content.get("grantedScopes", []),
+        }
+    )
+
+
 def test_signed_and_promoted_runtime_contract_admits_atomically(vector) -> None:
     replay = InMemoryAdmissionReplayStore()
     admitted = _admit(vector, replay_store=replay)
@@ -148,6 +206,47 @@ def test_signed_and_promoted_runtime_contract_admits_atomically(vector) -> None:
     _assert_code(
         "replayed_runtime_release",
         lambda: _admit(vector, replay_store=replay),
+    )
+
+
+def test_security_assurance_guardrail_contract_is_strict_and_typed(
+    vector_v2,
+) -> None:
+    verified = _mutated_verified(
+        vector_v2,
+        lambda content: _add_security_guardrail(content),
+    )
+    config = parse_runtime_bundle(
+        verified,
+        supported_capabilities={
+            *BASE_RUNTIME_CAPABILITIES,
+            CAPABILITY_SCHEMA_VALIDATE,
+            CAPABILITY_GUARD_EVALUATE,
+            CAPABILITY_SECURITY_DECISION_EMIT,
+        },
+    )
+    guardrail = config.guardrails[0]
+    assert guardrail.enforcement_mode == "review"
+    assert guardrail.review_threshold == 0.6
+    assert guardrail.enforce_threshold == 0.9
+    assert guardrail.decision_action == "deny"
+    assert guardrail.security_assurance_enabled is True
+
+    incomplete = _mutated_verified(
+        vector_v2,
+        lambda content: _add_security_guardrail(content, complete=False),
+    )
+    _assert_code(
+        "incomplete_security_assurance_guardrail",
+        lambda: parse_runtime_bundle(
+            incomplete,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+                CAPABILITY_GUARD_EVALUATE,
+                CAPABILITY_SECURITY_DECISION_EMIT,
+            },
+        ),
     )
 
 

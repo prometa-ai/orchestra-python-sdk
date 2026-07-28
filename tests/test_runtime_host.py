@@ -41,6 +41,7 @@ from prometa.runtime import (
     RuntimeAdmissionPolicy,
     RuntimeActivationResult,
     RuntimeEvidenceEvent,
+    RuntimeExecutionResult,
     RuntimeHostError,
     RuntimeHostConfig,
     RuntimeKernel,
@@ -175,6 +176,74 @@ def _execute(host, payload, *, token=API_TOKEN, content_type="application/json")
         },
         json.dumps(payload).encode("utf-8"),
     )
+
+
+def test_reference_host_propagates_bounded_security_campaign_headers() -> None:
+    host = _host(RecordingModelAdapter({"answer": "unused"}))
+
+    class CapturingRunner:
+        def __init__(self):
+            self.correlation = None
+
+        def execute(
+            self,
+            payload,
+            request_id,
+            timeout_seconds,
+            security_correlation=None,
+        ):
+            self.correlation = security_correlation
+            return RuntimeExecutionResult(
+                request_id=request_id,
+                output={"answer": "safe"},
+                model_name="test-model",
+                attempts=1,
+                tool_calls=0,
+                used_fallback=False,
+            )
+
+        def close(self):
+            return None
+
+    host._runner.close()
+    runner = CapturingRunner()
+    host._runner = runner
+    try:
+        response = host.handle(
+            "POST",
+            "/v1/runtime/execute",
+            {
+                "authorization": "Bearer %s" % API_TOKEN,
+                "content-type": "application/json",
+                "x-prometa-campaign-id": "campaign-1",
+                "x-prometa-campaign-run-id": "run-1",
+                "x-prometa-probe-id": "probe-1",
+            },
+            json.dumps(
+                {"requestId": "request-campaign", "input": {"question": "x"}}
+            ).encode("utf-8"),
+        )
+        assert response.status == 200
+        assert runner.correlation.campaign_id == "campaign-1"
+        assert runner.correlation.campaign_run_id == "run-1"
+        assert runner.correlation.probe_id == "probe-1"
+
+        invalid = host.handle(
+            "POST",
+            "/v1/runtime/execute",
+            {
+                "authorization": "Bearer %s" % API_TOKEN,
+                "content-type": "application/json",
+                "x-prometa-campaign-id": "contains spaces",
+            },
+            json.dumps(
+                {"requestId": "request-invalid", "input": {"question": "x"}}
+            ).encode("utf-8"),
+        )
+        assert invalid.status == 400
+        assert invalid.body["error"]["code"] == "invalid_campaign_id"
+    finally:
+        host.close()
 
 
 def test_reference_host_health_auth_schema_and_success_contract() -> None:
@@ -747,6 +816,7 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     assert config.database_dsn_env == "PROMETA_RUNTIME_DATABASE_URL"
     assert config.api_token_env == "PROMETA_RUNTIME_API_TOKEN"
     assert config.receipt_base_url is None
+    assert config.security_decision_base_url is None
     assert config.control_plane_base_url is None
     assert config.task_recovery_enabled is False
 
@@ -783,6 +853,28 @@ def test_host_config_is_strict_bounded_and_keeps_secrets_in_environment(
     )
     assert receipt_config.receipt_timeout_seconds == 3
     assert receipt_config.receipt_lease_seconds == 10
+
+    configured["securityDecisionDelivery"] = {
+        "baseUrl": "https://orchestra.example.test/control",
+        "apiKeyEnv": "ORCHESTRA_SECURITY_DECISION_API_KEY",
+        "timeoutSeconds": 3,
+        "pollIntervalSeconds": 1,
+        "leaseSeconds": 10,
+        "initialBackoffSeconds": 2,
+        "maxBackoffSeconds": 20,
+    }
+    path.write_text(json.dumps(configured), encoding="utf-8")
+    security_config = load_runtime_host_config(path)
+    assert (
+        security_config.security_decision_base_url
+        == "https://orchestra.example.test/control"
+    )
+    assert (
+        security_config.security_decision_api_key_env
+        == "ORCHESTRA_SECURITY_DECISION_API_KEY"
+    )
+    assert security_config.security_decision_timeout_seconds == 3
+    assert security_config.security_decision_lease_seconds == 10
 
     pulled = _config_document()
     pulled.pop("bundle")

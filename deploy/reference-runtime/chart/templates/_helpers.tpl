@@ -81,7 +81,7 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if hasKey .Values.podAnnotations "prometa.io/server-tls-rollout-id" -}}
 {{- fail "podAnnotations cannot override prometa.io/server-tls-rollout-id" -}}
 {{- end -}}
-{{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.controlPlaneApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) -}}
+{{- if or (empty .Values.credentials.databaseUrlKey) (empty .Values.credentials.apiTokenKey) (empty .Values.credentials.modelGatewayApiKeyKey) (empty .Values.credentials.controlPlaneApiKeyKey) (empty .Values.credentials.receiptApiKeyKey) (empty .Values.credentials.securityDecisionApiKeyKey) -}}
 {{- fail "all credentials key names must be non-empty" -}}
 {{- end -}}
 {{- if and (or .Values.migration.enabled .Values.migration.compatibilityCheck) (empty .Values.migration.serviceAccountName) -}}
@@ -173,8 +173,8 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if or (empty .Values.runtimeConfig.existingSecret) (not (empty .Values.runtimeConfig.existingConfigMap)) (empty .Values.runtimeConfig.rolloutId) -}}
 {{- fail "the engineering trial profile requires an immutable Secret-backed runtime config and rollout identity" -}}
 {{- end -}}
-{{- if or (empty .Values.credentials.existingSecret) .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional (not .Values.credentials.controlPlaneApiKeyOptional) -}}
-{{- fail "the engineering trial profile requires model and receipt credentials while keeping control-plane pull optional" -}}
+{{- if or (empty .Values.credentials.existingSecret) .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional .Values.credentials.securityDecisionApiKeyOptional (not .Values.credentials.controlPlaneApiKeyOptional) -}}
+{{- fail "the engineering trial profile requires model, receipt, and security-decision credentials while keeping control-plane pull optional" -}}
 {{- end -}}
 {{- if or (not .Values.serverTls.enabled) (empty .Values.serverTls.existingSecret) (empty .Values.serverTls.rolloutId) -}}
 {{- fail "the engineering trial profile requires operator-provided server TLS and rollout identity" -}}
@@ -283,15 +283,15 @@ app.kubernetes.io/part-of: orchestra-tenant-runtime
 {{- if or .Values.containerSecurityContext.allowPrivilegeEscalation (not .Values.containerSecurityContext.readOnlyRootFilesystem) (not (has "ALL" .Values.containerSecurityContext.capabilities.drop)) -}}
 {{- fail "the OpenShift runtime profile requires read-only root, no privilege escalation, and dropped capabilities" -}}
 {{- end -}}
-{{- if or .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional -}}
-{{- fail "the OpenShift runtime profile requires model-gateway and asynchronous receipt credentials" -}}
+{{- if or .Values.credentials.modelGatewayApiKeyOptional .Values.credentials.receiptApiKeyOptional .Values.credentials.securityDecisionApiKeyOptional -}}
+{{- fail "the OpenShift runtime profile requires model-gateway, asynchronous receipt, and security-decision credentials" -}}
 {{- end -}}
 {{- if or (not .Values.serverTls.enabled) (empty .Values.serverTls.rolloutId) -}}
 {{- fail "the OpenShift runtime profile requires server TLS and an explicit certificate rolloutId" -}}
 {{- end -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
-{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "PROMETA_RUNTIME_SERVER_TLS_CERT_FILE" "PROMETA_RUNTIME_SERVER_TLS_KEY_FILE" "PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE" "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE" "PROMETA_RUNTIME_PROBE_TLS_CERT_FILE" "PROMETA_RUNTIME_PROBE_TLS_KEY_FILE" "PROMETA_RUNTIME_PROBE_TLS_CA_FILE" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY" "SSL_CERT_FILE") -}}
+{{- if has .name (list "PORT" "PROMETA_RUNTIME_HOST" "PROMETA_RUNTIME_CONFIG" "PROMETA_RUNTIME_DATABASE_URL" "PROMETA_RUNTIME_API_TOKEN" "PROMETA_RUNTIME_EDGE_OVERLOAD_CONTRACT" "PROMETA_RUNTIME_SERVER_TLS_CERT_FILE" "PROMETA_RUNTIME_SERVER_TLS_KEY_FILE" "PROMETA_RUNTIME_SERVER_TLS_CLIENT_CA_FILE" "PROMETA_RUNTIME_SERVER_TLS_REQUIRE_CLIENT_CERTIFICATE" "PROMETA_RUNTIME_PROBE_TLS_CERT_FILE" "PROMETA_RUNTIME_PROBE_TLS_KEY_FILE" "PROMETA_RUNTIME_PROBE_TLS_CA_FILE" "MODEL_GATEWAY_API_KEY" "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY" "ORCHESTRA_RUNTIME_RECEIPT_API_KEY" "ORCHESTRA_SECURITY_DECISION_API_KEY" "SSL_CERT_FILE") -}}
 {{- fail (printf "extraEnv cannot override reserved variable %s" .name) -}}
 {{- end -}}
 {{- end -}}

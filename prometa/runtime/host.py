@@ -71,6 +71,7 @@ from .postgres import (
     PostgresRuntimeActivationStore,
     PostgresRuntimeReceiptOutbox,
     PostgresRuntimeReleaseCache,
+    PostgresSecurityDecisionOutbox,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
     RuntimePersistenceError,
@@ -80,6 +81,12 @@ from .receipts import (
     RuntimeReceiptClient,
     RuntimeReceiptDispatcher,
     build_runtime_receipt,
+)
+from .security_assurance import (
+    DurableSecurityDecisionEmitter,
+    SecurityDecisionClient,
+    SecurityDecisionCorrelation,
+    SecurityDecisionDispatcher,
 )
 from .tasks import (
     RUNTIME_TASK_LIFECYCLE_VERSION,
@@ -174,6 +181,13 @@ class RuntimeHostConfig:
     receipt_lease_seconds: float = 30.0
     receipt_initial_backoff_seconds: float = 1.0
     receipt_max_backoff_seconds: float = 300.0
+    security_decision_base_url: Optional[str] = None
+    security_decision_api_key_env: Optional[str] = None
+    security_decision_timeout_seconds: float = 5.0
+    security_decision_poll_interval_seconds: float = 2.0
+    security_decision_lease_seconds: float = 30.0
+    security_decision_initial_backoff_seconds: float = 1.0
+    security_decision_max_backoff_seconds: float = 300.0
     task_recovery_enabled: bool = False
     task_recovery_lease_seconds: float = 90.0
     task_recovery_max_attempts: int = 3
@@ -714,6 +728,7 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "promotionAttestation",
             "controlPlanePull",
             "receiptDelivery",
+            "securityDecisionDelivery",
             "taskRecovery",
             "mcpBroker",
         ),
@@ -906,6 +921,75 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             raise RuntimeHostError("receipt_lease_too_short")
         if receipt_max_backoff_seconds < receipt_initial_backoff_seconds:
             raise RuntimeHostError("receipt_backoff_invalid")
+    security_decision_base_url = None
+    security_decision_api_key_env = None
+    security_decision_timeout_seconds = 5.0
+    security_decision_poll_interval_seconds = 2.0
+    security_decision_lease_seconds = 30.0
+    security_decision_initial_backoff_seconds = 1.0
+    security_decision_max_backoff_seconds = 300.0
+    if document.get("securityDecisionDelivery") is not None:
+        security = _mapping(
+            document["securityDecisionDelivery"],
+            "security_decision_delivery_config_invalid",
+        )
+        _exact_keys(
+            security,
+            required=("baseUrl", "apiKeyEnv"),
+            optional=(
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "pollIntervalSeconds",
+                "leaseSeconds",
+                "initialBackoffSeconds",
+                "maxBackoffSeconds",
+            ),
+            code="security_decision_delivery_config_invalid",
+        )
+        allow_insecure_http = _boolean(
+            "security_decision_allow_insecure_http",
+            security.get("allowInsecureHttp", False),
+        )
+        security_decision_base_url = _service_base_url(
+            "security_decision",
+            security["baseUrl"],
+            allow_insecure_http,
+        )
+        security_decision_api_key_env = _environment_name(
+            "security_decision_api_key_env", security["apiKeyEnv"]
+        )
+        security_decision_timeout_seconds = _positive_number(
+            "security_decision_timeout_seconds",
+            security.get("timeoutSeconds", 5),
+            60,
+        )
+        security_decision_poll_interval_seconds = _positive_number(
+            "security_decision_poll_interval_seconds",
+            security.get("pollIntervalSeconds", 2),
+            300,
+        )
+        security_decision_lease_seconds = _positive_number(
+            "security_decision_lease_seconds",
+            security.get("leaseSeconds", 30),
+            3600,
+        )
+        security_decision_initial_backoff_seconds = _positive_number(
+            "security_decision_initial_backoff_seconds",
+            security.get("initialBackoffSeconds", 1),
+            3600,
+        )
+        security_decision_max_backoff_seconds = _positive_number(
+            "security_decision_max_backoff_seconds",
+            security.get("maxBackoffSeconds", 300),
+            86_400,
+        )
+        if security_decision_lease_seconds <= security_decision_timeout_seconds:
+            raise RuntimeHostError("security_decision_lease_too_short")
+        if (
+            security_decision_max_backoff_seconds
+            < security_decision_initial_backoff_seconds
+        ):
+            raise RuntimeHostError("security_decision_backoff_invalid")
     return RuntimeHostConfig(
         tenant_id=_identifier("tenant_id", document["tenantId"]),
         runtime_id=_identifier("runtime_id", document["runtimeId"]),
@@ -981,6 +1065,19 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
         receipt_lease_seconds=receipt_lease_seconds,
         receipt_initial_backoff_seconds=receipt_initial_backoff_seconds,
         receipt_max_backoff_seconds=receipt_max_backoff_seconds,
+        security_decision_base_url=security_decision_base_url,
+        security_decision_api_key_env=security_decision_api_key_env,
+        security_decision_timeout_seconds=security_decision_timeout_seconds,
+        security_decision_poll_interval_seconds=(
+            security_decision_poll_interval_seconds
+        ),
+        security_decision_lease_seconds=security_decision_lease_seconds,
+        security_decision_initial_backoff_seconds=(
+            security_decision_initial_backoff_seconds
+        ),
+        security_decision_max_backoff_seconds=(
+            security_decision_max_backoff_seconds
+        ),
         task_recovery_enabled=task_recovery_enabled,
         task_recovery_lease_seconds=task_recovery_lease_seconds,
         task_recovery_max_attempts=task_recovery_max_attempts,
@@ -1042,12 +1139,20 @@ class _KernelLoop:
         self._loop.close()
 
     def execute(
-        self, payload: Any, request_id: str, timeout_seconds: float
+        self,
+        payload: Any,
+        request_id: str,
+        timeout_seconds: float,
+        security_correlation: Optional[SecurityDecisionCorrelation] = None,
     ) -> RuntimeExecutionResult:
         if self._closed:
             raise RuntimeHostError("runtime_host_stopped")
         future = asyncio.run_coroutine_threadsafe(
-            self._kernel.execute(payload, request_id=request_id),
+            self._kernel.execute(
+                payload,
+                request_id=request_id,
+                security_correlation=security_correlation,
+            ),
             self._loop,
         )
         try:
@@ -1077,6 +1182,9 @@ class ReferenceRuntimeHost:
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         receipt_dispatcher: Optional[RuntimeReceiptDispatcher] = None,
+        security_decision_dispatcher: Optional[
+            SecurityDecisionDispatcher
+        ] = None,
         release_source: str = "embedded",
         task_store: Optional[RuntimeTaskStore] = None,
         task_lease_seconds: float = 90.0,
@@ -1097,6 +1205,7 @@ class ReferenceRuntimeHost:
         self._inflight_condition = threading.Condition()
         self._closing = False
         self._receipt_dispatcher = receipt_dispatcher
+        self._security_decision_dispatcher = security_decision_dispatcher
         if release_source not in {"embedded", "control_plane", "cache"}:
             raise RuntimeHostError("release_source_invalid")
         self.release_source = release_source
@@ -1305,6 +1414,46 @@ class ReferenceRuntimeHost:
                 code="request_invalid",
             )
             request_id = _identifier("request_id", request["requestId"], 256)
+            campaign_values = {
+                "campaign_id": normalized_headers.get(
+                    "x-prometa-campaign-id"
+                ),
+                "campaign_run_id": normalized_headers.get(
+                    "x-prometa-campaign-run-id"
+                ),
+                "probe_id": normalized_headers.get("x-prometa-probe-id"),
+            }
+            correlation = None
+            if any(value is not None for value in campaign_values.values()):
+                correlation = SecurityDecisionCorrelation(
+                    campaign_id=(
+                        _identifier(
+                            "campaign_id",
+                            campaign_values["campaign_id"],
+                            200,
+                        )
+                        if campaign_values["campaign_id"] is not None
+                        else None
+                    ),
+                    campaign_run_id=(
+                        _identifier(
+                            "campaign_run_id",
+                            campaign_values["campaign_run_id"],
+                            200,
+                        )
+                        if campaign_values["campaign_run_id"] is not None
+                        else None
+                    ),
+                    probe_id=(
+                        _identifier(
+                            "probe_id",
+                            campaign_values["probe_id"],
+                            200,
+                        )
+                        if campaign_values["probe_id"] is not None
+                        else None
+                    ),
+                )
         except RuntimeHostError as exc:
             return self._error(400, exc.code)
         with self._inflight_condition:
@@ -1323,7 +1472,10 @@ class ReferenceRuntimeHost:
             if claim is not None:
                 self.kernel.emit_task_claim(claim)
             result = self._runner.execute(
-                request["input"], request_id, self.request_timeout_seconds
+                request["input"],
+                request_id,
+                self.request_timeout_seconds,
+                security_correlation=correlation,
             )
         except (RuntimePersistenceError, RuntimeTaskError) as exc:
             failure = self._task_error(exc)
@@ -1418,8 +1570,12 @@ class ReferenceRuntimeHost:
         try:
             self._runner.close()
         finally:
-            if self._receipt_dispatcher is not None:
-                self._receipt_dispatcher.close()
+            try:
+                if self._receipt_dispatcher is not None:
+                    self._receipt_dispatcher.close()
+            finally:
+                if self._security_decision_dispatcher is not None:
+                    self._security_decision_dispatcher.close()
         if not drained:
             raise RuntimeHostError("runtime_shutdown_timeout")
 
@@ -1654,6 +1810,20 @@ def build_reference_runtime_host(
             raise RuntimeHostError("receipt_api_key_missing")
         if config.receipt_lease_seconds <= config.receipt_timeout_seconds:
             raise RuntimeHostError("receipt_lease_too_short")
+    security_decision_api_key = None
+    if config.security_decision_base_url is not None:
+        if config.security_decision_api_key_env is None:
+            raise RuntimeHostError("security_decision_api_key_env_missing")
+        security_decision_api_key = env.get(
+            config.security_decision_api_key_env, ""
+        )
+        if not security_decision_api_key:
+            raise RuntimeHostError("security_decision_api_key_missing")
+        if (
+            config.security_decision_lease_seconds
+            <= config.security_decision_timeout_seconds
+        ):
+            raise RuntimeHostError("security_decision_lease_too_short")
     model_api_key = None
     if config.model_gateway_api_key_env is not None:
         model_api_key = env.get(config.model_gateway_api_key_env, "")
@@ -1706,6 +1876,72 @@ def build_reference_runtime_host(
         dsn=dsn,
         now=admission_now,
     )
+    emitter = evidence_emitter or JsonLineEvidenceEmitter()
+    security_decision_outbox = None
+    security_decision_dispatcher = None
+    security_decision_emitter = None
+    if (
+        config.security_decision_base_url is not None
+        and security_decision_api_key is not None
+    ):
+        security_decision_outbox = PostgresSecurityDecisionOutbox(
+            dsn,
+            tenant_id=config.tenant_id,
+        )
+
+        def security_decision_status(
+            outcome: str, details: Mapping[str, str]
+        ) -> None:
+            attributes = {
+                "prometa.runtime.id": config.runtime_id,
+                "prometa.runtime.version": config.runtime_version,
+                "prometa.release.id": config.release_id,
+                "prometa.deployment.id": config.deployment_id,
+                "prometa.environment": config.environment,
+                "prometa.security.batch_id": details["batchId"],
+                "prometa.security.decision_count": details["decisionCount"],
+            }
+            if "errorCode" in details:
+                attributes["prometa.security.error_code"] = details[
+                    "errorCode"
+                ]
+            emitter.emit(
+                RuntimeEvidenceEvent(
+                    name="runtime.security_decision.delivery",
+                    outcome=outcome,
+                    occurred_at=datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    attributes=attributes,
+                )
+            )
+
+        security_decision_dispatcher = SecurityDecisionDispatcher(
+            security_decision_outbox,
+            SecurityDecisionClient(
+                config.security_decision_base_url,
+                security_decision_api_key,
+                timeout=config.security_decision_timeout_seconds,
+            ),
+            poll_interval_seconds=(
+                config.security_decision_poll_interval_seconds
+            ),
+            lease_seconds=config.security_decision_lease_seconds,
+            initial_backoff_seconds=(
+                config.security_decision_initial_backoff_seconds
+            ),
+            max_backoff_seconds=(
+                config.security_decision_max_backoff_seconds
+            ),
+            shutdown_timeout_seconds=min(
+                300, config.security_decision_timeout_seconds + 2
+            ),
+            on_status=security_decision_status,
+        )
+        security_decision_emitter = DurableSecurityDecisionEmitter(
+            security_decision_outbox,
+            security_decision_dispatcher,
+        )
     policy = RuntimeAdmissionPolicy(
         expected_org_id=config.org_id,
         expected_environment=config.environment,
@@ -1714,6 +1950,7 @@ def build_reference_runtime_host(
         expected_runtime=config.runtime_target,
         supported_capabilities=available_runtime_capabilities(
             guard_evaluator=guard_evaluator,
+            security_decision_emitter=security_decision_emitter,
             tool_broker=tool_broker,
             human_escalation=human_escalation,
         ),
@@ -1736,7 +1973,6 @@ def build_reference_runtime_host(
         if material.cache is None:
             raise RuntimeHostError("control_plane_cache_unavailable")
         material.cache.save(material.pulled_handoff)
-    emitter = evidence_emitter or JsonLineEvidenceEmitter()
     receipt_outbox = None
     receipt_dispatcher = None
     if config.receipt_base_url is not None and receipt_api_key is not None:
@@ -1804,6 +2040,7 @@ def build_reference_runtime_host(
             overload_contract_id=overload_contract or None,
         ),
         guard_evaluator=guard_evaluator,
+        security_decision_emitter=security_decision_emitter,
         tool_broker=tool_broker,
         human_escalation=human_escalation,
         state_store=PostgresRuntimeStateStore(
@@ -1833,6 +2070,7 @@ def build_reference_runtime_host(
         request_timeout_seconds=config.request_timeout_seconds,
         max_request_bytes=config.max_request_bytes,
         receipt_dispatcher=receipt_dispatcher,
+        security_decision_dispatcher=security_decision_dispatcher,
         release_source=material.source,
         task_store=(
             PostgresRuntimeTaskStore(
@@ -1893,6 +2131,9 @@ def build_reference_runtime_host(
             raise
         receipt_dispatcher.start()
         receipt_dispatcher.wake()
+    if security_decision_dispatcher is not None:
+        security_decision_dispatcher.start()
+        security_decision_dispatcher.wake()
     return host, activation.created
 
 

@@ -434,7 +434,7 @@ newer, or structurally incompatible schema before the host activates a release.
 The installer remains the separate mutating step.
 
 `prometa-runtime-postgres-verify` is a payload-free pre-cutover check for a
-newly restored database. It requires exact migrations through schema v6,
+newly restored database. It requires exact migrations through schema v7,
 required task/event and MCP columns, valid lease and terminal projections,
 complete ordered task history, and payload-free MCP audit records. Its JSON
 output contains only schema versions and table counts. Logical backup/restore
@@ -551,6 +551,22 @@ does not change readiness or request behavior. Replica leases prevent duplicate
 workers, deterministic receipt IDs preserve idempotency across restarts, and
 permanent rejections are dead-lettered with sanitized evidence.
 
+Guarded runtime-contract v2 releases additionally require
+`security.decision.emit.v1`. Configure `securityDecisionDelivery` with a
+machine key limited to `security-decisions:write`; otherwise admission fails
+before the host serves traffic. The kernel honors signed `observe`, `review`,
+and `enforce` modes plus review/enforcement thresholds locally, persists the
+strict content-minimized `prometa.security-decision.v1` evidence in tenant
+PostgreSQL, and sends batches of at most 500 decisions/1 MiB from a background
+dispatcher. Prometa is never consulted to take or resume an action.
+
+Security campaigns may pass `X-Prometa-Campaign-Id`,
+`X-Prometa-Campaign-Run-Id`, and `X-Prometa-Probe-Id` to
+`POST /v1/runtime/execute`. The host validates them as bounded identifiers and
+copies only those correlation IDs into emitted decisions; prompts, completions,
+messages, tool arguments, and credentials are rejected by the decision
+contract.
+
 Optional `controlPlanePull` configuration replaces the embedded `bundle` and
 `promotionAttestation` fields with an attestation ID selected by tenant CI/CD.
 The host calls the API only during bootstrap with a narrow `runtime:read` key,
@@ -603,7 +619,7 @@ backup/restore assets, strict configuration shape, and operator commands live in
 The release-bound chart runs the target image's compatibility check after
 migration and before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
 tenant-selected immutable config revisions explicit. The CI drill uses a real
-schema-v2 source baseline, upgrades to schema v6 and bundle B, then starts the
+schema-v2 source baseline, upgrades to schema v7 and bundle B, then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
 published-version certification claim. A separate manual release-channel drill

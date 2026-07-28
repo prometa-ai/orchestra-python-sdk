@@ -46,6 +46,8 @@ credentials:
   controlPlaneApiKeyOptional: true
   receiptApiKeyKey: receipt-api-key
   receiptApiKeyOptional: false
+  securityDecisionApiKeyKey: security-decision-api-key
+  securityDecisionApiKeyOptional: false
 
 serviceAccount:
   create: true

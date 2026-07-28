@@ -22,6 +22,11 @@ from .admission import RuntimeActivationResult
 from .control_plane import RuntimeReleaseHandoff
 from .mcp import McpAuditEvent, McpIdempotencyRecord
 from .receipts import RuntimeReceiptOutboxItem
+from .security_assurance import (
+    MAX_SECURITY_DECISION_BODY_BYTES,
+    SecurityDecisionOutboxItem,
+    validate_security_decision,
+)
 from .tasks import (
     RuntimeTaskClaim,
     RuntimeTaskError,
@@ -41,6 +46,7 @@ from .tasks import (
 _MAX_IDENTIFIER_LENGTH = 128
 _MAX_STATE_BYTES = 1_048_576
 _MAX_RECEIPT_BYTES = 64 * 1024
+_MAX_SECURITY_DECISION_BYTES = 64 * 1024
 _MAX_RELEASE_DOCUMENT_BYTES = 12 * 1024 * 1024
 _MAX_MCP_AUDIT_BYTES = 128 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -56,9 +62,9 @@ _RECEIPT_SEQUENCE = {
     "failed": 70,
     "stopped": 80,
 }
-RUNTIME_POSTGRES_SCHEMA_VERSION = 6
+RUNTIME_POSTGRES_SCHEMA_VERSION = 7
 RUNTIME_POSTGRES_COMPATIBILITY_VERSION = 1
-RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 6
+RUNTIME_POSTGRES_MIN_SCHEMA_VERSION = 7
 RUNTIME_POSTGRES_MAX_SCHEMA_VERSION = RUNTIME_POSTGRES_SCHEMA_VERSION
 _RUNTIME_TABLES = (
     "prometa_runtime_schema_migrations",
@@ -67,6 +73,7 @@ _RUNTIME_TABLES = (
     "prometa_runtime_release_activation",
     "prometa_runtime_bundle_identity",
     "prometa_runtime_receipt_outbox",
+    "prometa_runtime_security_decision_outbox",
     "prometa_runtime_release_cache",
     "prometa_runtime_task",
     "prometa_runtime_task_event",
@@ -149,7 +156,29 @@ _MCP_TABLE_COLUMNS = {
         }
     ),
 }
-_INTEGRITY_TABLE_COLUMNS = {**_TASK_TABLE_COLUMNS, **_MCP_TABLE_COLUMNS}
+_SECURITY_TABLE_COLUMNS = {
+    "prometa_runtime_security_decision_outbox": frozenset(
+        {
+            "tenant_id",
+            "decision_id",
+            "payload",
+            "status",
+            "attempts",
+            "available_at",
+            "leased_until",
+            "lease_token",
+            "last_error_code",
+            "delivered_at",
+            "created_at",
+            "updated_at",
+        }
+    )
+}
+_INTEGRITY_TABLE_COLUMNS = {
+    **_TASK_TABLE_COLUMNS,
+    **_MCP_TABLE_COLUMNS,
+    **_SECURITY_TABLE_COLUMNS,
+}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS prometa_runtime_schema_migrations (
@@ -229,6 +258,28 @@ CREATE TABLE IF NOT EXISTS prometa_runtime_receipt_outbox (
 CREATE INDEX IF NOT EXISTS prometa_runtime_receipt_outbox_pending_idx
     ON prometa_runtime_receipt_outbox (
         tenant_id, status, available_at, created_at, sequence
+    );
+
+CREATE TABLE IF NOT EXISTS prometa_runtime_security_decision_outbox (
+    tenant_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    leased_until TIMESTAMPTZ,
+    lease_token TEXT,
+    last_error_code TEXT,
+    delivered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, decision_id)
+);
+
+CREATE INDEX IF NOT EXISTS prometa_runtime_security_decision_pending_idx
+    ON prometa_runtime_security_decision_outbox (
+        tenant_id, status, available_at, created_at, decision_id
     );
 
 CREATE TABLE IF NOT EXISTS prometa_runtime_release_cache (
@@ -394,6 +445,10 @@ ON CONFLICT (version) DO NOTHING;
 INSERT INTO prometa_runtime_schema_migrations (version)
 VALUES (6)
 ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO prometa_runtime_schema_migrations (version)
+VALUES (7)
+ON CONFLICT (version) DO NOTHING;
 """
 
 
@@ -522,6 +577,25 @@ def _serialize_receipt(receipt: Mapping[str, Any]) -> tuple[str, str, int]:
     if len(encoded.encode("utf-8")) > _MAX_RECEIPT_BYTES:
         raise ValueError("receipt exceeds the 64 KiB limit")
     return receipt_id, encoded, _RECEIPT_SEQUENCE[transition]
+
+
+def _serialize_security_decision(
+    decision: Mapping[str, Any],
+) -> tuple[str, str]:
+    normalized = validate_security_decision(decision)
+    decision_id = _validate_identifier(
+        "decision_id", normalized["decisionId"], max_length=200
+    )
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    if len(encoded.encode("utf-8")) > _MAX_SECURITY_DECISION_BYTES:
+        raise ValueError("security decision exceeds the 64 KiB limit")
+    return decision_id, encoded
 
 
 def _serialize_release_document(name: str, value: Mapping[str, Any]) -> str:
@@ -943,6 +1017,25 @@ def verify_postgres_runtime_integrity(
 
                 cursor.execute(
                     """
+                    SELECT COUNT(*)
+                    FROM prometa_runtime_security_decision_outbox
+                    WHERE payload->>'decisionId' IS DISTINCT FROM decision_id
+                       OR payload ? 'prompt'
+                       OR payload ? 'completion'
+                       OR payload ? 'messages'
+                       OR payload ? 'arguments'
+                       OR payload ? 'output'
+                       OR payload ? 'credentials'
+                    """
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != 0:
+                    raise RuntimePersistenceError(
+                        "runtime_schema_integrity_failed"
+                    )
+
+                cursor.execute(
+                    """
                     SELECT
                         (SELECT COUNT(*) FROM prometa_runtime_schema_migrations),
                         (SELECT COUNT(*) FROM prometa_runtime_admission_replay),
@@ -950,6 +1043,8 @@ def verify_postgres_runtime_integrity(
                         (SELECT COUNT(*) FROM prometa_runtime_release_activation),
                         (SELECT COUNT(*) FROM prometa_runtime_bundle_identity),
                         (SELECT COUNT(*) FROM prometa_runtime_receipt_outbox),
+                        (SELECT COUNT(*) FROM
+                            prometa_runtime_security_decision_outbox),
                         (SELECT COUNT(*) FROM prometa_runtime_release_cache),
                         (SELECT COUNT(*) FROM prometa_runtime_task),
                         (SELECT COUNT(*) FROM prometa_runtime_task_event),
@@ -1337,6 +1432,254 @@ class PostgresRuntimeReceiptOutbox(_PostgresTenantStore):
 
     def mark_dead_letter(
         self, item: RuntimeReceiptOutboxItem, *, error_code: str
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="dead_letter",
+            error_code=error_code,
+        )
+
+
+class PostgresSecurityDecisionOutbox(_PostgresTenantStore):
+    """Durable leased security-decision queue shared by runtime replicas."""
+
+    def enqueue(self, decision: Mapping[str, Any]) -> bool:
+        decision_id, encoded = _serialize_security_decision(decision)
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO prometa_runtime_security_decision_outbox (
+                            tenant_id, decision_id, payload
+                        ) VALUES (%s, %s, %s::jsonb)
+                        ON CONFLICT (tenant_id, decision_id) DO NOTHING
+                        RETURNING decision_id
+                        """,
+                        (self.tenant_id, decision_id, encoded),
+                    )
+                    return cursor.fetchone() is not None
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "security_decision_outbox_unavailable"
+            ) from None
+
+    def claim_batch(
+        self,
+        lease_seconds: float,
+        maximum: int = 500,
+    ) -> Optional[SecurityDecisionOutboxItem]:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or lease_seconds <= 0
+            or lease_seconds > 3600
+        ):
+            raise ValueError("lease_seconds must be between 0 and 3600")
+        if type(maximum) is not int or maximum < 1 or maximum > 500:
+            raise ValueError("maximum must be between 1 and 500")
+        lease_token = str(uuid.uuid4())
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT decision_id, payload, attempts
+                        FROM prometa_runtime_security_decision_outbox
+                        WHERE tenant_id = %s
+                          AND status = 'pending'
+                          AND available_at <= CURRENT_TIMESTAMP
+                          AND (
+                              leased_until IS NULL
+                              OR leased_until <= CURRENT_TIMESTAMP
+                          )
+                        ORDER BY created_at, decision_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                        """,
+                        (self.tenant_id, maximum),
+                    )
+                    candidates = cursor.fetchall()
+                    selected = []
+                    encoded_size = 128
+                    for row in candidates:
+                        payload = row[1]
+                        if isinstance(payload, str):
+                            payload = json.loads(payload)
+                        normalized = validate_security_decision(payload)
+                        candidate_size = len(
+                            json.dumps(
+                                normalized,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ).encode("utf-8")
+                        ) + 2
+                        if (
+                            selected
+                            and encoded_size + candidate_size
+                            > MAX_SECURITY_DECISION_BODY_BYTES
+                        ):
+                            break
+                        encoded_size += candidate_size
+                        selected.append(
+                            (
+                                _validate_identifier(
+                                    "decision_id", row[0], max_length=200
+                                ),
+                                normalized,
+                                int(row[2]),
+                            )
+                        )
+                    if not selected:
+                        return None
+                    decision_ids = [row[0] for row in selected]
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_security_decision_outbox
+                        SET leased_until = CURRENT_TIMESTAMP
+                                + (%s * INTERVAL '1 second'),
+                            lease_token = %s,
+                            attempts = attempts + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s
+                          AND decision_id = ANY(%s)
+                          AND status = 'pending'
+                        """,
+                        (
+                            float(lease_seconds),
+                            lease_token,
+                            self.tenant_id,
+                            decision_ids,
+                        ),
+                    )
+                    if cursor.rowcount != len(decision_ids):
+                        raise RuntimePersistenceError(
+                            "security_decision_outbox_lease_lost"
+                        )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "security_decision_outbox_unavailable"
+            ) from None
+        return SecurityDecisionOutboxItem(
+            decision_ids=tuple(row[0] for row in selected),
+            decisions=tuple(row[1] for row in selected),
+            attempts=max(row[2] for row in selected) + 1,
+            lease_token=lease_token,
+        )
+
+    @staticmethod
+    def _validate_item(
+        item: SecurityDecisionOutboxItem,
+    ) -> tuple[Tuple[str, ...], str]:
+        if not isinstance(item, SecurityDecisionOutboxItem):
+            raise ValueError("item must be a SecurityDecisionOutboxItem")
+        if not item.decision_ids or len(item.decision_ids) > 500:
+            raise ValueError("item decision IDs are invalid")
+        decision_ids = tuple(
+            _validate_identifier("decision_id", value, max_length=200)
+            for value in item.decision_ids
+        )
+        if len(set(decision_ids)) != len(decision_ids):
+            raise ValueError("item decision IDs must be unique")
+        lease_token = _validate_identifier(
+            "lease_token", item.lease_token, max_length=200
+        )
+        return decision_ids, lease_token
+
+    def _complete_lease(
+        self,
+        item: SecurityDecisionOutboxItem,
+        *,
+        status: str,
+        error_code: Optional[str] = None,
+        delay_seconds: float = 0,
+    ) -> None:
+        decision_ids, lease_token = self._validate_item(item)
+        if status not in {"pending", "delivered", "dead_letter"}:
+            raise ValueError("unsupported security decision outbox status")
+        if error_code is not None and (
+            not isinstance(error_code, str)
+            or _ERROR_CODE.fullmatch(error_code) is None
+        ):
+            raise ValueError("error_code must be a bounded machine code")
+        if (
+            isinstance(delay_seconds, bool)
+            or not isinstance(delay_seconds, (int, float))
+            or delay_seconds < 0
+            or delay_seconds > 86_400
+        ):
+            raise ValueError("delay_seconds must be between 0 and 86400")
+        try:
+            with self._connect(self._dsn) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE prometa_runtime_security_decision_outbox
+                        SET status = %s,
+                            available_at = CASE
+                                WHEN %s = 'pending' THEN CURRENT_TIMESTAMP
+                                    + (%s * INTERVAL '1 second')
+                                ELSE available_at
+                            END,
+                            leased_until = NULL,
+                            lease_token = NULL,
+                            last_error_code = %s,
+                            delivered_at = CASE
+                                WHEN %s = 'delivered' THEN CURRENT_TIMESTAMP
+                                ELSE delivered_at
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE tenant_id = %s
+                          AND decision_id = ANY(%s)
+                          AND status = 'pending'
+                          AND lease_token = %s
+                        """,
+                        (
+                            status,
+                            status,
+                            float(delay_seconds),
+                            error_code,
+                            status,
+                            self.tenant_id,
+                            list(decision_ids),
+                            lease_token,
+                        ),
+                    )
+                    if cursor.rowcount != len(decision_ids):
+                        raise RuntimePersistenceError(
+                            "security_decision_outbox_lease_lost"
+                        )
+        except RuntimePersistenceError:
+            raise
+        except Exception:
+            raise RuntimePersistenceError(
+                "security_decision_outbox_unavailable"
+            ) from None
+
+    def mark_delivered(self, item: SecurityDecisionOutboxItem) -> None:
+        self._complete_lease(item, status="delivered")
+
+    def reschedule(
+        self,
+        item: SecurityDecisionOutboxItem,
+        *,
+        delay_seconds: float,
+        error_code: str,
+    ) -> None:
+        self._complete_lease(
+            item,
+            status="pending",
+            delay_seconds=delay_seconds,
+            error_code=error_code,
+        )
+
+    def mark_dead_letter(
+        self, item: SecurityDecisionOutboxItem, *, error_code: str
     ) -> None:
         self._complete_lease(
             item,
@@ -2816,6 +3159,7 @@ __all__ = [
     "PostgresAdmissionReplayStore",
     "PostgresRuntimeActivationStore",
     "PostgresRuntimeReceiptOutbox",
+    "PostgresSecurityDecisionOutbox",
     "PostgresRuntimeReleaseCache",
     "PostgresRuntimeTaskStore",
     "PostgresRuntimeStateStore",

@@ -1360,6 +1360,10 @@ class RuntimeKernel:
         except asyncio.CancelledError:
             raise
         except RuntimeExecutionError:
+            if tool.side_effects != "read-only":
+                await self._mark_workflow_indeterminate(
+                    evaluation, "workflow_postcondition_indeterminate"
+                )
             raise
         except Exception as exc:
             if tool.side_effects != "read-only":

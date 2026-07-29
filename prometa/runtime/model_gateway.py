@@ -15,6 +15,7 @@ from .kernel import (
     ModelAdapterError,
     ModelInvocationRequest,
     ModelInvocationResponse,
+    ModelTokenUsage,
     ModelToolCall,
 )
 
@@ -41,6 +42,89 @@ def _strict_json_loads(value, code):
         )
     except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ModelAdapterError(code) from exc
+
+
+def _non_negative_int(value: Any) -> int:
+    """Coerce a provider-reported token count, refusing anything implausible.
+
+    Usage blocks are provider-controlled, so a bool, float, string, or negative
+    is treated as absent rather than trusted into the runtime's budget maths.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value > 0 else 0
+
+
+def _parse_usage(usage: Any) -> Optional[ModelTokenUsage]:
+    """Read an OpenAI-shaped ``usage`` block into ``ModelTokenUsage``.
+
+    Returns ``None`` when the provider sent nothing usable, so callers can tell
+    "no usage reported" apart from "zero tokens". ``cached_tokens`` lives under
+    ``prompt_tokens_details`` and is clamped to ``input_tokens``: it is defined
+    as a sub-count, and a provider reporting more cached than prompt tokens is
+    stating something incoherent that must not reach budget accounting.
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    input_tokens = _non_negative_int(usage.get("prompt_tokens"))
+    output_tokens = _non_negative_int(usage.get("completion_tokens"))
+
+    # Guard on the real counts only. A block carrying nothing but
+    # ``cached_tokens`` says nothing usable — cached is a sub-count of a
+    # prompt total we don't have — and must not become an all-zero object that
+    # reads as "no tokens were spent".
+    if not (input_tokens or output_tokens):
+        return None
+
+    details = usage.get("prompt_tokens_details")
+    cached = (
+        _non_negative_int(details.get("cached_tokens"))
+        if isinstance(details, dict)
+        else 0
+    )
+    return ModelTokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=min(cached, input_tokens),
+    )
+
+
+# Engine error codes that describe the *request*, not a transient condition.
+# The engine returns some of these with a 5xx status — ``structured_output_invalid``
+# is a 502 because the failure happened upstream of the response — but retrying
+# an identical request cannot change the outcome, and the engine has already
+# retried internally before answering. Without this, the runtime spends its
+# whole ``max_attempts_per_model`` budget re-running a request that is
+# deterministically going to fail.
+_NON_RETRYABLE_ERROR_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "structured_output_invalid",
+        "tokenization_not_supported",
+        "model_not_found",
+    }
+)
+
+
+def _error_code(body: bytes) -> Optional[str]:
+    """Extract ``error.code`` from an OpenAI-shaped error body.
+
+    Best-effort by design: an error path must never raise a second error, so
+    any malformed or oversized body simply yields ``None`` and the caller falls
+    back to status-code semantics.
+    """
+    try:
+        document = json.loads(body)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    error = document.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code") or error.get("type")
+    return code if isinstance(code, str) and code else None
 
 
 class OpenAICompatibleModelAdapter:
@@ -195,6 +279,7 @@ class OpenAICompatibleModelAdapter:
             provider_model=(
                 provider_model if isinstance(provider_model, str) else None
             ),
+            usage=_parse_usage(document.get("usage")),
         )
 
     def _invoke_sync(self, request: ModelInvocationRequest) -> ModelInvocationResponse:
@@ -224,14 +309,34 @@ class OpenAICompatibleModelAdapter:
             ) as response:
                 data = response.read(self.max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
+            # Read the OpenAI-shaped ``error`` object when there is one: the
+            # status code alone cannot distinguish "the upstream hiccuped"
+            # from "this request is invalid and will stay invalid". Bounded by
+            # max_response_bytes like any other body, and never allowed to
+            # raise — a failure to parse the failure just falls through to
+            # status-code semantics.
+            code: Optional[str] = None
+            try:
+                code = _error_code(exc.read(self.max_response_bytes))
+            except Exception:  # noqa: BLE001 — never mask the original HTTPError
+                code = None
+
             retryable = self._retryable_status(exc.code)
+            if code in _NON_RETRYABLE_ERROR_CODES:
+                retryable = False
+
+            # ``code`` stays ``model_http_<status>`` — callers already branch on
+            # it and renaming it would break them. The provider's own code is
+            # additive, on ``provider_code``.
             raise ModelAdapterError(
                 "model_http_%s" % exc.code,
-                "Model gateway returned HTTP %s" % exc.code,
+                "Model gateway returned HTTP %s%s"
+                % (exc.code, " (%s)" % code if code else ""),
                 retryable=retryable,
                 retry_after_seconds=(
                     self._retry_after_seconds(exc.headers) if retryable else None
                 ),
+                provider_code=code,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ModelAdapterError("model_transport_failed", retryable=True) from exc

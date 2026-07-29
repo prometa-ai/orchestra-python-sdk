@@ -101,6 +101,7 @@ class ModelAdapterError(RuntimeExecutionError):
         *,
         retryable: bool = False,
         retry_after_seconds: Optional[float] = None,
+        provider_code: Optional[str] = None,
     ) -> None:
         if retry_after_seconds is not None and (
             not retryable
@@ -114,6 +115,13 @@ class ModelAdapterError(RuntimeExecutionError):
             )
         self.retry_after_seconds = (
             float(retry_after_seconds) if retry_after_seconds is not None else None
+        )
+        # The provider's own error identifier (OpenAI ``error.code``), when the
+        # response carried one. ``code`` stays the transport-level
+        # ``model_http_<status>`` so existing callers keep working; this is the
+        # additive, more specific signal.
+        self.provider_code = (
+            provider_code if isinstance(provider_code, str) and provider_code else None
         )
         super().__init__(code, message, retryable=retryable)
 
@@ -212,11 +220,58 @@ class ModelInvocationRequest:
 
 
 @dataclass(frozen=True)
+class ModelTokenUsage:
+    """Token accounting reported by the model plane for one invocation.
+
+    Adapters populate this from the provider's own ``usage`` block rather than
+    estimating: the runtime bills, budgets, and traces against these numbers,
+    and an approximation that drifts is worse than an absent value. Adapters
+    that cannot obtain real counts leave ``ModelInvocationResponse.usage`` as
+    ``None``.
+
+    ``cached_input_tokens`` is the portion of ``input_tokens`` served from a
+    provider-side prefix cache. It is a *sub-count* of ``input_tokens``, not an
+    addition to it.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
 class ModelInvocationResponse:
     content: Any
     tool_calls: Tuple[ModelToolCall, ...] = ()
     finish_reason: Optional[str] = None
     provider_model: Optional[str] = None
+    # ``None`` when the adapter could not obtain real counts. Kept optional so
+    # third-party adapters implementing ModelAdapter stay source-compatible.
+    usage: Optional[ModelTokenUsage] = None
+
+
+def _usage_attributes(usage: Optional[ModelTokenUsage]) -> Mapping[str, Any]:
+    """GenAI semantic-convention token attributes for an evidence event.
+
+    Returns an empty mapping when the adapter reported no usage, so a span
+    never carries a zero that reads as "no tokens were spent" when the truth is
+    "this adapter cannot say". ``cached_input_tokens`` is only emitted when
+    non-zero — most providers have no prefix cache, and a constant 0 on every
+    span is noise.
+    """
+    if usage is None:
+        return {}
+    attributes: Dict[str, Any] = {
+        "gen_ai.usage.input_tokens": usage.input_tokens,
+        "gen_ai.usage.output_tokens": usage.output_tokens,
+    }
+    if usage.cached_input_tokens:
+        attributes["gen_ai.usage.cached_input_tokens"] = usage.cached_input_tokens
+    return attributes
 
 
 class ModelAdapter(Protocol):
@@ -1726,6 +1781,7 @@ class RuntimeKernel:
                                 or model.model_name,
                                 "gen_ai.response.finish_reasons": response.finish_reason,
                                 "retry.attempt_number": retry_attempt,
+                                **_usage_attributes(response.usage),
                             },
                         )
 

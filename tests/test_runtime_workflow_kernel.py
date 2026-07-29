@@ -148,6 +148,11 @@ class StaticPostconditions:
         return self.context
 
 
+class InvalidPostconditions:
+    async def validate(self, request):
+        raise RuntimeExecutionError("workflow_postcondition_invalid")
+
+
 class FailingWorkflowEmitter:
     def emit(self, decision):
         raise OSError("decision outbox unavailable")
@@ -335,6 +340,38 @@ def test_quarantine_is_durable_even_when_indeterminate_evidence_emission_fails()
     assert caught.value.code == "workflow_decision_emit_failed"
     assert len(state.ledger) == 1
     assert state.ledger[0].reason_code == "tool_outcome_indeterminate"
+
+
+def test_invalid_postcondition_after_write_is_quarantined_and_never_committed():
+    admitted = _workflow_admitted(side_effects="write")
+    state = InMemoryWorkflowStateStore()
+    state.seed(_context(), "matched", 0)
+    decisions = InMemoryWorkflowDecisionEmitter()
+    kernel, _ = _kernel(
+        admitted,
+        _adapter(),
+        tool_broker=RecordingToolBroker(),
+        workflow_context_resolver=StaticResolver(),
+        workflow_state_store=state,
+        workflow_decision_emitter=decisions,
+        workflow_postcondition_validator=InvalidPostconditions(),
+    )
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        asyncio.run(
+            kernel.execute(
+                {"question": "lookup"},
+                request_id="request-invalid-postcondition",
+                workflow_context=_context(),
+            )
+    )
+    assert caught.value.code == "workflow_postcondition_invalid"
+    assert len(state.ledger) == 1
+    assert (
+        state.ledger[0].reason_code == "workflow_postcondition_indeterminate"
+    )
+    assert decisions.decisions[-1].recommended_outcome == "indeterminate"
+    assert decisions.decisions[-1].applied_outcome == "deny"
 
 
 def test_observe_mode_logs_postcondition_drift_without_committing_or_blocking():

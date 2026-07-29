@@ -27,6 +27,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Optional `workflowContext` on `POST /v1/runtime/execute`, limited to immutable
   workflow/version/instance identity and an opaque actor reference. Caller
   roles and authorization facts remain forbidden.
+- An explicitly enabled, staging-only workflow proof host that combines signed
+  v3 admission with tenant-owned approval/fact resolution, PostgreSQL CAS,
+  local deterministic SAP-boundary simulation, postcondition validation and
+  payload-free asynchronous evidence. Timeout/unknown and invalid
+  postcondition scenarios remain quarantined and never replay automatically.
 
 - A source-only, non-certifying OpenShift SNO engineering-trial chart overlay
   for `orchestra-ocp-sno-trial-amd64-v1`. It pins the single-replica runtime

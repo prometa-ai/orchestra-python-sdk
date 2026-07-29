@@ -86,6 +86,20 @@ def sync_runtime_release_version(
             f'"prometa-sdk[runtime-host,runtime-mcp]=={version}"',
         )
 
+    workflow_proof_dockerfile = "deploy/reference-runtime/Dockerfile.workflow-proof"
+    _replace_exact(
+        root,
+        workflow_proof_dockerfile,
+        r"^ARG IMAGE_VERSION=[0-9]+\.[0-9]+\.[0-9]+$",
+        f"ARG IMAGE_VERSION={version}",
+    )
+    _replace_exact(
+        root,
+        workflow_proof_dockerfile,
+        r'"prometa-sdk\[runtime-host\]==[0-9]+\.[0-9]+\.[0-9]+"',
+        f'"prometa-sdk[runtime-host]=={version}"',
+    )
+
     _replace_exact(
         root,
         "deploy/reference-runtime/compose.yaml",

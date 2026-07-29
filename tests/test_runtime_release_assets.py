@@ -41,6 +41,7 @@ def _release_fixture(tmp_path: Path) -> Path:
         Path("prometa/__init__.py"),
         Path("deploy/reference-runtime/Dockerfile"),
         Path("deploy/reference-runtime/Dockerfile.ubi"),
+        Path("deploy/reference-runtime/Dockerfile.workflow-proof"),
         Path("deploy/reference-runtime/compose.yaml"),
         Path("deploy/reference-runtime/chart/Chart.yaml"),
         Path("deploy/reference-runtime/chart/values.production.example.yaml"),
@@ -176,6 +177,11 @@ def test_runtime_release_version_synchronizer_updates_every_bound_surface(tmp_pa
     verified = _run_verifier("v0.19.0", fixture)
     assert verified.returncode == 0, verified.stderr
     assert "release_version=0.19.0" in verified.stdout
+    workflow_proof = (
+        fixture / "deploy/reference-runtime/Dockerfile.workflow-proof"
+    ).read_text(encoding="utf-8")
+    assert "ARG IMAGE_VERSION=0.19.0" in workflow_proof
+    assert '"prometa-sdk[runtime-host]==0.19.0"' in workflow_proof
 
 
 def test_runtime_release_version_synchronizer_advances_independent_chart(tmp_path):
@@ -265,9 +271,7 @@ def test_runtime_artifact_workflow_is_exact_tag_signed_and_attested():
     assert 'gh release upload "$RELEASE_TAG"' in workflow
     assert "Existing release asset digest differs" in workflow
     assert "GitHub release asset digests did not converge" in workflow
-    assert workflow.index(
-        "- name: Attest image build provenance"
-    ) < workflow.index(
+    assert workflow.index("- name: Attest image build provenance") < workflow.index(
         "- name: Sign digest and attest CycloneDX SBOM"
     )
 

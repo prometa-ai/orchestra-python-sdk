@@ -321,6 +321,38 @@ This proves Helm rendering and negative admission cases only. It does not
 prove that a released image exists, that OpenShift admits it, or that any live
 recovery, load, restore, RPO/RTO or availability requirement passes.
 
+### Staging company-workflow proof
+
+`Dockerfile.workflow-proof` packages an opt-in fixture for proving a published
+Company Workflow Ontology against the real runtime v3 admission, evaluator,
+PostgreSQL state/CAS ledger, MCP idempotency store and asynchronous receipt and
+workflow-decision outboxes. The process refuses to start unless:
+
+- `PROMETA_RUNTIME_WORKFLOW_PROOF=enabled`;
+- the runtime environment is exactly `staging`;
+- the model gateway is the fixture-local loopback endpoint;
+- receipt and workflow-decision delivery are configured; and
+- a bounded tenant approval is supplied through
+  `PROMETA_WORKFLOW_PROOF_APPROVAL_JSON`.
+
+The fixture's SAP transport is deterministic and local; it never connects to
+SAP. Inputs containing `simulate-timeout` exercise an outcome-unknown boundary,
+while `simulate-postcondition-fail` exercises a result that cannot satisfy the
+published transition postcondition. Both cases fail closed and are expected to
+leave the workflow instance quarantined rather than replaying the side effect.
+
+Build it only for a staging proof:
+
+```bash
+gcloud builds submit \
+  --config deploy/reference-runtime/cloudbuild.workflow-proof.yaml \
+  --substitutions _VCS_REF="$(git rev-parse HEAD)",_IMAGE_VERSION=0.20.0,_IMAGE=REGISTRY/IMAGE:TAG
+```
+
+The resulting evidence is a staging runtime proof. It does not enable a real
+SAP write, replace tenant approval infrastructure, or satisfy the production
+activation and OpenShift certification gates.
+
 ### Declared OpenShift runtime profile
 
 `chart/values.openshift-production.yaml` is the fail-closed tenant-runtime

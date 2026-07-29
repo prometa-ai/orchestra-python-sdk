@@ -217,6 +217,7 @@ jobs:
             prometa/__init__.py \
             deploy/reference-runtime/Dockerfile \
             deploy/reference-runtime/Dockerfile.ubi \
+            deploy/reference-runtime/Dockerfile.workflow-proof \
             deploy/reference-runtime/compose.yaml \
             deploy/reference-runtime/chart/Chart.yaml \
             deploy/reference-runtime/chart/values.production.example.yaml \
@@ -252,6 +253,7 @@ jobs:
             prometa/__init__.py \
             deploy/reference-runtime/Dockerfile \
             deploy/reference-runtime/Dockerfile.ubi \
+            deploy/reference-runtime/Dockerfile.workflow-proof \
             deploy/reference-runtime/compose.yaml \
             deploy/reference-runtime/chart/Chart.yaml \
             deploy/reference-runtime/chart/values.production.example.yaml \

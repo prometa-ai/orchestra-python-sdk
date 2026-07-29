@@ -1,0 +1,17 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file
+      - deploy/reference-runtime/Dockerfile.workflow-proof
+      - --build-arg
+      - VCS_REF=${_VCS_REF}
+      - --build-arg
+      - IMAGE_VERSION=${_IMAGE_VERSION}
+      - --tag
+      - ${_IMAGE}
+      - .
+images:
+  - ${_IMAGE}
+options:
+  logging: CLOUD_LOGGING_ONLY

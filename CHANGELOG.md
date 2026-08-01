@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- `prometa.integrations.openai.install()` now instruments
+  `client.embeddings.create` (sync and async). Embedding spans carry
+  `gen_ai.operation.name=embeddings`, request model, usage/total tokens,
+  and input-size signals without writing embedding vectors into attributes.
 - Runtime contract v3 admission and local Company Workflow Ontology
   enforcement, while retaining v1/v2 compatibility. The runtime verifies exact
   ontology, compiled-policy, sector-snapshot and bundle digest bindings before

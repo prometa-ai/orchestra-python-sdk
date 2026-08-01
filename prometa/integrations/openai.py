@@ -1,20 +1,27 @@
 """OpenAI client auto-instrumentation.
 
-Patches ``openai.resources.chat.completions.Completions.create`` and the
-async / streaming variants so every direct call to the OpenAI Python
-client emits a Prometa span carrying:
+Patches ``openai.resources.chat.completions.Completions.create``,
+``openai.resources.embeddings.Embeddings.create``, and the async /
+streaming variants so every direct call to the OpenAI Python client
+emits a Prometa span carrying:
 
 - ``gen_ai.system`` = ``openai``
 - ``gen_ai.request.model`` and request params
 - ``gen_ai.usage.input_tokens`` / ``gen_ai.usage.output_tokens``
-- ``gen_ai.prompt`` (truncated JSON of input messages)
-- ``gen_ai.completion`` (truncated assistant reply)
+  (embeddings stamp input/total tokens only)
+- ``gen_ai.prompt`` (truncated JSON of input messages; chat/responses)
+- ``gen_ai.completion`` (truncated assistant reply; chat/responses)
 
-Streaming is supported transparently: the wrapper returns a proxy
-iterator that finalizes the span when the stream is exhausted, with
-usage attributes populated from the final chunk (when the caller passes
-``stream_options={"include_usage": True}``; otherwise the span carries
-prompt/completion text but no token counts).
+Embedding spans additionally carry request-size signals
+(``gen_ai.request.embedding.input_count`` /
+``gen_ai.request.embedding.input_chars``) and never write embedding
+vectors into attributes.
+
+Streaming is supported transparently for chat/responses: the wrapper
+returns a proxy iterator that finalizes the span when the stream is
+exhausted, with usage attributes populated from the final chunk (when
+the caller passes ``stream_options={"include_usage": True}``; otherwise
+the span carries prompt/completion text but no token counts).
 
 Usage::
 
@@ -163,6 +170,105 @@ def _extract_finish_reasons(response: Any) -> list[str]:
     return out
 
 
+def _embedding_input_size(value: Any) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(input_count, approx_chars)`` for an embeddings ``input``.
+
+    Counts strings (or token-id sequences) without serializing the full
+    payload into span attributes. Returns ``(None, None)`` when the shape
+    is unrecognized.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        return 1, len(value)
+    if isinstance(value, (bytes, bytearray)):
+        return 1, len(value)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return 0, 0
+        if all(isinstance(item, str) for item in value):
+            return len(value), sum(len(item) for item in value)
+        # Token-id sequences: single ``[int, ...]`` or batch of those.
+        if all(isinstance(item, int) for item in value):
+            return 1, len(value)
+        if all(
+            isinstance(item, (list, tuple))
+            and all(isinstance(tok, int) for tok in item)
+            for item in value
+        ):
+            return len(value), sum(len(item) for item in value)
+        # Mixed / unknown batch — still report cardinality.
+        return len(value), None
+    return None, None
+
+
+def _embeddings_request_attrs(kwargs: dict) -> dict:
+    """Pull request metadata off kwargs for ``embeddings.create``."""
+    out: dict = {
+        "gen_ai.system": SYSTEM,
+        "gen_ai.framework": SYSTEM,
+        "gen_ai.operation.name": "embeddings",
+    }
+    model = kwargs.get("model")
+    if isinstance(model, str):
+        out["gen_ai.request.model"] = model
+    dimensions = kwargs.get("dimensions")
+    if dimensions is not None:
+        try:
+            out["gen_ai.request.embedding.dimensions"] = int(dimensions)
+        except (TypeError, ValueError):
+            pass
+    encoding_format = kwargs.get("encoding_format")
+    if isinstance(encoding_format, str):
+        out["gen_ai.request.embedding.encoding_format"] = encoding_format
+    count, chars = _embedding_input_size(kwargs.get("input"))
+    if count is not None:
+        out["gen_ai.request.embedding.input_count"] = count
+    if chars is not None:
+        out["gen_ai.request.embedding.input_chars"] = chars
+    return out
+
+
+def _apply_embeddings_response_attrs(span: _Span, response: Any) -> None:
+    """Populate span attributes from an embeddings response.
+
+    Intentionally omits ``data[*].embedding`` vectors — only model, usage,
+    and result cardinality are stamped.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        in_tok = getattr(usage, "prompt_tokens", None) or getattr(
+            usage, "input_tokens", None
+        )
+        total_tok = getattr(usage, "total_tokens", None)
+        if in_tok is not None:
+            span.attributes["gen_ai.usage.input_tokens"] = int(in_tok)
+        if total_tok is not None:
+            span.attributes["gen_ai.usage.total_tokens"] = int(total_tok)
+    response_model = getattr(response, "model", None)
+    if response_model:
+        span.attributes["gen_ai.response.model"] = str(response_model)
+    data = getattr(response, "data", None)
+    if data is not None:
+        try:
+            span.attributes["gen_ai.response.embedding.count"] = len(data)
+        except TypeError:
+            pass
+
+
+def _request_attrs_for(operation: str, kwargs: dict) -> dict:
+    if operation == "embeddings":
+        return _embeddings_request_attrs(kwargs)
+    return _request_attrs(kwargs)
+
+
+def _apply_response_attrs_for(operation: str, span: _Span, response: Any) -> None:
+    if operation == "embeddings":
+        _apply_embeddings_response_attrs(span, response)
+    else:
+        _apply_response_attrs(span, response)
+
+
 # ---------------------------------------------------------------------------
 # Streaming chunk handling
 # ---------------------------------------------------------------------------
@@ -281,11 +387,12 @@ def _wrap_sync_create(cls: type, operation: str) -> None:
     def wrapper(self, *args, **kwargs):
         client = _c._client()
         if client is None:
-            _c.pop_assistant_intent_attrs(kwargs)
+            if operation != "embeddings":
+                _c.pop_assistant_intent_attrs(kwargs)
             return original(self, *args, **kwargs)
-        attrs = _request_attrs(kwargs)
+        attrs = _request_attrs_for(operation, kwargs)
         span_name = _make_span_name(operation, kwargs)
-        is_stream = bool(kwargs.get("stream"))
+        is_stream = operation != "embeddings" and bool(kwargs.get("stream"))
         if is_stream:
             span = _c.open_manual_span("agent", span_name, attrs)
             if span is None:
@@ -312,7 +419,7 @@ def _wrap_sync_create(cls: type, operation: str) -> None:
                 span.attributes["error.message"] = str(e)
                 raise
             try:
-                _apply_response_attrs(span, response)
+                _apply_response_attrs_for(operation, span, response)
             except Exception:
                 pass
             return response
@@ -332,11 +439,12 @@ def _wrap_async_create(cls: type, operation: str) -> None:
     async def wrapper(self, *args, **kwargs):
         client = _c._client()
         if client is None:
-            _c.pop_assistant_intent_attrs(kwargs)
+            if operation != "embeddings":
+                _c.pop_assistant_intent_attrs(kwargs)
             return await original(self, *args, **kwargs)
-        attrs = _request_attrs(kwargs)
+        attrs = _request_attrs_for(operation, kwargs)
         span_name = _make_span_name(operation, kwargs)
-        is_stream = bool(kwargs.get("stream"))
+        is_stream = operation != "embeddings" and bool(kwargs.get("stream"))
         if is_stream:
             span = _c.open_manual_span("agent", span_name, attrs)
             if span is None:
@@ -362,7 +470,7 @@ def _wrap_async_create(cls: type, operation: str) -> None:
                 span.attributes["error.message"] = str(e)
                 raise
             try:
-                _apply_response_attrs(span, response)
+                _apply_response_attrs_for(operation, span, response)
             except Exception:
                 pass
             return response
@@ -377,7 +485,7 @@ def _wrap_async_create(cls: type, operation: str) -> None:
 
 
 def install() -> bool:
-    """Patch the openai client's chat + responses ``.create`` methods.
+    """Patch the openai client's chat, responses, and embeddings ``.create``.
 
     Returns True if patching applied, False if the openai library isn't
     importable.
@@ -415,6 +523,19 @@ def install() -> bool:
 
         _wrap_sync_create(Responses, "responses")
         _wrap_async_create(AsyncResponses, "responses")
+        patched_any = True
+    except Exception:
+        pass
+
+    # Embeddings: openai.resources.embeddings
+    try:
+        from openai.resources.embeddings import (  # type: ignore
+            Embeddings,
+            AsyncEmbeddings,
+        )
+
+        _wrap_sync_create(Embeddings, "embeddings")
+        _wrap_async_create(AsyncEmbeddings, "embeddings")
         patched_any = True
     except Exception:
         pass

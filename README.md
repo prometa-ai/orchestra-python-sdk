@@ -1157,8 +1157,9 @@ prometa_google.install()
 ```
 
 Once installed, every `client.chat.completions.create(...)`,
-`client.messages.create(...)`, and `client.models.generate_content(...)`
-call (sync, async, **and streaming**) emits a child span carrying:
+`client.embeddings.create(...)`, `client.messages.create(...)`, and
+`client.models.generate_content(...)` call (sync, async, **and streaming**
+where applicable) emits a child span carrying:
 
 - `gen_ai.system` (`openai` / `anthropic` / `google`)
 - `gen_ai.request.model`, `temperature`, `top_p`, `max_tokens`
@@ -1166,6 +1167,13 @@ call (sync, async, **and streaming**) emits a child span carrying:
 - `gen_ai.prompt` (truncated JSON of input messages)
 - `gen_ai.completion` (truncated assistant reply)
 - `gen_ai.response.id`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`
+
+OpenAI embedding spans use `gen_ai.operation.name=embeddings` and stamp
+model + usage (`gen_ai.usage.input_tokens` /
+`gen_ai.usage.total_tokens`) plus request-size signals
+(`gen_ai.request.embedding.input_count` /
+`gen_ai.request.embedding.input_chars`). Embedding **vectors** are never
+written into span attributes.
 
 Streaming spans propagate context properly — any `@prometa.tool` /
 `@prometa.agent` invoked from inside the stream consumer nests under

@@ -76,6 +76,49 @@ class RetrievalQueryNamespaceTest(unittest.TestCase):
         attrs = self._retrieval_attrs()
         self.assertNotIn("retrieval.namespace", attrs)
 
+    def test_namespace_is_whitespace_trimmed(self) -> None:
+        # Padding is stripped rather than stamped verbatim — otherwise
+        # "support-kb" and " support-kb" become two corpora in the RAG
+        # dashboard's per-namespace rollup.
+        @self.prometa.workflow(name="rag")
+        def handle():
+            with retrieval_query(
+                "graph",
+                query_text="psi",
+                top_k=2,
+                namespace="  support-kb  ",
+            ) as r:
+                r.results(result_ids=["chunk-a"])
+
+        handle()
+        attrs = self._retrieval_attrs()
+        self.assertEqual(attrs["retrieval.namespace"], "support-kb")
+
+    def test_namespace_cannot_be_passed_positionally(self) -> None:
+        # `namespace` is keyword-only, so no pre-existing positional call
+        # site can silently bind it. This is the source-compatibility
+        # guard for callers written before the kwarg existed.
+        with self.assertRaises(TypeError):
+            retrieval_query("vector", "psi", 5, "knowledge-bank")  # type: ignore[misc]
+
+    def test_namespace_ignored_without_an_active_client(self) -> None:
+        # No client installed → the helper yields an inert handle rather
+        # than raising, with or without a namespace.
+        previous = Prometa._current
+        Prometa._current = None
+        try:
+            with retrieval_query(
+                "vector",
+                query_text="psi",
+                top_k=3,
+                namespace="knowledge-bank",
+            ) as r:
+                r.results(result_ids=["chunk-a"])
+        finally:
+            Prometa._current = previous
+
+        self.assertEqual(len(self.prometa._buffer), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

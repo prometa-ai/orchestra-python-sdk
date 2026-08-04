@@ -1102,6 +1102,22 @@ with pii_filter("input", raw_input=text) as pii:
                match_categories=[m.kind for m in matches])
 
 prometa.raw_channel.enable()   # dual-channel raw capture (opt-in)
+
+# Optional retrieval.namespace identifies the searched corpus / collection
+# (not tenant, solution, agent, or environment). Omit or leave blank to
+# keep the attribute unset.
+with retrieval_query(
+    "hybrid",
+    query_text=query,
+    top_k=4,
+    namespace="knowledge-bank",
+) as r:
+    docs = store.search(query, top_k=4)
+    r.results(
+        result_ids=[d.id for d in docs],
+        scores=[d.score for d in docs],
+        permissions_enforced=True,
+    )
 ```
 
 Each helper is a context manager (or a synchronous record call for

@@ -152,11 +152,20 @@ def retrieval_query(
     *,
     query_text: str,
     top_k: int,
+    namespace: Optional[str] = None,
     raw_retrieved: Optional[str] = None,
 ) -> Iterator[_RetrievalQueryHandle]:
     """Emit a ``retrieval.query`` span around a RAG / graph / keyword fetch.
 
     ``system`` ∈ ``{vector, graph, keyword, hybrid}``.
+
+    ``namespace`` identifies the searched corpus, collection, index, or
+    datastore partition (for example a knowledge-base name or Chroma
+    collection id). When non-empty it is stamped as
+    ``retrieval.namespace``. Omit it — or pass blank — to leave the
+    attribute unset for backward compatibility. Do not overload this
+    with tenant, solution, agent, or deployment-environment identity;
+    those already have separate Prometa scope fields.
 
     Dual-channel: ``raw_retrieved`` is the concatenated raw text of the
     retrieved results — what A3 indirect-injection scans. Only stamped
@@ -165,7 +174,10 @@ def retrieval_query(
     Usage::
 
         with prometa.retrieval_query(
-            "vector", query_text=query, top_k=5,
+            "hybrid",
+            query_text=query,
+            top_k=5,
+            namespace="knowledge-bank",
             raw_retrieved=raw_text,        # raw_channel-gated
         ) as r:
             docs = vector_store.search(query, top_k=5)
@@ -189,6 +201,8 @@ def retrieval_query(
         a["retrieval.system"] = system
         a["retrieval.query_text"] = query_text
         a["retrieval.top_k"] = int(top_k)
+        if namespace is not None and str(namespace).strip():
+            a["retrieval.namespace"] = str(namespace).strip()
         if _raw_channel.is_enabled() and raw_retrieved is not None:
             a["prometa.raw.retrieved_content"] = raw_retrieved
         yield _RetrievalQueryHandle(span)

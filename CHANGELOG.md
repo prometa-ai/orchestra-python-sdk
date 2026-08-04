@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Optional ``namespace`` keyword on ``prometa.retrieval_query(...)``.
+  Non-empty values stamp ``retrieval.namespace`` with the searched
+  corpus / collection / index identifier; missing or blank values omit
+  the attribute so existing callers stay compatible.
 - `prometa.integrations.openai.install()` now instruments
   `client.embeddings.create` (sync and async). Embedding spans carry
   `gen_ai.operation.name=embeddings`, request model, usage/total tokens,

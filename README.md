@@ -9,20 +9,21 @@ Official Python SDK for the **Prometa Agentic Lifecycle Intelligence Platform**.
 Wraps OpenTelemetry GenAI semantic conventions with `@prometa` decorators that
 automatically emit lifecycle metadata to your Prometa instance via OTLP/JSON.
 The SDK ships telemetry surfaces that make agent behavior queryable, evaluable,
-and joinable on the platform. Version 0.18.0 added a first tenant-deployed
-reference host, restart-safe PostgreSQL release activation, and a non-root
-container around the optional Phase 2A kernel. Version 0.18.2 added the named
-`orchestra-runtime-edge-overload-v1` production contract: bounded local model
-retries honor `Retry-After`, skip waits outside the configured budget, and emit
-the contract ID as payload-free evidence. Version 0.18.4 adds a source-only,
-non-certifying OpenShift SNO engineering-trial profile. Current source also includes a
-governed tenant-side MCP broker as a separate optional extra, strict reference
-host wiring for read-only MCP bundles, and shared PostgreSQL MCP call admission
-and payload-free audit. A separate pinned K3s profile now exercises that
-read-only MCP path across two tenants and two runtime replicas per tenant. The
-host can bootstrap from an outbound, read-only release handoff with bounded
-tenant-side cache fallback. None of this adds a dependency or runtime behavior
-to the default observability install.
+and joinable on the platform.
+
+The package has two clearly separated surfaces:
+
+1. **Observability (default install)** — decorators, correlation helpers, AML
+   instrumentation primitives, LLM-client patchers, and framework
+   auto-instrumentation. Zero required third-party dependencies; everything
+   optional degrades to a no-op when the target library is absent.
+2. **Tenant runtime kit (optional extras)** — `prometa.runtime`, a
+   fail-closed execution kernel for signed Agent Builder bundles, plus a
+   governed MCP tool broker, PostgreSQL durability, a reference host, and a
+   conformance runner. Nothing here is imported, or adds a dependency, unless
+   you install the extra and import `prometa.runtime` explicitly.
+
+### Observability
 
 - **Lifecycle decorators** — `@prometa.workflow / .agent / .tool / .task`
   wrap any sync/async function and emit a span carrying `solution_id`,
@@ -45,6 +46,20 @@ to the default observability install.
   `record_user_feedback` collect thumbs-up / thumbs-down, 1-5 star
   ratings, and open-text comments as generic `prometa.feedback.*`
   telemetry for platform ingestion.
+- **Data-flow refs** — `set_input_ref` / `set_output_ref` /
+  `current_span_id` declare "whose output did this span consume?" between
+  sibling spans, which parent/child edges alone cannot express.
+- **Token budgets** — `TokenBudget` enforces a per-process sliding-window
+  token cap in `hard` (raises) or `soft` (warns) mode.
+- **LLM client auto-instrumentation** — opt-in patchers for OpenAI
+  (chat completions, responses, **embeddings**), Anthropic, and Google
+  GenAI capture prompts, completions, token usage, and cost signals.
+- **Framework auto-instrumentation** — opt-in patchers for LangChain,
+  LangGraph, CrewAI, Semantic Kernel, the OpenAI Agents SDK, MCP client
+  sessions, and Pinecone / Chroma / Weaviate.
+- **OpenLLMetry bridge** — optionally use Traceloop's OpenTelemetry
+  instrumentors as the auto-instrumentation layer and bridge their finished
+  spans into Prometa's OTLP/JSON shipper.
 - **AQL (Agentic Quality Leveling) trace metadata** — lifecycle,
   correlation, refs, intent, feedback, prompt, completion, usage, and
   model attributes give Prometa's AQL / PrometaQL query and evaluation
@@ -56,14 +71,57 @@ to the default observability install.
   platform's AML scoring engine consumes to score agents against the
   41-feature catalog.
 
+### Tenant runtime kit (optional)
+
+- **Signed-release admission** — bundle schema v1–v3 and runtime contract
+  v1–v3, verified locally against a tenant-controlled trust store, with
+  replay reservation, capability negotiation, and digest binding.
+- **Execution kernel** — bounded model/tool timeouts, retries, backoff,
+  circuit breaking, cancellation, and deterministic signed fallback, emitting
+  payload-free evidence.
+- **Company Workflow Ontology (contract v3)** — a deterministic closed-AST
+  workflow policy evaluator with tenant-owned fact/approval resolution,
+  pre-tool authorization, postcondition validation, and compare-and-set state
+  transitions.
+- **Governed MCP tool broker** — official stdio and Streamable HTTP
+  transports behind exact egress allowlists, late-bound credentials, signed
+  scope/risk intersection, and payload-free audit.
+- **PostgreSQL durability** — schema v8 covering admission replay, request
+  state, release activation and cache, task lifecycle, MCP idempotency and
+  audit, the workflow ledger, and the receipt / security / workflow decision
+  outboxes.
+- **Reference host and conformance runner** — `prometa-runtime-host` plus
+  `prometa-runtime-conformance` for adapter-level contract testing.
+
 ## Install
 
 ```bash
 pip install prometa-sdk
 ```
 
-Current source version: **0.19.0**. Release history is on
+Current source version: **0.20.1**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
+
+The default wheel has **no required third-party dependencies** and requires
+Python ≥ 3.9. Every extra below is optional and additive:
+
+| Extra | Installs | For |
+|---|---|---|
+| `openai` | `openai>=1.0` | OpenAI chat/responses/embeddings instrumentation |
+| `anthropic` | `anthropic>=0.40` | Anthropic messages instrumentation |
+| `google` | `google-genai>=0.3` | Google GenAI instrumentation |
+| `langchain` | `langchain-core>=0.3` | LangChain / LangGraph instrumentation |
+| `openllmetry` | OpenTelemetry SDK + 5 instrumentors (py ≥ 3.10) | OpenLLMetry bridge, default targets |
+| `openllmetry-all` | the above + Bedrock, Cohere, Haystack, LlamaIndex | broader OpenLLMetry coverage |
+| `runtime` | `cryptography`, `jsonschema` | tenant runtime kernel + admission |
+| `runtime-mcp` | `runtime` + `mcp>=1.28.1` (py ≥ 3.10) | governed MCP tool broker |
+| `runtime-postgres` | `runtime` + `psycopg[binary]` | multi-replica durability |
+| `runtime-host` | `runtime` + `psycopg[binary]` | reference tenant runtime host |
+| `dev` | `pytest`, `ruff` | contributing |
+
+You do **not** need the `openai` / `anthropic` / `google` / `langchain` extras
+if the library is already in your environment — the patchers only ever wrap what
+is importable, and `install()` returns `False` otherwise.
 
 ### Optional tenant-runtime kit
 
@@ -210,9 +268,14 @@ deterministic policy and execution-configuration digests, and typed logical
 secret references. Admission recomputes both digests and cross-checks the range
 form against the exact `name.vN` compatibility mirror. Secret references name a
 tenant-resolved provider and purpose only; credential values never enter the
-signed artifact. Runtime contract v1 remains admissible during the production
-profile transition, and bundles without a runtime contract remain
-integrity-verifiable but non-executable by default.
+signed artifact. Contract v3 adds the signed Company Workflow Ontology and its
+four workflow capabilities (see
+[Company Workflow Ontology](#company-workflow-ontology-runtime-contract-v3)).
+Bundle schema versions 1–3 and runtime contract versions 1–3 are all admissible
+(`SUPPORTED_BUNDLE_SCHEMA_VERSIONS`, `SUPPORTED_RUNTIME_CONTRACT_VERSIONS`), so
+v1 releases stay admissible during the production profile transition. Bundles
+without a runtime contract remain integrity-verifiable but non-executable by
+default.
 
 The kernel bounds model/tool timeouts, retries, exponential backoff, circuit
 breaking, topology steps, cancellation, and deterministic fallback. Under the
@@ -419,7 +482,13 @@ Pull-mode hosts also need `SELECT, INSERT, UPDATE` on
 `prometa_runtime_task_event`. MCP-enabled hosts need
 `SELECT, INSERT, UPDATE, DELETE` on `prometa_runtime_mcp_idempotency` and
 `INSERT` on `prometa_runtime_mcp_audit`; an operator identity may additionally
-receive `SELECT` on the audit table for verification.
+receive `SELECT` on the audit table for verification. Hosts admitting runtime
+contract v3 workflow releases also need `SELECT, INSERT, UPDATE` on
+`prometa_runtime_workflow_instance`, `SELECT, INSERT` on the append-only
+`prometa_runtime_workflow_ledger`, and — when `workflowDecisionDelivery` is
+configured — `SELECT, INSERT, UPDATE` on
+`prometa_runtime_workflow_decision_outbox`. Security-decision delivery likewise
+needs `SELECT, INSERT, UPDATE` on `prometa_runtime_security_decision_outbox`.
 
 ```bash
 export PROMETA_RUNTIME_DATABASE_URL='postgresql://...'
@@ -434,9 +503,10 @@ newer, or structurally incompatible schema before the host activates a release.
 The installer remains the separate mutating step.
 
 `prometa-runtime-postgres-verify` is a payload-free pre-cutover check for a
-newly restored database. It requires exact migrations through schema v7,
-required task/event and MCP columns, valid lease and terminal projections,
-complete ordered task history, and payload-free MCP audit records. Its JSON
+newly restored database. It requires exact migrations through the current
+schema version (**v8**), required task/event and MCP columns, valid lease and
+terminal projections, complete ordered task history, and payload-free MCP audit
+records. Its JSON
 output contains only schema versions and table counts. Logical backup/restore
 scripts and the optional encrypted-PVC Helm backup CronJob live under
 [`deploy/reference-runtime/`](deploy/reference-runtime/README.md); restore is
@@ -451,6 +521,7 @@ from prometa.runtime import (
     PostgresMcpIdempotencyStore,
     PostgresRuntimeStateStore,
     PostgresRuntimeTaskStore,
+    PostgresWorkflowStateStore,
     install_postgres_runtime_schema,
 )
 
@@ -480,6 +551,12 @@ mcp_audit_sink = PostgresMcpAuditSink(
     tenant_id="org_example",
     runtime_id="tenant-runtime-01",
 )
+# Runtime contract v3 workflow releases only.
+workflow_state_store = PostgresWorkflowStateStore(
+    os.environ["RUNTIME_DATABASE_URL"],
+    tenant_id="org_example",
+    runtime_id="tenant-runtime-01",
+)
 ```
 
 Pass `replay_store` to `admit_runtime_release()` and `state_store` to
@@ -495,6 +572,117 @@ same input/release/deployment identity, appends ordered payload-free events,
 and permits bounded reclaim after an expired safe lease. The MCP stores apply a
 different safety rule: expired or uncertain tool-call reservations become
 indeterminate and require operator reconciliation rather than automatic replay.
+
+#### Company Workflow Ontology (runtime contract v3)
+
+Runtime contract v3 carries a signed **Company Workflow Ontology** inside the
+bundle: a compiled, closed-AST policy describing states, tasks, transitions,
+roles, business objects, facts, evidence requirements, obligations, and
+controls, bound to a sector snapshot. The runtime resolves **no** ontology or
+authorization data from Orchestra during execution — it verifies the exact
+ontology, compiled-policy, sector-snapshot, and bundle digest bindings at
+admission and evaluates locally.
+
+A v3 contract **must** carry an ontology (admission fails with
+`runtime_v3_workflow_ontology_missing` otherwise), and an ontology-bearing
+bundle infers all four workflow capabilities — so a host serving one has to
+supply all three tenant-owned adapters. Conversely, declaring an ontology under
+contract v1 or v2 fails with `workflow_ontology_requires_runtime_v3`.
+
+| Capability | Supplied by |
+|---|---|
+| `workflow.policy.evaluate.v1` | built in (deterministic evaluator; always advertised) |
+| `workflow.context.resolve.v1` | your `WorkflowContextResolver` |
+| `workflow.state.persist.v1` | your `WorkflowStateStore` (or `PostgresWorkflowStateStore`) |
+| `workflow.decision.emit.v1` | your `WorkflowDecisionEmitter` (or `DurableWorkflowDecisionEmitter`) |
+
+```python
+from prometa.runtime import (
+    InMemoryWorkflowDecisionEmitter,
+    InMemoryWorkflowStateStore,
+    RuntimeKernel,
+    VerifiedWorkflowContext,
+    available_runtime_capabilities,
+)
+
+
+class TenantWorkflowContextResolver:
+    async def resolve(self, request) -> VerifiedWorkflowContext:
+        # Tenant-owned and authoritative. Roles, purpose, state version and
+        # facts come from your systems of record — never from the caller.
+        record = my_erp.load(request.workflow.instance_id)
+        return VerifiedWorkflowContext(
+            current_state=record.state,
+            state_version=record.version,
+            actor_role_ids=("ap_clerk",),
+            purpose="invoice_posting",
+            facts={"invoice.total": {"value": record.total, "asOf": record.as_of}},
+            approvals=(),
+        )
+
+
+resolver = TenantWorkflowContextResolver()
+state_store = InMemoryWorkflowStateStore()          # dev only
+decision_emitter = InMemoryWorkflowDecisionEmitter()  # dev only
+
+kernel = RuntimeKernel(
+    admitted,
+    model_adapter=...,
+    evidence_emitter=...,
+    workflow_context_resolver=resolver,
+    workflow_state_store=state_store,
+    workflow_decision_emitter=decision_emitter,
+    workflow_postcondition_validator=my_postcondition_validator,
+    runtime_id="tenant-runtime-01",
+    runtime_version="1.0.0",
+)
+```
+
+Declare the same adapters to `available_runtime_capabilities(...)` when building
+your `RuntimeAdmissionPolicy`, or admission refuses a workflow bundle whose
+declared capabilities the host cannot satisfy.
+
+Signed `mode` selects enforcement strength. **Observe** mode records
+recommendations without blocking; **enforce** mode fails closed, including on
+indeterminate state. Authorization runs *before* the tool call; postconditions
+are validated after it, and the state transition is a compare-and-set against
+the resolved `state_version`. A side effect whose outcome is uncertain
+(timeout, unknown result, invalid postcondition) is quarantined as
+`INDETERMINATE` in the append-only workflow ledger and is **never** replayed
+automatically — it requires operator reconciliation.
+
+Callers may pass an optional `workflowContext` on `POST /v1/runtime/execute`,
+limited to immutable workflow identity plus an opaque actor reference:
+
+```json
+{
+  "requestId": "request-42",
+  "input": {"invoiceId": "INV-1001"},
+  "workflowContext": {
+    "workflowId": "ap-invoice-posting",
+    "version": 4,
+    "instanceId": "instance-9f2c",
+    "actorRef": "actor-ref-7731"
+  }
+}
+```
+
+Caller-supplied roles, permissions, or authorization facts are rejected by the
+contract — those are resolved tenant-side by your `WorkflowContextResolver`.
+
+Decisions are emitted as strict `prometa.workflow-decision.v1` batches through a
+durable, payload-free outbox (`workflowDecisionDelivery` on the host, or
+`DurableWorkflowDecisionEmitter` in the library). The schema rejects raw
+prompts, tool arguments, results, messages, business facts, unknown fields, and
+mutable decision identifiers. Batches are bounded by
+`MAX_WORKFLOW_DECISIONS_PER_BATCH` and `MAX_WORKFLOW_DECISION_BODY_BYTES`.
+
+A separate, explicitly enabled **staging-only** workflow proof host
+(`PROMETA_RUNTIME_WORKFLOW_PROOF=enabled`) combines signed v3 admission with
+tenant-owned approval/fact resolution, PostgreSQL CAS, a deterministic local
+SAP-boundary simulation, postcondition validation, and payload-free
+asynchronous evidence. It never connects to a real ERP and is not a production
+profile.
 
 #### Reference tenant runtime host
 
@@ -544,6 +732,18 @@ and accepts only `/v1/chat/completions`; development profiles remain
 unrestricted. The tenant gateway still owns admission control, distributed
 rate limits, fairness, queueing, load shedding, and autoscaling.
 
+The mounted configuration is strict — unknown keys fail closed. Beyond the
+required release/model/database fields, these optional blocks are recognized:
+
+| Block | Adds |
+|---|---|
+| `controlPlanePull` | bootstrap-only outbound release handoff instead of an embedded pair |
+| `receiptDelivery` | durable asynchronous `admitted` / `active` lifecycle receipts |
+| `securityDecisionDelivery` | `prometa.security-decision.v1` evidence (required by guarded v2+ releases) |
+| `workflowDecisionDelivery` | `prometa.workflow-decision.v1` evidence for contract v3 workflow releases |
+| `taskRecovery` | lifecycle contract v1 cross-replica duplicate rejection and task history |
+| `mcpBroker` | governed read-only MCP tools bound to the signed contract |
+
 Optional `receiptDelivery` configuration adds durable asynchronous `admitted`
 and `active` lifecycle evidence. The host commits receipts to its PostgreSQL
 outbox before a background dispatcher contacts Orchestra, so platform outage
@@ -551,8 +751,8 @@ does not change readiness or request behavior. Replica leases prevent duplicate
 workers, deterministic receipt IDs preserve idempotency across restarts, and
 permanent rejections are dead-lettered with sanitized evidence.
 
-Guarded runtime-contract v2 releases additionally require
-`security.decision.emit.v1`. Configure `securityDecisionDelivery` with a
+Runtime-contract v2 and v3 releases whose guardrails enable security assurance
+additionally require `security.decision.emit.v1`. Configure `securityDecisionDelivery` with a
 machine key limited to `security-decisions:write`; otherwise admission fails
 before the host serves traffic. The kernel honors signed `observe`, `review`,
 and `enforce` modes plus review/enforcement thresholds locally, persists the
@@ -619,7 +819,8 @@ backup/restore assets, strict configuration shape, and operator commands live in
 The release-bound chart runs the target image's compatibility check after
 migration and before future chart rollback. Its `runtimeConfig.rolloutId` pod annotation makes
 tenant-selected immutable config revisions explicit. The CI drill uses a real
-schema-v2 source baseline, upgrades to schema v7 and bundle B, then starts the
+schema-v2 source baseline, upgrades to the current schema version and bundle B,
+then starts the
 baseline host again with bundle A's exact bytes under a fresh promotion and
 deployment identity. This is source-level compatibility evidence, not a
 published-version certification claim. A separate manual release-channel drill
@@ -709,7 +910,11 @@ The command exits nonzero when a check fails. Reports contain fixture identity,
 check outcomes, error codes, model-call counts, and evidence event names; they
 exclude fixture payloads, model outputs, trust keys, and credentials. A tenant
 runtime can implement `RuntimeConformanceDriver` and select a factory with
-`--driver package.module:create_driver`. This is an adapter-level test contract,
+`--driver package.module:create_driver`. `--command-timeout`,
+`--max-command-output-bytes`, `--fixture`, and `--compact` bound and redirect a
+subprocess run. `prometa-runtime-host-conformance-driver` is the shipped
+child-side adapter that exercises the reference host's own request boundary
+rather than the library kernel. This is an adapter-level test contract,
 not certification by the Prometa control plane. The separate
 `deploy/reference-runtime/ci/topology-certification.sh` profiles add retained
 K3s kube-router evidence for two-tenant isolation, load, a database-egress
@@ -724,6 +929,20 @@ see [`deploy/reference-runtime/README.md`](deploy/reference-runtime/README.md#op
 Production acceptance still requires the same
 proof against the tenant's actual CNI, ingress, database, storage, and recovery
 topology.
+
+#### Runtime console scripts
+
+The runtime extras install these commands; none are present in a default
+observability install:
+
+| Command | Extra | Purpose |
+|---|---|---|
+| `prometa-runtime-host` | `runtime-host` | serve the reference tenant runtime host |
+| `prometa-runtime-postgres-init` | `runtime-postgres` | install the fixed schema (migration credential) |
+| `prometa-runtime-postgres-compatibility` | `runtime-postgres` | serving-image gate; read-only metadata check |
+| `prometa-runtime-postgres-verify` | `runtime-postgres` | payload-free pre-cutover integrity check |
+| `prometa-runtime-conformance` | `runtime` | run the conformance suite (`core` / `resilience` / `deployment`) |
+| `prometa-runtime-host-conformance-driver` | `runtime-host` | child-side adapter exercising the host request boundary |
 
 **Repository:** [`prometa-ai/orchestra-python-sdk`](https://github.com/prometa-ai/orchestra-python-sdk) — canonical source. Releases publish from GitHub Actions via OIDC Trusted Publishing on `v*` tag push (see [`.github/workflows/publish.yml`](.github/workflows/publish.yml) and the [`Release`](.github/workflows/release.yml) one-click workflow). Older docs may still mention `sdks/python/` in the platform monorepo; that path is obsolete for Python.
 
@@ -894,6 +1113,69 @@ def prepare_action():
 Values must be `str`, `int`, `float`, or `bool`. Both helpers return
 `False` when called outside an active span.
 
+## Data-flow refs between sibling spans
+
+`parent_span_id` captures the call stack — who *invoked* whom. For agent traces
+the more interesting question is usually "whose **output** did this span
+consume?", and that is almost always a sibling relationship: an LLM emits a
+tool_call, the agent dispatches a sibling tool span. Without an explicit ref the
+platform can only infer that link from temporal proximity.
+
+```python
+from prometa import current_span_id, set_input_ref, set_output_ref
+
+state = {}
+
+@prometa.agent(name="openai.chat")
+async def call_llm(prompt: str) -> dict:
+    # Snapshot the active span so a later sibling can reference it.
+    state["last_llm_span_id"] = current_span_id()
+    ...
+
+@prometa.tool(name="kb-search")
+async def kb_search(q: str) -> list[str]:
+    # "I consumed the output of <llm span>"
+    set_input_ref(state["last_llm_span_id"])
+    ...
+```
+
+`set_input_ref` writes `prometa.input_ref`, `set_output_ref` writes
+`prometa.output_ref`, and `get_input_ref` / `get_output_ref` read them back. The
+platform persists both as dedicated columns and the trace UI's Causal-context
+block renders them as clickable "Input from" / "Output to" rows. Calling any of
+them outside an active span is a no-op.
+
+See [`examples/data_flow_refs.py`](examples/data_flow_refs.py) for a runnable
+end-to-end version.
+
+## Token budgets
+
+`TokenBudget` is a per-process sliding-window cap for throttling LLM spend
+before the call goes out. It is thread-safe but **not** distributed — for
+cross-instance budgets, call the platform API at runtime.
+
+```python
+from prometa import TokenBudget, BudgetExceededError
+
+budget = TokenBudget(
+    limit_tokens=1_000_000,
+    window_seconds=86_400,
+    mode="hard",        # "hard" raises; "soft" allows the call and flags the span
+    label="default",
+)
+
+try:
+    budget.check(approx_input_tokens + approx_output_tokens)
+    resp = llm.chat(...)
+except BudgetExceededError:
+    resp = "(request throttled: token budget exceeded)"
+```
+
+`check()` stamps `budget.label`, `budget.limit`, `budget.used`,
+`budget.remaining`, and `budget.exceeded` on the active span in both modes, so
+soft-mode overruns stay visible in the trace. `used()` and `remaining()` expose
+the current window without consuming from it.
+
 ## Assistant intent labels
 
 Applications can stamp assistant intent before any LLM/tool/action work
@@ -939,6 +1221,10 @@ such as "change the settings, then run the flow" emits `D,E` without
 LLM token usage. Provider integrations also classify the latest
 `role: "user"` text automatically when no active parent span already
 has intent labels.
+
+`classify_assistant_intent(text)` exposes the same deterministic classifier
+without touching a span, if you want to inspect or route on the labels before
+deciding what to instrument.
 
 For deterministic UI actions, pass local-only kwargs through supported
 LLM integrations; the SDK strips them before calling the provider:
@@ -1126,6 +1412,32 @@ shape the AML detectors expect. Calling them from inside an active
 `@prometa.workflow / .agent / .tool` decorator nests the AML spans
 under the parent — no extra wiring needed.
 
+See [`examples/aml_instrumentation.py`](examples/aml_instrumentation.py) for a
+full simulated agent turn wired through these helpers.
+
+### Dual-channel raw capture
+
+Eight of the 41 AML features exist precisely to *transform* raw input, so they
+cannot be detected from the sanitized record alone. The raw channel is the
+opt-in second stream that makes them auditable.
+
+```python
+import prometa
+
+prometa.raw_channel.enable()    # process-wide; call once at startup
+prometa.raw_channel.is_enabled()
+prometa.raw_channel.disable()
+```
+
+**Off by default.** While disabled, `raw_input=` / `raw_*` arguments to the
+guardrail, PII-filter, prompt, sentiment, and MCP helpers are dropped at the SDK
+boundary, so a misconfiguration cannot leak raw PII upstream. While enabled,
+those helpers stamp truncated `prometa.raw.*` attributes.
+
+The toggle is a module-level flag, not a per-client setting — flipping it
+mid-process affects every active client. Enable it only after confirming the org
+is authorized to emit raw attributes.
+
 ## AQL / PrometaQL query readiness
 
 AQL is the platform-side query and evaluation layer over the telemetry
@@ -1143,7 +1455,10 @@ the stable fields AQL filters and aggregates on:
 | `set_customer_id`, `set_user_id`, `set_conversation_id`, `set_request_model`, `set_tool_name` | canonical customer, user, session, model, and tool dimensions |
 | `set_assistant_intent` / `set_assistant_intent_from_text` | `prometa.intent.*` filters for user-turn intent and preclassified UI actions |
 | `set_input_ref`, `set_output_ref`, `current_span_id` | lineage edges for replay, judge, and flow-level queries |
+| `set_user_feedback` / `record_user_feedback` | `prometa.feedback.*` outcome labels for eval cohorts and regression tracking |
 | LLM integrations | `gen_ai.prompt`, `gen_ai.prompt.user`, `gen_ai.completion`, token usage, response model, finish reasons |
+| Framework integrations | `gen_ai.framework`, plus framework-native `db.*` / `mcp.*` / `crewai.*` / `sk.*` dimensions |
+| `TokenBudget.check` | `budget.used`, `budget.remaining`, `budget.exceeded` for throttling and spend queries |
 | AML helpers | typed evidence spans that AQL can join with ordinary lifecycle and LLM spans |
 
 In short: instrument once with the SDK, then run AQL / PrometaQL on the
@@ -1173,6 +1488,7 @@ prometa_google.install()
 ```
 
 Once installed, every `client.chat.completions.create(...)`,
+`client.responses.create(...)` (openai ≥ 1.40),
 `client.embeddings.create(...)`, `client.messages.create(...)`, and
 `client.models.generate_content(...)` call (sync, async, **and streaming**
 where applicable) emits a child span carrying:
@@ -1222,6 +1538,91 @@ policy gate ships and starts populating the `prometa.conversation_turns`
 table. When that lands, the panel will switch back to reading the
 processed-vs-raw pair from that table; the SDK contract does not
 change.
+
+## Framework auto-instrumentation
+
+Beyond the raw LLM clients, the SDK ships opt-in patchers for the agent
+frameworks and edge surfaces that most stacks already go through. Each is a
+`install()` call at startup that monkey-patches the framework's canonical entry
+points, so your existing code emits Prometa spans without decorators.
+
+Every `install()` returns `False` (a clean no-op) when the target library isn't
+importable — it is safe to call all of them unconditionally.
+
+```python
+from prometa import Prometa
+from prometa.integrations import (
+    langchain as prometa_langchain,
+    langgraph as prometa_langgraph,
+    crewai as prometa_crewai,
+    semantic_kernel as prometa_sk,
+    openai_agents as prometa_openai_agents,
+    mcp as prometa_mcp,
+    vector as prometa_vector,
+)
+
+Prometa(endpoint=..., api_key=..., solution_id=..., agent_name="my-agent")
+
+prometa_langchain.install()
+prometa_langgraph.install()
+prometa_crewai.install()
+prometa_sk.install()
+prometa_openai_agents.install()
+prometa_mcp.install()
+prometa_vector.install_all()   # {'pinecone': True, 'chroma': False, ...}
+```
+
+| Module | Patched entry points | Span kinds |
+|---|---|---|
+| `langchain` | `Runnable.invoke/ainvoke/batch/abatch`, `BaseChatModel.invoke/ainvoke`, `BaseTool.run/arun` | `agent`, `tool`, `task` |
+| `langgraph` | `StateGraph` / compiled-graph invocation | `workflow` (nodes nest via the LangChain patch) |
+| `crewai` | `Crew.kickoff`/`kickoff_async`, `Agent.execute_task`, `Task.execute_sync`/`execute_async` | `workflow`, `agent`, `task` |
+| `semantic_kernel` | `Kernel.invoke*`, `KernelFunction.invoke*`, `agents.Agent.invoke`/`get_response` | `workflow`, `task`, `agent` |
+| `openai_agents` | `Runner.run`/`run_sync`, `Agent.run`/`run_sync` | `agent` |
+| `mcp` | `mcp.ClientSession.call_tool` | `tool` |
+| `vector` | Pinecone `Index.query`, Chroma `Collection.query`, Weaviate query | `retrieval` |
+
+All of these stamp `gen_ai.framework` (`langchain`, `langgraph`, `crewai`,
+`semantic-kernel`, `openai-agents`, `mcp`, `pinecone` / `chroma` / `weaviate`),
+so you can filter or group by framework in AQL without knowing which patcher
+produced the span. They nest correctly under an enclosing
+`@prometa.workflow / .agent / .tool` when one is active, and stand alone when
+one isn't.
+
+Framework subclasses are walked at install time (LangChain, LangGraph, and
+CrewAI users commonly subclass), so `install()` must run **after** your classes
+are imported and **before** the first invocation.
+
+### MCP tool calls
+
+`prometa.integrations.mcp` turns each MCP tool invocation into a `tool` span
+carrying `mcp.server.name`, `mcp.tool.name`, `mcp.tool.args_count`, and the
+`gen_ai.tool.name` / `prometa.tool_name` aliases the platform's Tool registry
+keys on. Arguments and results are **not** captured unless the process-wide raw
+channel is enabled, in which case they are truncated into `prometa.raw.*`.
+
+Note this is the *client-side observability* patcher, distinct from
+`prometa.runtime`'s `GovernedMcpToolBroker`, which is a fail-closed execution
+control for signed bundles.
+
+### Vector retrievals
+
+Each `install_*` is independently opt-in and returns whether the client was
+importable:
+
+```python
+from prometa.integrations import vector as prometa_vector
+
+prometa_vector.install_pinecone()
+prometa_vector.install_chroma()
+prometa_vector.install_weaviate()
+```
+
+Retrieval spans carry OTel semantic `db.*` attributes plus a best-effort
+`db.result_count`. For richer AML-scored retrieval evidence (query text, scores,
+permission enforcement), use the `retrieval_query` helper described under
+[AML v0.4](#aml-v04-instrumentation-contract) instead of, or alongside, this
+patcher.
 
 ## OpenLLMetry bridge (optional)
 
@@ -1360,10 +1761,31 @@ all join on the same chain. The end-to-end design lives in
 
 - Python ≥ 3.9
 - `urllib` (standard library) for OTLP POST
-- No required third-party deps; LLM auto-instrumentation hooks are
-  opt-in and only run when the corresponding library is installed.
+- No required third-party deps; LLM and framework auto-instrumentation
+  hooks are opt-in and only run when the corresponding library is installed.
 - Optional OpenLLMetry bridge extras require Python ≥ 3.10 because the
-  current OpenLLMetry packages do.
+  current OpenLLMetry packages do. The `runtime-mcp` extra likewise requires
+  Python ≥ 3.10 for the official MCP transport SDK.
+- The `runtime*` extras add `cryptography` / `jsonschema` (and `psycopg` for the
+  PostgreSQL and host extras) only inside the tenant runtime component.
+
+## Examples
+
+Runnable examples live in [`examples/`](examples/). Each one degrades to a clean
+no-op when its optional dependency is missing, so they are all safe to run
+against a local Prometa instance:
+
+| Example | Shows |
+|---|---|
+| [`quickstart.py`](examples/quickstart.py) | end-to-end decorator smoke test |
+| [`aml_instrumentation.py`](examples/aml_instrumentation.py) | AML v0.4 helpers wired into a simulated agent turn |
+| [`data_flow_refs.py`](examples/data_flow_refs.py) | sibling input/output refs between an LLM and a tool span |
+| [`langchain_quickstart.py`](examples/langchain_quickstart.py) | LangChain auto-instrumentation |
+| [`crewai_quickstart.py`](examples/crewai_quickstart.py) | CrewAI auto-instrumentation |
+| [`openai_agents_quickstart.py`](examples/openai_agents_quickstart.py) | OpenAI Agents SDK auto-instrumentation |
+| [`mcp_vector_quickstart.py`](examples/mcp_vector_quickstart.py) | MCP tool calls + Pinecone / Chroma / Weaviate retrievals |
+| [`runtime_kernel_quickstart.py`](examples/runtime_kernel_quickstart.py) | admitting and executing one signed model-only bundle |
+| [`runtime_conformance_command_driver.py`](examples/runtime_conformance_command_driver.py) | subprocess adapter for `prometa-runtime-conformance --command` |
 
 ## Contributing
 

@@ -266,10 +266,12 @@ block.
 Bundle schema/runtime contract v2 adds exact capability-version ranges,
 deterministic policy and execution-configuration digests, and typed logical
 secret references. Admission recomputes both digests and cross-checks the range
-form against the exact `name.vN` compatibility mirror. Secret references name a
-tenant-resolved provider and purpose only; credential values never enter the
-signed artifact. Contract v3 adds the signed Company Workflow Ontology and its
-four workflow capabilities (see
+form against the exact `name.vN` compatibility mirror. A signed tool's
+`rateLimitPerMin` is covered by that configuration digest but is not a runtime
+control: no kernel or host component reads it, and the tenant gateway owns rate
+limiting. Secret references name a tenant-resolved provider and purpose only;
+credential values never enter the signed artifact. Contract v3 adds the signed
+Company Workflow Ontology and its four workflow capabilities (see
 [Company Workflow Ontology](#company-workflow-ontology-runtime-contract-v3)).
 Bundle schema versions 1–3 and runtime contract versions 1–3 are all admissible
 (`SUPPORTED_BUNDLE_SCHEMA_VERSIONS`, `SUPPORTED_RUNTIME_CONTRACT_VERSIONS`), so

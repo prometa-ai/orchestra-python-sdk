@@ -419,6 +419,11 @@ _TOOL_POLICY_KEYS = (
     "approvalRequired",
     "requiredGuardrails",
 )
+# ``rateLimitPerMin`` is a digest input only. Nothing reads it: rate limiting is
+# distributed state the tenant gateway owns, and a per-replica counter would
+# understate the fleet-wide limit rather than enforce it. Dropping the key would
+# change the configuration digest of every already-signed bundle that declares
+# it, so it stays in the projection until a contract version can retire it.
 _TOOL_CONFIGURATION_KEYS = (
     "name",
     "source",

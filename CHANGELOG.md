@@ -210,6 +210,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Secrets, proves stale clients fail after server rotation, and requires a
   runtime rollout before fresh calls recover. It certifies read-only tools only;
   write/destructive tools and resumable approval remain outside the claim.
+- A signed tool's `rateLimitPerMin` is bound into the configuration digest but is
+  not enforced by the runtime. It is now documented as inert and pinned by tests
+  so it cannot be mistaken for a local control; distributed rate limiting remains
+  a tenant-gateway responsibility.
 
 ## [0.18.0] - 2026-07-12
 

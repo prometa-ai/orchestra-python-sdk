@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from prometa import __version__ as RUNTIME_VERSION
+from prometa.runtime import admission
 
 
 ROOT = Path(__file__).parent.parent
@@ -48,6 +49,13 @@ def _pod(name: str, ip: str, node: str):
             "conditions": [{"type": "Ready", "status": "True"}],
         },
     }
+
+
+def test_topology_fixture_mirrors_the_admission_digest_projection_keys():
+    fixture = _load_module("topology_fixture_projection_keys", FIXTURE_PATH)
+
+    assert fixture._TOOL_POLICY_KEYS == admission._TOOL_POLICY_KEYS
+    assert fixture._TOOL_CONFIGURATION_KEYS == admission._TOOL_CONFIGURATION_KEYS
 
 
 def test_topology_profile_is_pinned_and_explicitly_non_production():

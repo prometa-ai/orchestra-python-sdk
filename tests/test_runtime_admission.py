@@ -193,6 +193,103 @@ def _add_security_guardrail(content, *, complete=True) -> None:
     )
 
 
+_RATE_LIMITED_TOOL = {
+    "name": "Lookup",
+    "source": "native",
+    "operation": "lookup",
+    "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"q": {"type": "string", "minLength": 1}},
+        "required": ["q"],
+        "additionalProperties": False,
+    },
+    "sideEffects": "read-only",
+    "riskLevel": "low",
+    "authBinding": "none",
+    "scopes": [],
+    "approvalRequired": False,
+    "requiredGuardrails": [],
+    "rateLimitPerMin": 60,
+}
+
+_TOOL_POLICY_PROJECTION_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "sideEffects",
+    "riskLevel",
+    "authBinding",
+    "scopes",
+    "approvalRequired",
+    "requiredGuardrails",
+)
+_TOOL_CONFIGURATION_PROJECTION_KEYS = (
+    "name",
+    "source",
+    "mcpServer",
+    "operation",
+    "inputSchema",
+)
+
+
+def _add_rate_limited_tool(content, *, digest_covers_rate_limit=True) -> None:
+    content["tools"] = [copy.deepcopy(_RATE_LIMITED_TOOL)]
+    contract = content["runtimeContract"]
+    contract["requiredCapabilities"] = sorted(
+        {*contract["requiredCapabilities"], CAPABILITY_TOOL_BROKER}
+    )
+    contract["capabilityRequirements"] = sorted(
+        [
+            *contract["capabilityRequirements"],
+            {"name": "tool.broker", "minVersion": 1, "maxVersion": 1},
+        ],
+        key=lambda value: value["name"],
+    )
+    configuration_keys = _TOOL_CONFIGURATION_PROJECTION_KEYS
+    if digest_covers_rate_limit:
+        configuration_keys += ("rateLimitPerMin",)
+
+    def selected(tool, keys):
+        return {key: tool[key] for key in keys if key in tool}
+
+    contract["policyDigest"] = _canonical_digest(
+        {
+            "guardrails": content.get("guardrails", []),
+            "identity": content.get("identity"),
+            "tools": [
+                selected(tool, _TOOL_POLICY_PROJECTION_KEYS)
+                for tool in content["tools"]
+            ],
+            "requiredScopes": content.get("requiredScopes", []),
+            "grantedScopes": content.get("grantedScopes", []),
+        }
+    )
+    contract["configurationDigest"] = _canonical_digest(
+        {
+            "manifest": content.get("manifest"),
+            "systemPrompt": content.get("systemPrompt"),
+            "models": content.get("models"),
+            "primaryModel": content.get("primaryModel"),
+            "topology": content.get("topology"),
+            "tools": [
+                selected(tool, configuration_keys) for tool in content["tools"]
+            ],
+            "skills": content.get("skills", []),
+            "knowledge": content.get("knowledge", []),
+            "memory": content.get("memory", []),
+            "subAgents": content.get("subAgents", []),
+            "workflows": content.get("workflows", []),
+            "triggers": content.get("triggers", []),
+            "evaluation": content.get("evaluation", []),
+            "inputSchema": contract.get("inputSchema"),
+            "outputSchema": contract.get("outputSchema"),
+            "mcpServers": content.get("mcpServers", []),
+        }
+    )
+
+
 def test_signed_and_promoted_runtime_contract_admits_atomically(vector) -> None:
     replay = InMemoryAdmissionReplayStore()
     admitted = _admit(vector, replay_store=replay)
@@ -367,6 +464,58 @@ def test_v2_contract_recomputes_signed_projection_digests(vector_v2, field, code
             supported_capabilities={
                 *BASE_RUNTIME_CAPABILITIES,
                 CAPABILITY_SCHEMA_VALIDATE,
+            },
+        ),
+    )
+
+
+def test_signed_tool_rate_limit_binds_the_digest_but_reaches_no_runtime_field(
+    vector_v2,
+) -> None:
+    verified = _mutated_verified(vector_v2, _add_rate_limited_tool)
+    config = parse_runtime_bundle(
+        verified,
+        supported_capabilities={
+            *BASE_RUNTIME_CAPABILITIES,
+            CAPABILITY_SCHEMA_VALIDATE,
+            CAPABILITY_TOOL_BROKER,
+        },
+    )
+
+    tool = config.tools[0]
+    assert tool.name == "Lookup"
+    assert set(type(tool).__dataclass_fields__) == {
+        "name",
+        "source",
+        "operation",
+        "input_schema",
+        "mcp_server",
+        "side_effects",
+        "risk_level",
+        "auth_binding",
+        "scopes",
+        "approval_required",
+        "required_guardrails",
+    }
+
+
+def test_signed_tool_rate_limit_omitted_from_the_projection_fails_admission(
+    vector_v2,
+) -> None:
+    verified = _mutated_verified(
+        vector_v2,
+        lambda content: _add_rate_limited_tool(
+            content, digest_covers_rate_limit=False
+        ),
+    )
+    _assert_code(
+        "runtime_configuration_digest_mismatch",
+        lambda: parse_runtime_bundle(
+            verified,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+                CAPABILITY_TOOL_BROKER,
             },
         ),
     )

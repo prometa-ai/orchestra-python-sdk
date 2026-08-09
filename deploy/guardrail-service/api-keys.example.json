@@ -1,0 +1,7 @@
+[
+  {
+    "key": "REPLACE-WITH-A-32-BYTE-RANDOM-VALUE",
+    "tenant": "acme-prod",
+    "org_id": "org-acme"
+  }
+]

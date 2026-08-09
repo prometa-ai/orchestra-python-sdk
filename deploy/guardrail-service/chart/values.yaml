@@ -1,0 +1,95 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+revisionHistoryLimit: 5
+
+image:
+  repository: prometa-guardrail-service
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  # Immutable digest wins over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+# Compatible with Kubernetes restricted Pod Security and OpenShift-assigned UIDs.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# The chart never creates these objects. guardrailConfig carries the profile
+# document; credentials carries the bearer keys file the service authenticates
+# against. Set exactly one source for the config.
+guardrailConfig:
+  existingSecret: ""
+  existingConfigMap: ""
+  key: config.json
+  targetFile: config.json
+  # A non-secret tenant CI/CD deployment identifier. Changing it updates the
+  # pod template even when an external object name is unchanged.
+  rolloutId: ""
+
+credentials:
+  existingSecret: ""
+  apiKeysKey: api-keys.json
+
+containerPort: 8080
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# The evaluator never calls out: no model, no database, no control plane. The
+# default policy therefore allows no egress at all, which is what makes the
+# air-gapped deployment the same artifact as the connected one.
+networkPolicy:
+  enabled: true
+  allowDNS: false
+  dnsNamespaceSelector: {}
+  dnsPodSelector: {}
+  ingress: []
+  egress: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+# The service holds no request beyond the call, so draining is short.
+gracefulShutdown:
+  terminationGracePeriodSeconds: 15
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1

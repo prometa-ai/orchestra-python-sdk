@@ -1,0 +1,19 @@
+services:
+  guardrail:
+    image: ${PROMETA_GUARDRAIL_IMAGE:-prometa-guardrail-service:0.20.1}
+    restart: unless-stopped
+    read_only: true
+    environment:
+      PROMETA_GUARDRAIL_CONFIG: /etc/prometa-guardrail/config.json
+    volumes:
+      - ./config.json:/etc/prometa-guardrail/config.json:ro
+      - ./api-keys.json:/etc/prometa-guardrail/api-keys.json:ro
+    ports:
+      - "127.0.0.1:${PROMETA_GUARDRAIL_PORT:-8080}:8080"
+    stop_grace_period: 15s
+
+  conformance:
+    profiles: ["operations"]
+    image: ${PROMETA_GUARDRAIL_IMAGE:-prometa-guardrail-service:0.20.1}
+    entrypoint: ["prometa-guardrail-conformance"]
+    restart: "no"

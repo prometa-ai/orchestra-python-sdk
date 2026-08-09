@@ -1,0 +1,41 @@
+{{- include "prometa-guardrail.validateValues" . }}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "prometa-guardrail.fullname" . }}
+  labels:
+    {{- include "prometa-guardrail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: guardrail
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "prometa-guardrail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: guardrail
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.networkPolicy.ingress }}
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+    {{- else }} []
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.allowDNS }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.dnsNamespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.dnsPodSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- with .Values.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and (not .Values.networkPolicy.allowDNS) (empty .Values.networkPolicy.egress) }} []
+    {{- end }}
+{{- end }}

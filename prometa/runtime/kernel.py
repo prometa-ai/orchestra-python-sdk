@@ -621,6 +621,7 @@ class RuntimeKernel:
                 "runtime_component_missing",
                 "Missing runtime component: workflow postcondition validator",
             )
+        self._assert_broker_guardrails_reconcile()
         self._models = self._resolve_models()
         self._emit(
             "runtime.release.admitted",
@@ -630,6 +631,26 @@ class RuntimeKernel:
                 "prometa.runtime.contract_version": admission.config.contract.contract_version
             },
         )
+
+    def _assert_broker_guardrails_reconcile(self) -> None:
+        """Refuse a broker wired with a different guardrail set than admitted.
+
+        The broker owns ``tool_result`` and is constructed with its own
+        guardrail list, while every other stage reads
+        ``admission.config.guardrails``. Nothing else compares the two, so a
+        broker holding a stale or empty list would enforce a policy the signed
+        release does not declare, at the one stage where the tool has already
+        run.
+        """
+
+        declared = getattr(self.tool_broker, "declared_guardrails", None)
+        if declared is None:
+            return
+        if tuple(declared) != tuple(self.admission.config.guardrails):
+            raise RuntimeExecutionError(
+                "guardrail_policy_source_divergent",
+                "The tool broker's guardrails differ from the admitted release's.",
+            )
 
     def _resolve_models(self) -> Tuple[RuntimeModel, ...]:
         by_name = {model.name: model for model in self.admission.config.models}

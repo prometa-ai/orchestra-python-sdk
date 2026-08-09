@@ -13,6 +13,7 @@ OPTIONAL_DISTRIBUTIONS = (
     "httpx",
     "jsonschema",
     "mcp",
+    "presidio_analyzer",
     "psycopg",
 )
 OPTIONAL_IMPORT_ROOTS = frozenset(OPTIONAL_DISTRIBUTIONS)
@@ -63,6 +64,22 @@ def main() -> None:
     if loaded := _loaded_optional_modules():
         raise AssertionError(
             "import prometa.runtime loaded optional modules: %s" % (loaded,)
+        )
+
+    guardrail = importlib.import_module("prometa.guardrail")
+    if loaded := _loaded_optional_modules():
+        raise AssertionError(
+            "import prometa.guardrail loaded optional modules: %s" % (loaded,)
+        )
+    report = guardrail.run_guardrail_conformance(guardrail.build_conformance_driver())
+    if not report.passed:
+        raise AssertionError(
+            "guardrail conformance failed on the core wheel: %s"
+            % ([check.check_id for check in report.failures],)
+        )
+    if loaded := _loaded_optional_modules():
+        raise AssertionError(
+            "guardrail conformance loaded optional modules: %s" % (loaded,)
         )
     if runtime.CAPABILITY_SCHEMA_VALIDATE in runtime.available_runtime_capabilities():
         raise AssertionError("schema capability advertised without the runtime extra")

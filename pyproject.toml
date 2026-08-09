@@ -56,6 +56,16 @@ runtime-mcp = [
     "jsonschema>=4.23,<5",
     "mcp>=1.28.1,<2; python_version >= '3.10'",
 ]
+# The evaluate contract, the detector pack, the reference service and its host
+# are stdlib-only; these two extras exist to pin intent, not to add packages.
+guardrail-client = []
+guardrail-service = []
+# The in-process evaluator used beside the runtime kernel, which needs the
+# runtime extra to admit a signed bundle in the first place.
+guardrail = [
+    "cryptography>=42",
+    "jsonschema>=4.23,<5",
+]
 runtime-postgres = [
     "cryptography>=42",
     "jsonschema>=4.23,<5",
@@ -75,6 +85,8 @@ prometa-runtime-postgres-compatibility = "prometa.runtime.postgres:compatibility
 prometa-runtime-postgres-verify = "prometa.runtime.postgres:verify_main"
 prometa-runtime-host = "prometa.runtime.host:main"
 prometa-runtime-host-conformance-driver = "prometa.runtime.host_conformance:main"
+prometa-guardrail-service = "prometa.guardrail.host:main"
+prometa-guardrail-conformance = "prometa.guardrail.conformance:main"
 
 [project.urls]
 Homepage = "https://prometa.io"

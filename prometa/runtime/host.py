@@ -48,6 +48,7 @@ from .kernel import (
     RuntimeExecutionPolicy,
     RuntimeExecutionResult,
     RuntimeKernel,
+    _validate_model_identity,
     available_runtime_capabilities,
     runtime_release_identity_attributes,
 )
@@ -276,6 +277,16 @@ def _identifier(name: str, value: Any, maximum: int = 128) -> str:
     ):
         raise RuntimeHostError("invalid_%s" % name)
     return value
+
+
+def _runtime_request_identifier(value: Any) -> str:
+    """Validate a host request ID against the shared model identity contract."""
+
+    request_id = _identifier("request_id", value, 256)
+    try:
+        return _validate_model_identity(request_id, "request_id")
+    except ValueError:
+        raise RuntimeHostError("invalid_request_id") from None
 
 
 def _bounded_string(name: str, value: Any, maximum: int) -> str:
@@ -1495,7 +1506,7 @@ class ReferenceRuntimeHost:
                 optional=("workflowContext",),
                 code="request_invalid",
             )
-            request_id = _identifier("request_id", request["requestId"], 256)
+            request_id = _runtime_request_identifier(request["requestId"])
             workflow_context = (
                 parse_workflow_execution_context(request["workflowContext"])
                 if "workflowContext" in request

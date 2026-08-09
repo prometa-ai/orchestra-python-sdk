@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from .kernel import (
@@ -17,7 +18,131 @@ from .kernel import (
     ModelInvocationResponse,
     ModelTokenUsage,
     ModelToolCall,
+    _canonical_server_identity,
 )
+
+
+_CLIENT_IDENTITY_HEADERS = frozenset(
+    {
+        "x-orchestra-runtime-request-id",
+        "x-orchestra-model-invocation-id",
+        "x-orchestra-model-attempt-id",
+    }
+)
+_SERVER_IDENTITY_HEADERS = frozenset(
+    {"x-request-id", "x-orchestra-usage-record-id"}
+)
+_TRACE_CONTEXT_HEADERS = frozenset({"traceparent", "tracestate", "baggage"})
+_RESERVED_REQUEST_HEADERS = (
+    _CLIENT_IDENTITY_HEADERS | _SERVER_IDENTITY_HEADERS | _TRACE_CONTEXT_HEADERS
+)
+
+
+def _native_prometa_trace_headers() -> Mapping[str, str]:
+    """Translate the active native Prometa span into W3C trace context."""
+
+    try:
+        from .. import _context
+    except ImportError:
+        return {}
+    try:
+        span = _context.current_span()
+    except Exception:  # noqa: BLE001 - telemetry must not break execution
+        return {}
+    if span is None:
+        return {}
+    trace_id = getattr(span, "trace_id", None)
+    span_id = getattr(span, "span_id", None)
+    if (
+        not isinstance(trace_id, str)
+        or len(trace_id) != 32
+        or trace_id == "0" * 32
+        or any(character not in "0123456789abcdef" for character in trace_id)
+        or not isinstance(span_id, str)
+        or len(span_id) != 16
+        or span_id == "0" * 16
+        or any(character not in "0123456789abcdef" for character in span_id)
+    ):
+        return {}
+    return {"traceparent": "00-%s-%s-01" % (trace_id, span_id)}
+
+
+def _otel_w3c_trace_headers() -> Mapping[str, str]:
+    """Inject active W3C trace context when OpenTelemetry is installed.
+
+    The runtime extra intentionally does not depend on OpenTelemetry.  When an
+    application has enabled the optional tracing stack, its current context is
+    the fallback when there is no native Prometa span.
+    """
+
+    try:
+        from opentelemetry.trace.propagation.tracecontext import (  # type: ignore
+            TraceContextTextMapPropagator,
+        )
+    except ImportError:
+        return {}
+    carrier: Dict[str, str] = {}
+    try:
+        TraceContextTextMapPropagator().inject(carrier)
+    except Exception:  # noqa: BLE001 - tracing must not break model execution
+        return {}
+    return {
+        key.lower(): value
+        for key, value in carrier.items()
+        if key.lower() in {"traceparent", "tracestate"}
+        and isinstance(value, str)
+        and "\r" not in value
+        and "\n" not in value
+    }
+
+
+def _w3c_trace_headers() -> Mapping[str, str]:
+    """Prefer native Prometa context, then optional OpenTelemetry context."""
+
+    return _native_prometa_trace_headers() or _otel_w3c_trace_headers()
+
+
+def _response_identity_header(
+    headers: Any, name: str, field_name: str
+) -> Optional[str]:
+    """Read one canonical server identity; legacy echoes become absent."""
+
+    if headers is None:
+        return None
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        values = list(get_all(name) or ())
+    else:
+        items = getattr(headers, "items", None)
+        values = (
+            [value for key, value in items() if str(key).lower() == name]
+            if callable(items)
+            else []
+        )
+    if not values:
+        return None
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    return _canonical_server_identity(values[0], field_name)
+
+
+def _response_identities(
+    headers: Any, runtime_request_id: str
+) -> Tuple[Optional[str], Optional[str]]:
+    engine_request_id = _response_identity_header(
+        headers, "x-request-id", "engine_request_id"
+    )
+    if engine_request_id == runtime_request_id:
+        # Old engines echoed the caller's runtime identity in x-request-id.
+        # Even a caller-selected value that resembles a canonical engine ID
+        # remains caller-owned and must never be relabeled as server-owned.
+        engine_request_id = None
+    return (
+        engine_request_id,
+        _response_identity_header(
+            headers, "x-orchestra-usage-record-id", "usage_record_id"
+        ),
+    )
 
 
 def _reject_duplicate_keys(pairs):
@@ -40,8 +165,12 @@ def _strict_json_loads(value, code):
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_json_constant,
         )
-    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ModelAdapterError(code) from exc
+    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    # Raise after leaving the parser exception handler. JSONDecodeError keeps
+    # the complete source document, which must not remain reachable through a
+    # public adapter error's cause/context chain.
+    raise ModelAdapterError(code)
 
 
 def _non_negative_int(value: Any) -> int:
@@ -228,7 +357,12 @@ class OpenAICompatibleModelAdapter:
         return min(seconds, 86_400.0)
 
     @staticmethod
-    def _parse_response(data: bytes) -> ModelInvocationResponse:
+    def _parse_response(
+        data: bytes,
+        *,
+        engine_request_id: Optional[str] = None,
+        usage_record_id: Optional[str] = None,
+    ) -> ModelInvocationResponse:
         document = _strict_json_loads(data, "model_response_invalid_json")
         if not isinstance(document, dict):
             raise ModelAdapterError("model_response_invalid")
@@ -280,6 +414,8 @@ class OpenAICompatibleModelAdapter:
                 provider_model if isinstance(provider_model, str) else None
             ),
             usage=_parse_usage(document.get("usage")),
+            engine_request_id=engine_request_id,
+            usage_record_id=usage_record_id,
         )
 
     def _invoke_sync(self, request: ModelInvocationRequest) -> ModelInvocationResponse:
@@ -290,10 +426,17 @@ class OpenAICompatibleModelAdapter:
             allow_nan=False,
         ).encode("utf-8")
         headers = {
-            **self.headers,
+            **{
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in _RESERVED_REQUEST_HEADERS
+            },
             "content-type": "application/json",
             "accept": "application/json",
-            "x-orchestra-runtime-request-id": request.request_id,
+            "x-orchestra-runtime-request-id": request.runtime_request_id,
+            "x-orchestra-model-invocation-id": request.model_invocation_id,
+            "x-orchestra-model-attempt-id": request.model_attempt_id,
+            **_w3c_trace_headers(),
         }
         if self.api_key:
             headers["authorization"] = "Bearer %s" % self.api_key
@@ -303,10 +446,16 @@ class OpenAICompatibleModelAdapter:
             headers=headers,
             method="POST",
         )
+        engine_request_id: Optional[str] = None
+        usage_record_id: Optional[str] = None
+        request_failure: Optional[ModelAdapterError] = None
         try:
             with urllib.request.urlopen(
                 http_request, timeout=self.timeout_seconds
             ) as response:
+                engine_request_id, usage_record_id = _response_identities(
+                    getattr(response, "headers", None), request.runtime_request_id
+                )
                 data = response.read(self.max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
             # Read the OpenAI-shaped ``error`` object when there is one: the
@@ -316,6 +465,9 @@ class OpenAICompatibleModelAdapter:
             # raise — a failure to parse the failure just falls through to
             # status-code semantics.
             code: Optional[str] = None
+            engine_request_id, usage_record_id = _response_identities(
+                exc.headers, request.runtime_request_id
+            )
             try:
                 code = _error_code(exc.read(self.max_response_bytes))
             except Exception:  # noqa: BLE001 — never mask the original HTTPError
@@ -328,7 +480,7 @@ class OpenAICompatibleModelAdapter:
             # ``code`` stays ``model_http_<status>`` — callers already branch on
             # it and renaming it would break them. The provider's own code is
             # additive, on ``provider_code``.
-            raise ModelAdapterError(
+            request_failure = ModelAdapterError(
                 "model_http_%s" % exc.code,
                 "Model gateway returned HTTP %s%s"
                 % (exc.code, " (%s)" % code if code else ""),
@@ -337,12 +489,58 @@ class OpenAICompatibleModelAdapter:
                     self._retry_after_seconds(exc.headers) if retryable else None
                 ),
                 provider_code=code,
-            ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ModelAdapterError("model_transport_failed", retryable=True) from exc
+                engine_request_id=engine_request_id,
+                usage_record_id=usage_record_id,
+            )
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ):
+            request_failure = ModelAdapterError(
+                "model_transport_failed",
+                retryable=True,
+                engine_request_id=engine_request_id,
+                usage_record_id=usage_record_id,
+            )
+        # Raise outside the source exception handler: HTTPError owns its body
+        # stream and IncompleteRead owns ``partial`` bytes. Neither may remain
+        # reachable through ModelAdapterError.__cause__ or __context__.
+        if request_failure is not None:
+            raise request_failure
         if len(data) > self.max_response_bytes:
-            raise ModelAdapterError("model_response_too_large")
-        return self._parse_response(data)
+            raise ModelAdapterError(
+                "model_response_too_large",
+                engine_request_id=engine_request_id,
+                usage_record_id=usage_record_id,
+            )
+        try:
+            return self._parse_response(
+                data,
+                engine_request_id=engine_request_id,
+                usage_record_id=usage_record_id,
+            )
+        except ModelAdapterError as exc:
+            # Parsing and semantic response validation happen after a priced
+            # engine request. Preserve only the two allowlisted server IDs so
+            # the runtime's failure evidence remains joinable to that ledger
+            # record without copying response headers wholesale.
+            if exc.engine_request_id is not None or exc.usage_record_id is not None:
+                response_failure = exc
+            else:
+                response_failure = ModelAdapterError(
+                    exc.code,
+                    str(exc),
+                    retryable=exc.retryable,
+                    retry_after_seconds=exc.retry_after_seconds,
+                    provider_code=exc.provider_code,
+                    engine_request_id=engine_request_id,
+                    usage_record_id=usage_record_id,
+                )
+        # The parser exception can retain the full response document. Raise the
+        # allowlisted replacement only after leaving that exception handler.
+        raise response_failure
 
     async def invoke(self, request: ModelInvocationRequest) -> ModelInvocationResponse:
         return await asyncio.to_thread(self._invoke_sync, request)

@@ -15,6 +15,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -309,6 +310,134 @@ def test_reference_host_health_auth_schema_and_success_contract() -> None:
         assert duplicate_json.body == {"error": {"code": "request_invalid_json"}}
         assert host.handle("GET", "/v1/runtime/execute", {}).status == 405
         assert host.handle("GET", "/missing", {}).status == 404
+    finally:
+        host.close()
+
+
+def test_reference_host_rejects_null_sentinel_request_ids_before_task_claim() -> None:
+    store = InMemoryRuntimeTaskStore()
+    adapter = RecordingModelAdapter(_vector()["sampleOutput"])
+    host = _host(adapter, task_store=store)
+    sentinels = []
+    for sentinel in ("null", "none", "nil", "undefined"):
+        sentinels.extend(
+            "".join(characters)
+            for characters in product(
+                *((character.lower(), character.upper()) for character in sentinel)
+            )
+        )
+
+    try:
+        for request_id in sentinels:
+            response = _execute(
+                host,
+                {"requestId": request_id, "input": _vector()["sampleInput"]},
+            )
+            assert response.status == 400
+            assert response.body == {"error": {"code": "invalid_request_id"}}
+            assert store.get(request_id) is None
+
+        assert adapter.requests == []
+        assert host._inflight == set()
+        assert not any(
+            event.name == "runtime.task.claim"
+            for event in host.kernel.evidence_emitter.events
+        )
+    finally:
+        host.close()
+
+
+def test_reference_host_request_sentinels_do_not_restrict_campaign_ids() -> None:
+    host = _host(RecordingModelAdapter(_vector()["sampleOutput"]))
+
+    class CapturingRunner:
+        def __init__(self):
+            self.correlation = None
+
+        def execute(
+            self,
+            payload,
+            request_id,
+            timeout_seconds,
+            security_correlation=None,
+        ):
+            self.correlation = security_correlation
+            return RuntimeExecutionResult(
+                request_id=request_id,
+                output=_vector()["sampleOutput"],
+                model_name="test-model",
+                attempts=1,
+                tool_calls=0,
+                used_fallback=False,
+            )
+
+        def close(self):
+            return None
+
+    host._runner.close()
+    runner = CapturingRunner()
+    host._runner = runner
+    try:
+        response = host.handle(
+            "POST",
+            "/v1/runtime/execute",
+            {
+                "authorization": "Bearer %s" % API_TOKEN,
+                "content-type": "application/json",
+                "x-prometa-campaign-id": "null",
+            },
+            json.dumps(
+                {"requestId": "request-campaign", "input": _vector()["sampleInput"]}
+            ).encode("utf-8"),
+        )
+        assert response.status == 200
+        assert runner.correlation.campaign_id == "null"
+    finally:
+        host.close()
+
+
+def test_reference_host_keeps_historical_sentinel_task_status_readable() -> None:
+    store = InMemoryRuntimeTaskStore()
+    vector, admitted = _admitted()
+    promotion = admitted.promotion.claims
+    store.claim(
+        "NuLl",
+        input_digest=canonical_payload_digest(vector["sampleInput"]),
+        artifact_digest=admitted.artifact_digest,
+        release_id=promotion["releaseId"],
+        deployment_id=promotion["deploymentId"],
+        recoverable=True,
+        max_attempts=3,
+        lease_seconds=10,
+        now=datetime.now(timezone.utc) - timedelta(seconds=11),
+    )
+    host = _host(
+        RecordingModelAdapter(vector["sampleOutput"]),
+        task_store=store,
+    )
+    try:
+        status = host.handle(
+            "GET",
+            "/v1/runtime/tasks/NuLl",
+            {"authorization": "Bearer %s" % API_TOKEN},
+        )
+        assert status.status == 200
+        assert status.body["requestId"] == "NuLl"
+        assert status.body["attempt"] == 1
+        assert [event["transition"] for event in status.body["lifecycle"]] == [
+            "claimed"
+        ]
+
+        rejected_retry = _execute(
+            host,
+            {"requestId": "NuLl", "input": vector["sampleInput"]},
+        )
+        assert rejected_retry.status == 400
+        assert rejected_retry.body == {"error": {"code": "invalid_request_id"}}
+        unchanged = store.get("NuLl")
+        assert unchanged is not None
+        assert unchanged.record.attempt == 1
+        assert [event.transition for event in unchanged.events] == ["claimed"]
     finally:
         host.close()
 

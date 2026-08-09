@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from datetime import datetime, timezone
 from math import isfinite
 from typing import (
@@ -74,6 +75,67 @@ from .workflow_ontology import (
 
 
 RUNTIME_EDGE_OVERLOAD_CONTRACT = "orchestra-runtime-edge-overload-v1"
+MODEL_IDENTITY_MAX_LENGTH = 256
+_RESERVED_EXTERNAL_IDENTITIES = frozenset({"null", "none", "nil", "undefined"})
+_ENGINE_REQUEST_ID_PATTERN = re.compile(r"req_[0-9a-f]{32}\Z")
+_USAGE_RECORD_ID_PATTERN = re.compile(r"usage_[0-9a-f]{32}\Z")
+_MODEL_INVOCATION_MISSING = object()
+
+
+def _validate_model_identity(value: Any, field_name: str) -> str:
+    """Validate one cross-plane identity without rewriting it.
+
+    The inference-engine contract accepts visible ASCII only.  Keeping the
+    validation byte-for-byte (rather than stripping or truncating) prevents
+    two distinct upstream identities from collapsing onto one ledger key.
+    """
+
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= MODEL_IDENTITY_MAX_LENGTH
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+    ):
+        raise ValueError(
+            "%s must be 1-256 visible ASCII characters" % field_name
+        )
+    if value.lower() in _RESERVED_EXTERNAL_IDENTITIES:
+        raise ValueError("%s uses a reserved null identity sentinel" % field_name)
+    return value
+
+
+def _canonical_server_identity(value: Any, field_name: str) -> Optional[str]:
+    """Return a canonical server-owned ID, or ``None`` for legacy input.
+
+    Older inference-engine releases echoed the runtime request identity in
+    ``x-request-id``.  Treating a non-canonical value as absent prevents that
+    legacy echo from being mislabeled as an engine-owned request identity.
+    """
+
+    pattern = {
+        "engine_request_id": _ENGINE_REQUEST_ID_PATTERN,
+        "usage_record_id": _USAGE_RECORD_ID_PATTERN,
+    }.get(field_name)
+    if pattern is None:
+        raise ValueError("unsupported server identity field")
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _validate_optional_server_identity(
+    value: Optional[str], field_name: str
+) -> Optional[str]:
+    if value is None:
+        return None
+    canonical = _canonical_server_identity(value, field_name)
+    if canonical is None:
+        expected = (
+            "req_[0-9a-f]{32}"
+            if field_name == "engine_request_id"
+            else "usage_[0-9a-f]{32}"
+        )
+        raise ValueError("%s must match %s" % (field_name, expected))
+    return canonical
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -102,6 +164,8 @@ class ModelAdapterError(RuntimeExecutionError):
         retryable: bool = False,
         retry_after_seconds: Optional[float] = None,
         provider_code: Optional[str] = None,
+        engine_request_id: Optional[str] = None,
+        usage_record_id: Optional[str] = None,
     ) -> None:
         if retry_after_seconds is not None and (
             not retryable
@@ -122,6 +186,12 @@ class ModelAdapterError(RuntimeExecutionError):
         # additive, more specific signal.
         self.provider_code = (
             provider_code if isinstance(provider_code, str) and provider_code else None
+        )
+        self.engine_request_id = _validate_optional_server_identity(
+            engine_request_id, "engine_request_id"
+        )
+        self.usage_record_id = _validate_optional_server_identity(
+            usage_record_id, "usage_record_id"
         )
         super().__init__(code, message, retryable=retryable)
 
@@ -209,7 +279,7 @@ class ModelToolCall:
     arguments: Mapping[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ModelInvocationRequest:
     request_id: str
     model: RuntimeModel
@@ -217,6 +287,132 @@ class ModelInvocationRequest:
     tools: Tuple[RuntimeTool, ...]
     output_schema: Optional[Mapping[str, Any]]
     attempt: int
+    # InitVars remain outside fields/asdict/repr/equality while teaching
+    # dataclasses.replace() to carry the two non-legacy identities forward.
+    _clone_model_invocation_id: InitVar[Optional[str]] = None
+    _clone_model_attempt_id: InitVar[Optional[str]] = None
+    __match_args__ = (
+        "request_id",
+        "model",
+        "messages",
+        "tools",
+        "output_schema",
+        "attempt",
+    )
+
+    def __init__(
+        self,
+        request_id: Any = _MODEL_INVOCATION_MISSING,
+        model: Any = _MODEL_INVOCATION_MISSING,
+        messages: Any = _MODEL_INVOCATION_MISSING,
+        tools: Any = _MODEL_INVOCATION_MISSING,
+        output_schema: Any = _MODEL_INVOCATION_MISSING,
+        attempt: Any = _MODEL_INVOCATION_MISSING,
+        *,
+        runtime_request_id: Any = _MODEL_INVOCATION_MISSING,
+        model_invocation_id: Optional[str] = None,
+        model_attempt_id: Optional[str] = None,
+        _clone_model_invocation_id: Optional[str] = None,
+        _clone_model_attempt_id: Optional[str] = None,
+    ) -> None:
+        """Build a request while retaining the public v1 call signature.
+
+        The declared dataclass fields and first six parameters deliberately
+        match the former public shape. New callers can use
+        ``runtime_request_id``; kernel callers additionally supply the semantic
+        invocation and unique attempt identities. Those identities are exposed
+        as properties without changing legacy ``fields()``, ``asdict()``, repr,
+        equality, or positional pattern matching. Legacy construction gets safe
+        UUID identities.
+        """
+
+        if runtime_request_id is _MODEL_INVOCATION_MISSING:
+            if request_id is _MODEL_INVOCATION_MISSING:
+                raise TypeError("request_id or runtime_request_id is required")
+            resolved_runtime_request_id = request_id
+        else:
+            resolved_runtime_request_id = runtime_request_id
+            if (
+                request_id is not _MODEL_INVOCATION_MISSING
+                and request_id != runtime_request_id
+            ):
+                raise ValueError("request_id and runtime_request_id must match")
+        missing_fields = [
+            name
+            for name, value in (
+                ("model", model),
+                ("messages", messages),
+                ("tools", tools),
+                ("output_schema", output_schema),
+                ("attempt", attempt),
+            )
+            if value is _MODEL_INVOCATION_MISSING
+        ]
+        if missing_fields:
+            raise TypeError(
+                "missing required ModelInvocationRequest fields: %s"
+                % ", ".join(missing_fields)
+            )
+        object.__setattr__(self, "request_id", resolved_runtime_request_id)
+        resolved_model_invocation_id = (
+            model_invocation_id
+            if model_invocation_id is not None
+            else _clone_model_invocation_id
+        )
+        resolved_model_attempt_id = (
+            model_attempt_id
+            if model_attempt_id is not None
+            else _clone_model_attempt_id
+        )
+        object.__setattr__(
+            self,
+            "_clone_model_invocation_id",
+            (
+                resolved_model_invocation_id
+                if resolved_model_invocation_id is not None
+                else str(uuid.uuid4())
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_clone_model_attempt_id",
+            (
+                resolved_model_attempt_id
+                if resolved_model_attempt_id is not None
+                else str(uuid.uuid4())
+            ),
+        )
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "output_schema", output_schema)
+        object.__setattr__(self, "attempt", attempt)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        _validate_model_identity(self.runtime_request_id, "runtime_request_id")
+        _validate_model_identity(self.model_invocation_id, "model_invocation_id")
+        _validate_model_identity(self.model_attempt_id, "model_attempt_id")
+        if type(self.attempt) is not int or self.attempt < 1:
+            raise ValueError("attempt must be a positive integer")
+
+    @property
+    def runtime_request_id(self) -> str:
+        """Cross-plane alias for the legacy ``request_id`` field."""
+
+        return self.request_id
+
+    @property
+    def model_invocation_id(self) -> str:
+        """Semantic model-turn identity, stable across retry and fallback."""
+
+        return self._clone_model_invocation_id
+
+    @property
+    def model_attempt_id(self) -> str:
+        """Unique identity for this outbound adapter call."""
+
+        return self._clone_model_attempt_id
 
 
 @dataclass(frozen=True)
@@ -252,6 +448,16 @@ class ModelInvocationResponse:
     # ``None`` when the adapter could not obtain real counts. Kept optional so
     # third-party adapters implementing ModelAdapter stay source-compatible.
     usage: Optional[ModelTokenUsage] = None
+    # Server-owned correlation and ledger identities returned by the tenant
+    # model plane.  Only these explicitly allowlisted values enter evidence.
+    engine_request_id: Optional[str] = None
+    usage_record_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _validate_optional_server_identity(
+            self.engine_request_id, "engine_request_id"
+        )
+        _validate_optional_server_identity(self.usage_record_id, "usage_record_id")
 
 
 def _usage_attributes(usage: Optional[ModelTokenUsage]) -> Mapping[str, Any]:
@@ -1678,14 +1884,9 @@ class RuntimeKernel:
         security_correlation: Optional[SecurityDecisionCorrelation] = None,
         workflow_context: Optional[WorkflowExecutionContext] = None,
     ) -> RuntimeExecutionResult:
-        request_id = request_id or str(uuid.uuid4())
-        if (
-            not isinstance(request_id, str)
-            or not request_id.strip()
-            or request_id != request_id.strip()
-            or len(request_id) > 256
-        ):
-            raise ValueError("request_id must be a trimmed string of 1-256 characters")
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+        _validate_model_identity(request_id, "request_id")
         if self.admission.config.workflow_ontologies:
             if not isinstance(workflow_context, WorkflowExecutionContext):
                 raise RuntimeExecutionError("workflow_context_required")
@@ -1725,6 +1926,10 @@ class RuntimeKernel:
                 {"role": "user", "content": self._user_message(runtime_input)},
             )
             last_error: Optional[RuntimeExecutionError] = None
+            # One invocation identifies one semantic model turn.  Retries and
+            # model fallback preserve it; a successful tool-result continuation
+            # rotates it below because that continuation is a new model turn.
+            model_invocation_id = str(uuid.uuid4())
 
             for model_index, model in enumerate(self._models):
                 if model_index > 0:
@@ -1737,7 +1942,10 @@ class RuntimeKernel:
                         "runtime.model.fallback",
                         "selected",
                         request_id,
-                        {"gen_ai.request.model": model.model_name},
+                        {
+                            "gen_ai.request.model": model.model_name,
+                            "prometa.model.invocation_id": model_invocation_id,
+                        },
                     )
                 if not self._circuit_available(model, request_id):
                     last_error = RuntimeExecutionError("circuit_open", retryable=True)
@@ -1748,6 +1956,7 @@ class RuntimeKernel:
                 retry_attempt = 1
                 while retry_attempt <= self.policy.max_attempts_per_model:
                     attempts += 1
+                    model_attempt_id = str(uuid.uuid4())
                     self._emit(
                         "runtime.model.attempt",
                         "started",
@@ -1755,6 +1964,8 @@ class RuntimeKernel:
                         {
                             "gen_ai.request.model": model.model_name,
                             "prometa.model.provider": model.provider,
+                            "prometa.model.invocation_id": model_invocation_id,
+                            "prometa.model.attempt_id": model_attempt_id,
                             "retry.attempt_number": retry_attempt,
                         },
                     )
@@ -1762,7 +1973,9 @@ class RuntimeKernel:
                         response = await asyncio.wait_for(
                             self.model_adapter.invoke(
                                 ModelInvocationRequest(
-                                    request_id=request_id,
+                                    runtime_request_id=request_id,
+                                    model_invocation_id=model_invocation_id,
+                                    model_attempt_id=model_attempt_id,
                                     model=model,
                                     messages=messages,
                                     tools=self.admission.config.tools,
@@ -1785,6 +1998,14 @@ class RuntimeKernel:
                                 or model.model_name,
                                 "gen_ai.response.finish_reasons": response.finish_reason,
                                 "retry.attempt_number": retry_attempt,
+                                "prometa.model.invocation_id": model_invocation_id,
+                                "prometa.model.attempt_id": model_attempt_id,
+                                "prometa.model.engine_request_id": (
+                                    response.engine_request_id
+                                ),
+                                "prometa.model.usage_record_id": (
+                                    response.usage_record_id
+                                ),
                                 **_usage_attributes(response.usage),
                             },
                         )
@@ -1861,6 +2082,7 @@ class RuntimeKernel:
                                 },
                                 *tool_messages,
                             )
+                            model_invocation_id = str(uuid.uuid4())
                             continue
 
                         output = self._validate_schema(
@@ -1934,6 +2156,12 @@ class RuntimeKernel:
                         "retry.attempt_number": retry_attempt,
                         "prometa.runtime.reason": failure.code,
                         "prometa.runtime.retryable": failure.retryable,
+                        "prometa.model.invocation_id": model_invocation_id,
+                        "prometa.model.attempt_id": model_attempt_id,
+                        "prometa.model.engine_request_id": (
+                            failure.engine_request_id
+                        ),
+                        "prometa.model.usage_record_id": failure.usage_record_id,
                     }
                     if failure.retry_after_seconds is not None:
                         failure_attributes["retry.server_retry_after_ms"] = int(

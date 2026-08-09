@@ -46,6 +46,8 @@ from prometa.runtime import (
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v1.json"
 V2_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v2.json"
+ENGINE_REQUEST_ID = "req_" + "c" * 32
+USAGE_RECORD_ID = "usage_" + "d" * 32
 
 
 def _instant(value: str) -> datetime:
@@ -383,6 +385,20 @@ def test_retry_circuit_open_and_deterministic_fallback() -> None:
         "Fallback",
         "Fallback",
     ]
+    assert [request.runtime_request_id for request in adapter.requests] == [
+        "fallback-1",
+        "fallback-1",
+        "fallback-1",
+        "fallback-2",
+    ]
+    assert len(
+        {request.model_invocation_id for request in adapter.requests[:3]}
+    ) == 1
+    assert (
+        adapter.requests[3].model_invocation_id
+        != adapter.requests[0].model_invocation_id
+    )
+    assert len({request.model_attempt_id for request in adapter.requests}) == 4
     assert any(
         event.name == "runtime.circuit_breaker" and event.outcome == "opened"
         for event in emitter.events
@@ -488,6 +504,39 @@ def test_model_adapter_retry_after_requires_retryable_bounded_metadata() -> None
         )
     with pytest.raises(ValueError, match="overload_contract_id"):
         RuntimeExecutionPolicy(overload_contract_id="unknown-contract")
+    with pytest.raises(ValueError, match="engine_request_id"):
+        ModelInvocationResponse(
+            content="{}",
+            engine_request_id="legacy-runtime-request-echo",
+        )
+    with pytest.raises(ValueError, match="usage_record_id"):
+        ModelAdapterError(
+            "model_http_500",
+            usage_record_id="non-canonical-usage-id",
+        )
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "",
+        "contains space",
+        "line\nbreak",
+        "x" * 257,
+        "null",
+        "NONE",
+        "nIl",
+        "Undefined",
+    ],
+)
+def test_runtime_request_identity_is_rejected_instead_of_normalized(
+    request_id,
+) -> None:
+    _, admitted = _admitted()
+    kernel, _ = _kernel(admitted, SequenceModelAdapter())
+
+    with pytest.raises(ValueError, match="request_id"):
+        asyncio.run(kernel.execute({"question": "hello"}, request_id=request_id))
 
 
 def test_non_retryable_model_failure_does_not_fallback() -> None:
@@ -625,6 +674,18 @@ def test_tool_calls_are_declared_schema_guarded_and_brokered() -> None:
     assert broker.requests[0].environment == "prod"
     assert broker.requests[0].granted_scopes == ("orders.read",)
     assert adapter.requests[1].messages[-1]["role"] == "tool"
+    assert [request.runtime_request_id for request in adapter.requests] == [
+        "tool-1",
+        "tool-1",
+    ]
+    assert (
+        adapter.requests[0].model_invocation_id
+        != adapter.requests[1].model_invocation_id
+    )
+    assert (
+        adapter.requests[0].model_attempt_id
+        != adapter.requests[1].model_attempt_id
+    )
     assert any(
         event.name == "runtime.tool.call" and event.outcome == "completed"
         for event in emitter.events
@@ -862,6 +923,8 @@ def test_model_usage_reaches_the_attempt_evidence_event() -> None:
             finish_reason="stop",
             provider_model="golden-model@sha256:test",
             usage=ModelTokenUsage(input_tokens=41, output_tokens=7),
+            engine_request_id=ENGINE_REQUEST_ID,
+            usage_record_id=USAGE_RECORD_ID,
         )
     )
     kernel, emitter = _kernel(admitted, adapter)
@@ -871,6 +934,39 @@ def test_model_usage_reaches_the_attempt_evidence_event() -> None:
     attributes = _attempt_completed(emitter).attributes
     assert attributes["gen_ai.usage.input_tokens"] == 41
     assert attributes["gen_ai.usage.output_tokens"] == 7
+    assert attributes["prometa.model.engine_request_id"] == ENGINE_REQUEST_ID
+    assert attributes["prometa.model.usage_record_id"] == USAGE_RECORD_ID
+    assert attributes["prometa.model.invocation_id"] == (
+        adapter.requests[0].model_invocation_id
+    )
+    assert attributes["prometa.model.attempt_id"] == (
+        adapter.requests[0].model_attempt_id
+    )
+
+
+def test_model_failure_response_identities_reach_evidence_without_other_headers() -> None:
+    _, admitted = _admitted()
+    adapter = SequenceModelAdapter(
+        ModelAdapterError(
+            "model_http_503",
+            retryable=False,
+            engine_request_id=ENGINE_REQUEST_ID,
+            usage_record_id=USAGE_RECORD_ID,
+        )
+    )
+    kernel, emitter = _kernel(admitted, adapter)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(kernel.execute({"question": "hello"}, request_id="failure-1"))
+
+    failed = next(
+        event
+        for event in emitter.events
+        if event.name == "runtime.model.attempt" and event.outcome == "failed"
+    )
+    assert failed.attributes["prometa.model.engine_request_id"] == ENGINE_REQUEST_ID
+    assert failed.attributes["prometa.model.usage_record_id"] == USAGE_RECORD_ID
+    assert "authorization" not in failed.attributes
 
 
 def test_cached_input_tokens_are_emitted_when_present() -> None:

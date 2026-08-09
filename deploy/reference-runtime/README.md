@@ -699,6 +699,16 @@ synchronous control-plane calls and never includes keys or signed payloads.
 }
 ```
 
+In 0.20.2, request IDs are exact 1-256 character visible ASCII values and the
+case-insensitive null sentinels `null`, `none`, `nil`, and `undefined` are
+rejected before any task claim. Use opaque, non-PII values because request and
+derived model identities cross model-plane headers and can appear in
+payload-free evidence and the model billing ledger/stdout. Before rollout,
+inventory generators and durable task rows and reconcile legacy in-flight
+work. Historical sentinel rows stay readable through the task-status endpoint,
+but cannot be executed or retried by 0.20.2; do not rewrite a claimed row, and
+use a new conformant ID only for genuinely new work.
+
 Requests are strict JSON, bounded by `maxRequestBytes`, schema-validated before
 model invocation, and subject to a host timeout. Without `taskRecovery`,
 duplicate request IDs are rejected only inside one replica. With it, one active

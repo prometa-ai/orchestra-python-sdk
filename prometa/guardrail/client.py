@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -127,11 +128,27 @@ class UrllibGuardrailTransport:
                 body=_decode_json(payload),
                 headers=_header_map(error.headers),
             )
-        except TimeoutError:
+        except (TimeoutError, socket.timeout):
+            # ``socket.timeout`` only became an alias of ``TimeoutError`` in
+            # 3.10. On 3.9 it is a sibling under ``OSError``, so catching
+            # ``TimeoutError`` alone lets a read deadline fall through to the
+            # arm below and report an exhausted budget as an unreachable
+            # service — a distinction the fail-open budget is keyed on.
             return GuardrailTransportResult(
                 status=0, body=None, reason_code=REASON_CODE_TIMEOUT
             )
-        except (urllib.error.URLError, OSError, ValueError):
+        except urllib.error.URLError as error:
+            # A deadline struck while connecting is wrapped rather than raised.
+            return GuardrailTransportResult(
+                status=0,
+                body=None,
+                reason_code=(
+                    REASON_CODE_TIMEOUT
+                    if isinstance(error.reason, socket.timeout)
+                    else REASON_CODE_UNAVAILABLE
+                ),
+            )
+        except (OSError, ValueError):
             return GuardrailTransportResult(
                 status=0, body=None, reason_code=REASON_CODE_UNAVAILABLE
             )

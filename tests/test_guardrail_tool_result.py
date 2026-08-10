@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -357,6 +360,40 @@ def test_deadline_exceeded_fails_closed_without_leaking_the_token() -> None:
 
     assert caught.value.code == "guardrail_timeout"
     assert API_KEY not in str(caught.value)
+
+
+def test_a_connect_phase_deadline_is_a_timeout_not_an_unreachable_service(
+    monkeypatch,
+) -> None:
+    """urllib wraps a deadline struck while connecting; a read deadline it raises.
+
+    Both are exhausted budget rather than an absent service, and the fail-open
+    budget is keyed on that distinction.
+    """
+
+    def _refuse(*_args, **_kwargs):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refuse)
+    result = UrllibGuardrailTransport("http://127.0.0.1:1").request(
+        "POST", "/v1/guardrail:evaluate", b"{}", {}, timeout=0.1
+    )
+
+    assert result.reason_code == "guardrail_timeout"
+
+
+def test_a_refused_connection_stays_unavailable_rather_than_a_timeout(
+    monkeypatch,
+) -> None:
+    def _refuse(*_args, **_kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refuse)
+    result = UrllibGuardrailTransport("http://127.0.0.1:1").request(
+        "POST", "/v1/guardrail:evaluate", b"{}", {}, timeout=0.1
+    )
+
+    assert result.reason_code == "guardrail_unavailable"
 
 
 def test_deadline_exceeded_fails_open_with_high_severity_evidence() -> None:

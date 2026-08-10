@@ -1514,29 +1514,55 @@ def _f7(driver: GuardrailConformanceDriver) -> Tuple[bool, str]:
 # --- Detectors --------------------------------------------------------------
 
 
-_DEPENDENCY_FREE_PROGRAM = (
-    "import json,sys;"
-    "sys.path.insert(0,sys.argv[1]);"
-    "from prometa.guardrail.detectors import DetectorContext,build_builtin_pack;"
-    "pack=build_builtin_pack({'deniedTerms':['%s']});"
-    "context=DetectorContext(stage='llm_output',guardrail_name='x',"
-    "guardrail_type='secret-dlp');"
-    "finding=pack.select('secret-dlp','llm_output').scan('key %s',context);"
-    "third_party=sorted({name.split('.',1)[0] for name in sys.modules} - "
-    "set(sys.stdlib_module_names) - {'prometa','_distutils_hack','sitecustomize',"
-    "'usercustomize','__main__','_bootlocale'});"
-    "sys.stdout.write(json.dumps({'violated':finding.violated,"
-    "'loaded':third_party}))"
-) % (DENIED_TERM, PLANTED_SECRET)
+_DEPENDENCY_FREE_PROGRAM = '''
+import json, os, sys
+
+sys.path.insert(0, sys.argv[1])
+from prometa.guardrail.detectors import DetectorContext, build_builtin_pack
+
+pack = build_builtin_pack({'deniedTerms': ['%s']})
+context = DetectorContext(
+    stage='llm_output', guardrail_name='x', guardrail_type='secret-dlp'
+)
+finding = pack.select('secret-dlp', 'llm_output').scan('key %s', context)
+
+# ``sys.stdlib_module_names`` arrived in 3.10. On 3.9 a loaded module counts as
+# stdlib when it is builtin or frozen (no ``__file__``) or its file sits under
+# the interpreter's own library directory. Both readings answer the same
+# question here, because ``-I -S`` has already kept site-packages off the path.
+stdlib_names = getattr(sys, 'stdlib_module_names', None)
+if stdlib_names is not None:
+    third_party = {name.split('.', 1)[0] for name in sys.modules} - set(stdlib_names)
+else:
+    library = os.path.dirname(os.__file__)
+    third_party = {
+        name.split('.', 1)[0]
+        for name, module in list(sys.modules.items())
+        if getattr(module, '__file__', None)
+        and not os.path.abspath(module.__file__).startswith(library)
+    }
+loaded = sorted(
+    third_party
+    - {
+        'prometa',
+        '_distutils_hack',
+        'sitecustomize',
+        'usercustomize',
+        '__main__',
+        '_bootlocale',
+    }
+)
+sys.stdout.write(json.dumps({'violated': finding.violated, 'loaded': loaded}))
+''' % (DENIED_TERM, PLANTED_SECRET)
 
 
 def _d1(driver: GuardrailConformanceDriver) -> Tuple[bool, str]:
     """Isolated interpreter, and nothing outside the stdlib may be loaded.
 
     ``-I`` is what makes this a claim about the installation rather than about
-    this process's environment, and comparing against ``stdlib_module_names``
-    is what makes it a claim about every third-party package rather than about
-    a hand-maintained list of the ones somebody thought of.
+    this process's environment, and comparing against the interpreter's own
+    stdlib inventory is what makes it a claim about every third-party package
+    rather than about a hand-maintained list of the ones somebody thought of.
     """
 
     observed = _clean_interpreter(_DEPENDENCY_FREE_PROGRAM)

@@ -295,6 +295,11 @@ def test_published_install_workflow_consumes_immutable_release_artifacts():
     assert "gh release download" in workflow
     assert "git -C source describe --tags --exact-match HEAD" in workflow
     assert "release-prometa-runtime-host-ubi9.json" in workflow
+    assert (
+        "uses: sigstore/cosign-installer@"
+        "6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2"
+    ) in workflow
+    assert "cosign-release: v3.0.6" in workflow
     assert "cosign verify" in workflow
     assert "cosign verify-attestation" in workflow
     assert "PROMETA_RUNTIME_TOPOLOGY_ARTIFACT_MODE: published" in workflow
@@ -312,6 +317,11 @@ def test_published_upgrade_workflow_consumes_two_immutable_release_sets():
     assert "baseline_tag:" in workflow
     assert "target_tag:" in workflow
     assert "resolve-published-release.sh" in workflow
+    assert (
+        "uses: sigstore/cosign-installer@"
+        "6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2"
+    ) in workflow
+    assert "cosign-release: v3.0.6" in workflow
     assert 'PROMETA_RUNTIME_KEEP_TOPOLOGY_CLUSTER: "true"' in workflow
     assert "PROMETA_RUNTIME_PUBLISHED_BASELINE_DESCRIPTOR" in workflow
     assert "PROMETA_RUNTIME_PUBLISHED_TARGET_DESCRIPTOR" in workflow

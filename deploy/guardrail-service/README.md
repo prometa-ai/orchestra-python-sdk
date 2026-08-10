@@ -172,7 +172,7 @@ whole serialized body against a planted secret.
 
 ```bash
 docker build -f deploy/guardrail-service/Dockerfile \
-  -t prometa-guardrail-service:0.20.1 .
+  -t prometa-guardrail-service:0.20.2 .
 ```
 
 `config.example.json` is the profile document; `api-keys.example.json` is the

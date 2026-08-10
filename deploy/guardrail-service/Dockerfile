@@ -9,7 +9,7 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels ".[guardrail-service]
 FROM ${PYTHON_IMAGE}
 
 ARG VCS_REF=unknown
-ARG IMAGE_VERSION=0.20.1
+ARG IMAGE_VERSION=0.20.2
 
 LABEL org.opencontainers.image.title="Prometa reference guardrail service" \
       org.opencontainers.image.description="Tenant-deployed orchestra-guardrail-evaluate-v1 evaluator" \
@@ -27,7 +27,7 @@ RUN groupadd --gid 10001 guardrail \
     && useradd --uid 10001 --gid guardrail --create-home --shell /usr/sbin/nologin guardrail
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels \
-      "prometa-sdk[guardrail-service]==0.20.1" \
+      "prometa-sdk[guardrail-service]==0.20.2" \
     && rm -rf /wheels
 
 USER 10001:10001

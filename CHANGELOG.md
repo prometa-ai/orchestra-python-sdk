@@ -74,6 +74,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   out-of-band detector band or `builtin.eval-gate`, and no
   `/v1/guardrail:capabilities` negotiation route. The `tool_call` stage is kept: the SDK kernel
   emits it from a shipped call site.
+- Cross-plane model invocation identity v2 for the tenant runtime and model
+  gateway: one runtime request identity per execution, semantic invocation IDs
+  across retry/fallback, and unique attempt IDs per outbound call. The gateway
+  sends exact bounded headers, preserves canonical engine request and usage
+  record IDs in payload-free evidence, propagates active native Prometa or
+  optional OpenTelemetry W3C trace context without baggage, and treats legacy
+  echoed `x-request-id` values as unowned rather than misattributing them.
+  External IDs reject the case-insensitive null sentinels `null`, `none`,
+  `nil`, and `undefined` before flattened telemetry can erase their meaning.
+  Public positional and `request_id=` construction remains compatible.
 - Optional ``namespace`` keyword on ``prometa.retrieval_query(...)``.
   Non-empty values stamp ``retrieval.namespace`` with the searched
   corpus / collection / index identifier; missing or blank values omit
@@ -219,6 +229,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Runtime artifact publication waits for the exact SDK version to become
   visible on PyPI before building its package-pinned images, removing the race
   between package and OCI publication.
+
+### Changed
+
+- **0.20.2 identity migration:** runtime/model identities are now exact,
+  untruncated 1-256 character visible ASCII values and reject `null`, `none`,
+  `nil`, and `undefined` case-insensitively. Before activating this SDK or host,
+  inventory direct-kernel callers, host request-ID generators, and durable task
+  rows; replace whitespace, non-ASCII, and sentinel IDs at the source. Existing
+  sentinel task rows remain readable through the task-status endpoint for
+  audit/migration, but cannot be retried or executed by 0.20.2. Reconcile or
+  finish in-flight legacy work before cutover, then submit genuinely new work
+  under a new conformant ID rather than rewriting a claimed record. IDs must be
+  opaque and contain no prompts, emails, customer identifiers, secrets, or
+  other PII because they cross model-plane headers and may appear in payload-free
+  runtime evidence and model billing ledger/stdout. The public
+  `ModelInvocationRequest` legacy constructor, dataclass field/asdict/repr
+  shape, positional matching, and `request_id` access remain compatible; the
+  three cross-plane identities are available as properties, and
+  `dataclasses.replace()` preserves invocation/attempt continuity unless the
+  caller explicitly supplies replacement identities.
 
 ### Fixed
 

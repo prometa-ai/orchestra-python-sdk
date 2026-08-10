@@ -3,4 +3,4 @@ name: prometa-guardrail
 description: Tenant-deployed reference service for orchestra-guardrail-evaluate-v1
 type: application
 version: 0.1.0
-appVersion: "0.20.1"
+appVersion: "0.20.2"

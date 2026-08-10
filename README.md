@@ -99,7 +99,7 @@ The package has two clearly separated surfaces:
 pip install prometa-sdk
 ```
 
-Current source version: **0.20.1**. Release history is on
+Current source version: **0.20.2**. Release history is on
 [PyPI](https://pypi.org/project/prometa-sdk/#history).
 
 The default wheel has **no required third-party dependencies** and requires
@@ -820,6 +820,22 @@ different artifact digest fails closed. The host then serves:
 - `GET /v1/runtime/tasks/{requestId}` for authenticated payload-free lifecycle
   replay when `taskRecovery` is configured;
 - `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
+
+Starting with 0.20.2, every cross-plane runtime/model identity is preserved
+exactly: it must contain 1-256 visible ASCII characters and cannot equal
+`null`, `none`, `nil`, or `undefined` in any capitalization. Values are never
+trimmed or truncated. Keep these IDs opaque and free of prompts, emails,
+customer identifiers, secrets, and other PII: the three model invocation IDs
+cross tenant model-plane headers and may appear in payload-free runtime
+evidence and the model plane's billing ledger/stdout.
+
+Before activating 0.20.2, inventory direct `RuntimeKernel` callers, host
+request-ID generators, and durable task rows. Replace whitespace, non-ASCII,
+or sentinel IDs at their source and let legacy in-flight tasks finish before
+cutover. Historical host task rows whose ID is a sentinel remain readable from
+`GET /v1/runtime/tasks/{requestId}` for audit, but 0.20.2 will not execute or
+retry them. Do not rewrite a claimed record: after confirming that legacy work
+is terminal or reconciled, submit genuinely new work under a new conformant ID.
 
 The request endpoint calls only tenant-owned model, state, and optional MCP
 planes. It validates schemas before model invocation, rejects duplicate

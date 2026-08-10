@@ -239,11 +239,17 @@ _VERDICT_LITERALS = (
 
 
 class GuardrailConformanceError(RuntimeError):
-    """The runner could not execute, which is distinct from a failed check."""
+    """The runner could not execute, which is distinct from a failed check.
 
-    def __init__(self, code: str) -> None:
+    ``code`` stays the stable machine-readable identity. ``detail`` is the
+    optional human half: a report reader is usually not the person holding
+    this source, so a code alone leaves them with nothing to act on.
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
         self.code = code
-        super().__init__(code)
+        self.detail = detail
+        super().__init__("%s: %s" % (code, detail) if detail else code)
 
 
 class GuardrailConformanceDriver(Protocol):
@@ -1647,6 +1653,9 @@ _CROSS_PROCESS_DIGEST_PROGRAM = (
 )
 
 
+_PROBE_STDERR_LIMIT = 200
+
+
 def _run_interpreter(program: str, *arguments: str, hash_seed: str = "0") -> str:
     """Run one probe with the site directories off and the package via argv.
 
@@ -1673,8 +1682,27 @@ def _run_interpreter(program: str, *arguments: str, hash_seed: str = "0") -> str
         timeout=120,
     )
     if completed.returncode != 0:
-        raise GuardrailConformanceError("guardrail_conformance_subprocess_failed")
+        raise GuardrailConformanceError(
+            "guardrail_conformance_subprocess_failed", _probe_failure(completed)
+        )
     return completed.stdout.decode("utf-8").strip()
+
+
+def _probe_failure(completed: "subprocess.CompletedProcess[bytes]") -> str:
+    """Summarize a failed probe as its exit status and its last stderr line.
+
+    The last line of a traceback is the exception, which is the whole of what
+    a reader needs; the frames above it are this repository's own paths and
+    belong in nobody's conformance report. The probe is a first-party program
+    run with a fixed environment, so its stderr carries no caller content.
+    """
+
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return "exit %d, %s" % (
+        completed.returncode,
+        lines[-1][:_PROBE_STDERR_LIMIT] if lines else "no stderr",
+    )
 
 
 def _clean_interpreter(program: str) -> Dict[str, Any]:

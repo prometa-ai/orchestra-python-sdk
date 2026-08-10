@@ -31,11 +31,21 @@ from typing import (
 )
 from urllib.parse import urlsplit
 
+from .admission import RuntimeGuardrail
 from .kernel import (
+    GuardDecision,
+    GuardEvaluator,
+    GuardRequest,
     RuntimeExecutionError,
     ToolBroker,
     ToolInvocationRequest,
     ToolInvocationResult,
+)
+from .security_assurance import (
+    SecurityDecisionEmitter,
+    SecurityGuardAssessment,
+    build_security_decision,
+    security_policy_identifier,
 )
 
 
@@ -446,6 +456,7 @@ class McpAuditEvent:
     output_digest: Optional[str]
     idempotency_key: Optional[str]
     reason: Optional[str] = None
+    guarded_output_digest: Optional[str] = None
 
 
 class McpAuditSink(Protocol):
@@ -659,6 +670,25 @@ def official_mcp_transport_available() -> bool:
 
 
 @dataclass(frozen=True)
+class McpGuardrailPolicy:
+    """Policy identity for the decisions a ``tool_result`` guard produces.
+
+    The broker owns ``tool_result`` rather than the kernel, so it does not see
+    the admitted bundle that supplies these two values everywhere else. They
+    are passed in rather than derived so a ``security_decisions`` row written
+    from the broker is attributable to the same policy version and digest the
+    kernel would have written.
+    """
+
+    version: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not self.version or not self.digest:
+            raise ValueError("guardrail policy version and digest are required")
+
+
+@dataclass(frozen=True)
 class _Authorization:
     server: McpServerConfig
     grant: McpToolGrant
@@ -680,6 +710,10 @@ class GovernedMcpToolBroker(ToolBroker):
         audit_sink: McpAuditSink,
         credential_provider: Optional[McpCredentialProvider] = None,
         idempotency_store: Optional[McpIdempotencyStore] = None,
+        guard_evaluator: Optional[GuardEvaluator] = None,
+        guardrails: Sequence[RuntimeGuardrail] = (),
+        security_decision_emitter: Optional[SecurityDecisionEmitter] = None,
+        security_policy: Optional[McpGuardrailPolicy] = None,
     ) -> None:
         by_name = {server.name: server for server in servers}
         by_id = {server.connection_id: server for server in servers}
@@ -697,6 +731,45 @@ class GovernedMcpToolBroker(ToolBroker):
         self._audit_sink = audit_sink
         self._credential_provider = credential_provider
         self._idempotency = idempotency_store
+        declared_guardrails = tuple(guardrails)
+        if declared_guardrails and guard_evaluator is None:
+            raise ValueError(
+                "a guard evaluator is required to enforce declared guardrails"
+            )
+        if guard_evaluator is not None and not declared_guardrails:
+            # The guardrail set is supplied by the caller, never inferred from
+            # the evaluator's profile. An evaluator with nothing to evaluate is
+            # a broker that reports "checked" and enforces nothing, so it is a
+            # construction error rather than a silent no-op.
+            raise ValueError(
+                "a guard evaluator requires a non-empty guardrail list"
+            )
+        if any(
+            guardrail.security_assurance_enabled for guardrail in declared_guardrails
+        ) and (security_decision_emitter is None or security_policy is None):
+            # Declaring enforcementMode/reviewThreshold/decisionAction with
+            # nowhere to record the outcome would make those fields inert, and
+            # a policy that silently does nothing is worse than an absent one.
+            raise ValueError(
+                "a security decision emitter and policy are required to enforce "
+                "security-assurance guardrails"
+            )
+        self._guard_evaluator = guard_evaluator
+        self._guardrails = declared_guardrails
+        self._security_decision_emitter = security_decision_emitter
+        self._security_policy = security_policy
+
+    @property
+    def declared_guardrails(self) -> Tuple[RuntimeGuardrail, ...]:
+        """The guardrail set this broker enforces at ``tool_result``.
+
+        Exposed so the kernel can refuse a runtime whose broker was wired with
+        a different set than the admitted release declares. One policy with two
+        sources and nothing reconciling them is a policy that is only enforced
+        where somebody remembered to copy it.
+        """
+
+        return self._guardrails
 
     @staticmethod
     def _required_identity(value: Optional[str], code: str) -> str:
@@ -853,6 +926,7 @@ class GovernedMcpToolBroker(ToolBroker):
         authorization: Optional[_Authorization] = None,
         argument_digest: Optional[str] = None,
         output_digest: Optional[str] = None,
+        guarded_output_digest: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> McpAuditEvent:
@@ -882,6 +956,7 @@ class GovernedMcpToolBroker(ToolBroker):
             output_digest=output_digest,
             idempotency_key=idempotency_key,
             reason=reason,
+            guarded_output_digest=guarded_output_digest,
         )
 
     async def _record(self, event: McpAuditEvent) -> None:
@@ -899,6 +974,180 @@ class GovernedMcpToolBroker(ToolBroker):
             raise
         except Exception as exc:
             raise RuntimeExecutionError("mcp_idempotency_store_failed") from exc
+
+    def _record_security_decisions(
+        self,
+        request: ToolInvocationRequest,
+        decision: GuardDecision,
+        guardrails: Tuple[RuntimeGuardrail, ...],
+        *,
+        blocked: bool,
+    ) -> Optional[str]:
+        """Write one ``security_decisions`` row per security-assurance guardrail.
+
+        ``surface`` is ``tool_response``, which ``security_assurance._SURFACES``
+        already accepts, so ``tool_result`` needs no decision-wire change.
+
+        The applied action is derived from the same four fields the service
+        used to reach its verdict, so the two cannot disagree; it may only
+        strengthen the broker's outcome to ``deny``, never relax it. When the
+        result is blocked for any reason, no row may claim ``allow``: the
+        content did not reach the model, whichever guardrail stopped it.
+        """
+
+        if not guardrails:
+            return None
+        emitter = self._security_decision_emitter
+        policy = self._security_policy
+        if emitter is None or policy is None:
+            raise RuntimeExecutionError("security_decision_emitter_missing")
+        assessments = {
+            assessment.guardrail_name: assessment
+            for assessment in decision.security_assessments
+            if isinstance(assessment, SecurityGuardAssessment)
+        }
+        if len(assessments) != len(decision.security_assessments) or set(
+            assessments
+        ) != {guardrail.name for guardrail in guardrails}:
+            raise RuntimeExecutionError("security_decision_evidence_incomplete")
+        applied_actions = []
+        for guardrail in guardrails:
+            assessment = assessments[guardrail.name]
+            mode = guardrail.enforcement_mode or "observe"
+            review_threshold = guardrail.review_threshold
+            enforce_threshold = guardrail.enforce_threshold
+            recommended = guardrail.decision_action or "allow"
+            if review_threshold is None or enforce_threshold is None:
+                raise RuntimeExecutionError("security_decision_policy_incomplete")
+            if not assessment.violated:
+                recommended = "allow"
+                applied = "allow"
+            elif mode == "enforce" and assessment.confidence_score >= enforce_threshold:
+                applied = recommended
+                if (
+                    applied in {"mask", "rewrite"}
+                    and decision.transformed_payload is None
+                ):
+                    # A transformation policy must never release the original
+                    # payload when its adapter omitted the transformed value.
+                    applied = "deny"
+            else:
+                applied = "allow"
+            if blocked:
+                applied = "deny"
+            runtime_decision = build_security_decision(
+                request_id=request.request_id,
+                agent_id=str(request.agent_id),
+                environment=str(request.environment),
+                release_id=str(request.release_id),
+                deployment_id=str(request.deployment_id),
+                surface="tool_response",
+                policy_id=security_policy_identifier(guardrail.name),
+                policy_version=policy.version,
+                policy_digest=policy.digest,
+                enforcement_mode=mode,
+                recommended_action=recommended,
+                applied_action=applied,
+                review_required=(
+                    assessment.violated
+                    and mode == "review"
+                    and assessment.confidence_score >= review_threshold
+                ),
+                assessment=assessment,
+            )
+            try:
+                emitter.emit(runtime_decision)
+            except RuntimeExecutionError:
+                raise
+            except Exception as exc:
+                raise RuntimeExecutionError(
+                    "security_decision_emit_failed", retryable=True
+                ) from exc
+            applied_actions.append(applied)
+        return "deny" if "deny" in applied_actions else "allow"
+
+    async def _guard_tool_result(
+        self,
+        request: ToolInvocationRequest,
+        output: Any,
+        authorization: _Authorization,
+    ) -> Tuple[Any, Optional[str]]:
+        """Inspect a completed tool result before it can reach the model.
+
+        The tool has already run, so a denial means "this content does not
+        enter the context window", not "the call is undone". The caller keeps
+        the pre-guard digest and the idempotency completion either way.
+
+        Every result reaching here is submitted. The declared guardrail list
+        says what to evaluate and what evidence must come back, never whether
+        to make the call: a broker that was handed an evaluator and then
+        skipped it is a broker that looks guarded and is not, and the profile
+        the evaluator carries is policy this broker cannot see. A broker
+        holding an evaluator and an empty guardrail list is refused at
+        construction, so no "nothing declared, skip it" case survives.
+        """
+
+        required = set(request.tool.required_guardrails)
+        try:
+            decision = await self._guard_evaluator.evaluate(
+                GuardRequest(
+                    request_id=request.request_id,
+                    stage="tool_result",
+                    payload=output,
+                    guardrails=self._guardrails,
+                    tool=request.tool,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeExecutionError:
+            raise
+        except Exception as exc:
+            raise RuntimeExecutionError("guard_evaluation_failed") from exc
+        if not isinstance(decision, GuardDecision):
+            raise RuntimeExecutionError("invalid_guard_decision")
+        evaluated = set(decision.evaluated_guardrails)
+        applicable = {
+            guardrail.name
+            for guardrail in self._guardrails
+            if guardrail.applies_to in {None, "all", "tool-results"}
+        }
+        declared_identifiers = (
+            {guardrail.name for guardrail in self._guardrails}
+            | {guardrail.guardrail_type for guardrail in self._guardrails}
+            | required
+        )
+        if (
+            not evaluated.issubset(declared_identifiers)
+            or not applicable.issubset(evaluated)
+            or not required.issubset(evaluated)
+        ):
+            raise RuntimeExecutionError("guardrail_evidence_incomplete")
+        security_guardrails = tuple(
+            guardrail
+            for guardrail in self._guardrails
+            if guardrail.name in applicable and guardrail.security_assurance_enabled
+        )
+        blocked = decision.action == "escalate" or not decision.allowed
+        assured_action = self._record_security_decisions(
+            request, decision, security_guardrails, blocked=blocked
+        )
+        if decision.action == "escalate":
+            raise RuntimeExecutionError("guard_escalation_unsupported")
+        if blocked or assured_action == "deny":
+            raise RuntimeExecutionError("guard_denied")
+        if decision.transformed_payload is None:
+            if decision.action == "transform":
+                # A transform that released the original payload is a protocol
+                # violation, not a soft error.
+                raise RuntimeExecutionError("guard_denied")
+            return output, None
+        guarded_bytes = _canonical_json(
+            decision.transformed_payload,
+            maximum=authorization.server.max_response_bytes,
+        )
+        guarded_output = json.loads(guarded_bytes.decode("utf-8"))
+        return guarded_output, _digest(guarded_bytes)
 
     async def invoke(self, request: ToolInvocationRequest) -> ToolInvocationResult:
         audit_reference = "mcp-audit-" + str(uuid.uuid4())
@@ -1085,6 +1334,17 @@ class GovernedMcpToolBroker(ToolBroker):
                 )
                 raise
 
+        guarded_output = output
+        guarded_output_digest: Optional[str] = None
+        guard_failure: Optional[str] = None
+        if self._guard_evaluator is not None:
+            try:
+                guarded_output, guarded_output_digest = await self._guard_tool_result(
+                    request, output, authorization
+                )
+            except RuntimeExecutionError as exc:
+                guard_failure = exc.code
+
         try:
             await self._record(
                 self._event(
@@ -1095,6 +1355,7 @@ class GovernedMcpToolBroker(ToolBroker):
                     authorization=authorization,
                     argument_digest=argument_digest,
                     output_digest=output_digest,
+                    guarded_output_digest=guarded_output_digest,
                     idempotency_key=idempotency_key,
                 )
             )
@@ -1106,7 +1367,24 @@ class GovernedMcpToolBroker(ToolBroker):
                     request_digest,
                 )
             raise
-        return ToolInvocationResult(output=output, audit_reference=audit_reference)
+        if guard_failure is not None:
+            await self._record(
+                self._event(
+                    request,
+                    audit_reference,
+                    "guard",
+                    "denied",
+                    authorization=authorization,
+                    argument_digest=argument_digest,
+                    output_digest=output_digest,
+                    idempotency_key=idempotency_key,
+                    reason=guard_failure,
+                )
+            )
+            raise RuntimeExecutionError(guard_failure)
+        return ToolInvocationResult(
+            output=guarded_output, audit_reference=audit_reference
+        )
 
 
 __all__ = [
@@ -1126,6 +1404,7 @@ __all__ = [
     "EnvironmentMcpCredentialProvider",
     "McpAuditEvent",
     "McpAuditSink",
+    "McpGuardrailPolicy",
     "InMemoryMcpAuditSink",
     "McpIdempotencyRecord",
     "McpIdempotencyStore",

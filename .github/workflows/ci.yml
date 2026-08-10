@@ -54,6 +54,9 @@ jobs:
       - name: Dependency-free import smoke test
         run: python -c "from prometa import Prometa; import prometa.runtime; assert Prometa.__name__ == 'Prometa'"
 
+      - name: Guardrail contract conformance
+        run: prometa-guardrail-conformance --compact
+
   core-package-boundary:
     runs-on: ubuntu-latest
     timeout-minutes: 10

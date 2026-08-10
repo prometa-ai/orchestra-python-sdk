@@ -1,0 +1,100 @@
+{
+  "configVersion": 1,
+  "defaultProfile": "prod-strict",
+  "apiKeysFile": "/etc/prometa-guardrail/api-keys.json",
+  "maxRequestBytes": 2097152,
+  "maxConcurrentRequests": 64,
+  "profiles": [
+    {
+      "id": "prod-strict",
+      "failMode": "closed",
+      "guardrails": [
+        {
+          "name": "secret-egress",
+          "guardrailType": "secret-dlp",
+          "onViolation": "block"
+        },
+        {
+          "name": "pii-egress",
+          "guardrailType": "pii-dlp",
+          "onViolation": "block"
+        },
+        {
+          "name": "content-policy",
+          "guardrailType": "content-policy",
+          "onViolation": "block"
+        },
+        {
+          "name": "prompt-injection",
+          "guardrailType": "input-filter",
+          "onViolation": "redact"
+        },
+        {
+          "name": "tool-risk",
+          "guardrailType": "mcp-risk-gate",
+          "onViolation": "block"
+        },
+        {
+          "name": "cost-budget",
+          "guardrailType": "cost-budget",
+          "onViolation": "block"
+        },
+        {
+          "name": "human-approval",
+          "guardrailType": "human-approval",
+          "onViolation": "escalate"
+        }
+      ],
+      "maxPayloadBytes": 1048576,
+      "oversizePolicy": "deny",
+      "deferPolicy": "deny",
+      "unknownGuardrailPolicy": "deny",
+      "streaming": "allow",
+      "flushHoldbackChars": 256,
+      "toolResultInjectionVerdict": "transform",
+      "detectorKinds": [
+        "builtin.secret-dlp",
+        "builtin.pii-dlp",
+        "builtin.content-policy",
+        "builtin.mcp-risk-gate",
+        "builtin.injection-heuristics",
+        "builtin.cost-budget",
+        "builtin.human-approval"
+      ],
+      "detectorSettings": {
+        "deniedTerms": [],
+        "egressAllowlist": [
+          "tools.tenant-internal.svc"
+        ],
+        "maxToolRiskLevel": "medium",
+        "allowedSideEffects": [
+          "read-only"
+        ],
+        "maxInputTokens": 32000
+      }
+    },
+    {
+      "id": "staging-observe",
+      "failMode": "open",
+      "failOpenMaxConsecutive": 20,
+      "failOpenWindowSeconds": 60,
+      "guardrails": [
+        {
+          "name": "secret-egress",
+          "guardrailType": "secret-dlp",
+          "onViolation": "log"
+        },
+        {
+          "name": "pii-egress",
+          "guardrailType": "pii-dlp",
+          "onViolation": "log"
+        },
+        {
+          "name": "prompt-injection",
+          "guardrailType": "input-filter",
+          "onViolation": "log"
+        }
+      ]
+    }
+  ]
+}

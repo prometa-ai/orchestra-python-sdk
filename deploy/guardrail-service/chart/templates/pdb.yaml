@@ -1,0 +1,16 @@
+{{- include "prometa-guardrail.validateValues" . }}
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "prometa-guardrail.fullname" . }}
+  labels:
+    {{- include "prometa-guardrail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: guardrail
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "prometa-guardrail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: guardrail
+{{- end }}

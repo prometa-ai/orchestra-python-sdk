@@ -1,0 +1,23 @@
+The Prometa guardrail service is tenant-plane software. This release does not
+install or move the Orchestra control plane into the synchronous request path.
+
+Service:      {{ include "prometa-guardrail.fullname" . }}:{{ .Values.service.port }}
+Health:       /healthz
+Ready:        /readyz
+Evaluate:     /v1/guardrail:evaluate   (bearer token, tenant-bound)
+
+There is no capability-negotiation endpoint. Version skew is resolved per
+request by the supported-version window, and a request outside it is a 422 that
+states the window.
+
+The chart references, but never creates, the profile document and the bearer
+keys Secret. NetworkPolicy is fail-closed and allows no egress by default: the
+evaluator opens no outbound connection, which is what lets the same artifact
+run air-gapped.
+
+Selection is the caller's, definition is the profile's. The caller sends the
+list of names it wants evaluated on every request; the profile's guardrails
+array says what each name is, and a profile declaring none can serve nothing.
+Fail mode is carried in the profile too: failMode: open beside anything that
+can enforce is refused when the profile loads and again at evaluator
+construction, rather than at request time.

@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from prometa.guardrail.conformance import (
     CHECK_IDS,
     CHECKS_BEYOND_CHECKLIST,
     DELEGATED_CHECKS,
+    GuardrailConformanceError,
+    _run_interpreter,
     build_conformance_driver,
     main,
     run_guardrail_conformance,
@@ -43,6 +47,31 @@ def test_the_builtin_service_passes_every_check_the_runner_owns() -> None:
     assert report.passed is True
     assert report.contract == "orchestra-guardrail-evaluate-v1"
     assert {check.check_id for check in report.checks} == set(CHECK_IDS)
+
+
+def test_a_failed_probe_reports_why_rather_than_only_that_it_failed() -> None:
+    """The exact shape that hid an AttributeError behind a bare code.
+
+    The report is read by someone certifying their own service, who does not
+    have this source open. A code with no detail sends them to a debugger.
+    """
+
+    with pytest.raises(GuardrailConformanceError) as caught:
+        _run_interpreter("import sys;sys.exit(sys.argv[1] and 0/0)")
+
+    assert caught.value.code == "guardrail_conformance_subprocess_failed"
+    assert "exit 1" in caught.value.detail
+    assert "ZeroDivisionError" in caught.value.detail
+    # The frames above the exception are this repository's paths.
+    assert "Traceback" not in caught.value.detail
+    assert len(caught.value.detail) < 260
+
+
+def test_a_probe_that_dies_without_stderr_still_reports_its_exit_status() -> None:
+    with pytest.raises(GuardrailConformanceError) as caught:
+        _run_interpreter("import os;os._exit(9)")
+
+    assert caught.value.detail == "exit 9, no stderr"
 
 
 def test_every_delegated_check_names_a_test_module_that_exists() -> None:

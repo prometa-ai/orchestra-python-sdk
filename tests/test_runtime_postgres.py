@@ -938,6 +938,9 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
             self.release = asyncio.Event()
             self.calls = 0
 
+        async def list_tools(self, server, credentials):
+            return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
+
         async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.calls += 1
             self.started.set()
@@ -1019,6 +1022,9 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
         )
 
         class UncertainTransport:
+            async def list_tools(self, server, credentials):
+                return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
+
             async def call_tool(self, *args, **kwargs):
                 raise McpTransportError("mcp_transport_failed", outcome_unknown=True)
 

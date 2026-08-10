@@ -234,8 +234,24 @@ _TOOL_CONFIGURATION_PROJECTION_KEYS = (
 )
 
 
-def _add_rate_limited_tool(content, *, digest_covers_rate_limit=True) -> None:
+def _add_rate_limited_tool(
+    content,
+    *,
+    digest_covers_rate_limit=True,
+    descriptor_digest=None,
+    digest_covers_descriptor_digest=True,
+) -> None:
     content["tools"] = [copy.deepcopy(_RATE_LIMITED_TOOL)]
+    if descriptor_digest is not None:
+        # Only an MCP-sourced tool may pin a descriptor digest.
+        content["tools"][0].update(
+            {
+                "source": "mcp",
+                "mcpServer": "Orders",
+                "mcpToolDescriptorDigest": descriptor_digest,
+            }
+        )
+        content["mcpServers"] = ["Orders"]
     contract = content["runtimeContract"]
     contract["requiredCapabilities"] = sorted(
         {*contract["requiredCapabilities"], CAPABILITY_TOOL_BROKER}
@@ -250,6 +266,8 @@ def _add_rate_limited_tool(content, *, digest_covers_rate_limit=True) -> None:
     configuration_keys = _TOOL_CONFIGURATION_PROJECTION_KEYS
     if digest_covers_rate_limit:
         configuration_keys += ("rateLimitPerMin",)
+    if digest_covers_descriptor_digest:
+        configuration_keys += ("mcpToolDescriptorDigest",)
 
     def selected(tool, keys):
         return {key: tool[key] for key in keys if key in tool}
@@ -496,7 +514,52 @@ def test_signed_tool_rate_limit_binds_the_digest_but_reaches_no_runtime_field(
         "scopes",
         "approval_required",
         "required_guardrails",
+        "descriptor_digest",
     }
+
+
+def test_a_pinned_descriptor_digest_is_inside_the_configuration_projection(
+    vector_v2,
+) -> None:
+    # The control plane signs a configuration digest that projects
+    # `mcpToolDescriptorDigest`. If this side left it out, every bundle that
+    # pins a descriptor would be refused as a digest mismatch — an outage, not
+    # a refusal — so the two projections are kept identical.
+    pinned = "sha256:" + "b" * 64
+    verified = _mutated_verified(
+        vector_v2,
+        lambda content: _add_rate_limited_tool(content, descriptor_digest=pinned),
+    )
+    config = parse_runtime_bundle(
+        verified,
+        supported_capabilities={
+            *BASE_RUNTIME_CAPABILITIES,
+            CAPABILITY_SCHEMA_VALIDATE,
+            CAPABILITY_TOOL_BROKER,
+        },
+    )
+
+    assert config.tools[0].descriptor_digest == pinned
+
+    omitted = _mutated_verified(
+        vector_v2,
+        lambda content: _add_rate_limited_tool(
+            content,
+            descriptor_digest=pinned,
+            digest_covers_descriptor_digest=False,
+        ),
+    )
+    _assert_code(
+        "runtime_configuration_digest_mismatch",
+        lambda: parse_runtime_bundle(
+            omitted,
+            supported_capabilities={
+                *BASE_RUNTIME_CAPABILITIES,
+                CAPABILITY_SCHEMA_VALIDATE,
+                CAPABILITY_TOOL_BROKER,
+            },
+        ),
+    )
 
 
 def test_signed_tool_rate_limit_omitted_from_the_projection_fails_admission(

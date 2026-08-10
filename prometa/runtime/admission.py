@@ -79,6 +79,7 @@ class RuntimeManifest:
     version: int
     agent_id: str
     solution_name: Optional[str]
+    solution_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,13 @@ class RuntimeTool:
     scopes: Tuple[str, ...]
     approval_required: bool
     required_guardrails: Tuple[str, ...]
+    descriptor_digest: Optional[str] = None
+    """Signed digest of the descriptor the MCP server is expected to advertise.
+
+    A signature proves who published a tool declaration, not what the server
+    behind it does today. This digest is what lets the broker notice a server
+    that quietly changed its own tool description between versions.
+    """
 
 
 @dataclass(frozen=True)
@@ -419,11 +427,20 @@ _TOOL_POLICY_KEYS = (
     "approvalRequired",
     "requiredGuardrails",
 )
-# ``rateLimitPerMin`` is a digest input only. Nothing reads it: rate limiting is
-# distributed state the tenant gateway owns, and a per-replica counter would
-# understate the fleet-wide limit rather than enforce it. Dropping the key would
-# change the configuration digest of every already-signed bundle that declares
-# it, so it stays in the projection until a contract version can retire it.
+# ``rateLimitPerMin`` is a digest input only. Nothing reads it: it states a
+# fleet-wide number, and the only ceiling the runtime can enforce by itself is
+# per replica, so honoring it here would enforce N times the signed limit across
+# N replicas. ``McpToolLimits`` is that per-replica control and is configured
+# locally, precisely so the two are not confused. Dropping the key would change
+# the configuration digest of every already-signed bundle that declares it, so
+# it stays in the projection until a contract version can retire it.
+#
+# ``mcpToolDescriptorDigest`` is in this projection because the control plane
+# puts it in the projection it signs. A key that one side projects and the
+# other does not makes every bundle that declares it fail admission with
+# ``runtime_configuration_digest_mismatch`` — which is a fleet outage, not a
+# refusal. Tools that do not declare the key are unaffected: the projection
+# only carries keys the tool actually has.
 _TOOL_CONFIGURATION_KEYS = (
     "name",
     "source",
@@ -431,6 +448,7 @@ _TOOL_CONFIGURATION_KEYS = (
     "operation",
     "inputSchema",
     "rateLimitPerMin",
+    "mcpToolDescriptorDigest",
 )
 
 
@@ -638,6 +656,19 @@ def _parse_tool(value: Any) -> RuntimeTool:
         raise BundleVerificationError("invalid_runtime_tool")
     if (source == "mcp") != (mcp_server is not None):
         raise BundleVerificationError("invalid_runtime_tool")
+    descriptor_digest = _optional_string(
+        tool, "mcpToolDescriptorDigest", "invalid_runtime_tool"
+    )
+    if descriptor_digest is not None:
+        if source != "mcp":
+            raise BundleVerificationError("invalid_runtime_tool")
+        if len(descriptor_digest) != 71 or not descriptor_digest.startswith("sha256:"):
+            raise BundleVerificationError("invalid_tool_descriptor_digest")
+        hex_digits = descriptor_digest[7:]
+        if hex_digits != hex_digits.lower() or any(
+            character not in "0123456789abcdef" for character in hex_digits
+        ):
+            raise BundleVerificationError("invalid_tool_descriptor_digest")
     return RuntimeTool(
         name=_string(tool, "name", "invalid_runtime_tool"),
         source=source,
@@ -650,6 +681,7 @@ def _parse_tool(value: Any) -> RuntimeTool:
         scopes=scopes,
         approval_required=approval,
         required_guardrails=required_guardrails,
+        descriptor_digest=descriptor_digest,
     )
 
 
@@ -734,6 +766,9 @@ def parse_runtime_bundle(
         agent_id=agent_id,
         solution_name=_optional_string(
             manifest_value, "solutionName", "invalid_runtime_manifest"
+        ),
+        solution_id=_optional_string(
+            manifest_value, "solutionId", "invalid_runtime_manifest"
         ),
     )
 

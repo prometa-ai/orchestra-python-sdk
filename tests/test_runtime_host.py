@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import http.client
 import io
 import json
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +43,8 @@ from prometa.runtime import (
     ReferenceRuntimeHost,
     RuntimeAdmissionPolicy,
     RuntimeActivationResult,
+    RuntimeControlDenied,
+    RuntimeControlStatus,
     RuntimeEvidenceEvent,
     RuntimeExecutionResult,
     RuntimeHostError,
@@ -55,7 +59,14 @@ from prometa.runtime import (
     install_postgres_runtime_schema,
     load_runtime_host_config,
 )
-from prometa.runtime.host import _RuntimeHttpServer
+from prometa.runtime.escalation import ControlPlaneHumanEscalation
+from prometa.runtime.host import (
+    _RuntimeHttpServer,
+    _require_runtime_control_signing_key,
+    _RuntimeControlEpisodes,
+    _runtime_control_receipt_id,
+    _runtime_control_transitions,
+)
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "runtime-kernel-v1.json"
@@ -148,7 +159,7 @@ class SleepingModelAdapter:
         raise AssertionError("cancelled request resumed")
 
 
-def _host(adapter, *, timeout=2.0, task_store=None):
+def _host(adapter, *, timeout=2.0, task_store=None, runtime_control_gate=None):
     _, admitted = _admitted()
     kernel = RuntimeKernel(
         admitted,
@@ -164,6 +175,7 @@ def _host(adapter, *, timeout=2.0, task_store=None):
         max_request_bytes=1024,
         task_store=task_store,
         task_lease_seconds=max(10.0, timeout + 1),
+        runtime_control_gate=runtime_control_gate,
     )
 
 
@@ -1233,6 +1245,9 @@ def test_reference_host_wires_mcp_only_for_an_exact_signed_release_binding(
     }
 
     class TenantTransport:
+        async def list_tools(self, server, credentials):
+            return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
+
         async def call_tool(self, *args, **kwargs):
             return {"ok": True}
 
@@ -1359,6 +1374,9 @@ def test_reference_host_executes_mcp_with_explicit_tenant_human_adapter(
     class TenantTransport:
         def __init__(self):
             self.calls = []
+
+        async def list_tools(self, server, credentials):
+            return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
 
         async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.calls.append(
@@ -1922,3 +1940,450 @@ def test_reference_host_pulls_and_uses_bounded_cache_when_platform_is_down() -> 
         gateway.shutdown()
         gateway.server_close()
         gateway_thread.join(timeout=2)
+
+
+class _StubControlGate:
+    """Stand-in for a verified lease state at the host request boundary.
+
+    The lease verification and staleness rules have their own tests; what this
+    exercises is that the host actually consults the gate before admitting work
+    and reports the same state on its readiness surface.
+    """
+
+    def __init__(self, status) -> None:
+        self._status = status
+
+    def status(self, now=None):
+        return self._status
+
+    def admit(self, now=None):
+        if not self._status.admitting:
+            raise RuntimeControlDenied(self._status.denial_code)
+        return self._status
+
+
+def _control_status(**overrides):
+    values = {
+        "state": "quarantined",
+        "admitting": False,
+        "stale": False,
+        "stale_action": "continue",
+        "enforcement": "enforcing",
+        "enforced_control_count": 1,
+        "lease_id": "lease-q",
+        "revision": 7,
+        "reason_code": "incident-4711",
+        "denial_code": "runtime_quarantined",
+    }
+    values.update(overrides)
+    return RuntimeControlStatus(**values)
+
+
+def test_a_quarantined_runtime_refuses_work_and_says_which_lease_did_it() -> None:
+    adapter = RecordingModelAdapter({"ok": True})
+    host = _host(
+        adapter, runtime_control_gate=_StubControlGate(_control_status())
+    )
+    try:
+        response = _execute(host, {"requestId": "request-q", "input": {"a": 1}})
+    finally:
+        host.close()
+
+    assert response.status == 503
+    assert response.body["error"]["code"] == "runtime_quarantined"
+    assert response.body["runtimeControl"]["leaseId"] == "lease-q"
+    assert response.body["runtimeControl"]["reasonCode"] == "incident-4711"
+    assert adapter.requests == []
+
+
+def test_a_quarantined_runtime_reports_not_admitting_on_readiness() -> None:
+    host = _host(
+        RecordingModelAdapter({"ok": True}),
+        runtime_control_gate=_StubControlGate(_control_status()),
+    )
+    try:
+        response = host.handle("GET", "/readyz", {})
+    finally:
+        host.close()
+
+    assert response.status == 503
+    assert response.body["status"] == "not_admitting"
+    # /readyz has no authorization check, so it gets counts and booleans only.
+    assert response.body["runtimeControl"] == {
+        "admitting": False,
+        "quarantined": True,
+        "stale": False,
+        "enforcing": True,
+        "enforcedControlCount": 1,
+    }
+    assert "lease-q" not in json.dumps(response.body)
+    assert "incident-4711" not in json.dumps(response.body)
+
+
+def test_stale_controls_are_shown_on_readiness_while_work_still_flows() -> None:
+    status = _control_status(
+        state="serving",
+        admitting=True,
+        stale=True,
+        enforcement="advisory",
+        enforced_control_count=0,
+        denial_code=None,
+        reason_code=None,
+        last_refresh_error="control_plane_unavailable",
+    )
+    vector = _vector()
+    host = _host(
+        RecordingModelAdapter(vector["sampleOutput"]),
+        runtime_control_gate=_StubControlGate(status),
+    )
+    try:
+        readiness = host.handle("GET", "/readyz", {})
+        executed = _execute(
+            host,
+            {"requestId": "request-stale", "input": vector["sampleInput"]},
+        )
+    finally:
+        host.close()
+
+    assert readiness.status == 200
+    assert readiness.body["runtimeControl"]["stale"] is True
+    # The refresh error is an operator-facing string and stays off /readyz.
+    assert "lastRefreshError" not in readiness.body["runtimeControl"]
+    assert "control_plane_unavailable" not in json.dumps(readiness.body)
+    assert executed.status == 200
+
+
+def test_an_ungated_host_keeps_its_plain_readiness_body() -> None:
+    host = _host(RecordingModelAdapter({"ok": True}))
+    try:
+        response = host.handle("GET", "/readyz", {})
+    finally:
+        host.close()
+
+    assert response.status == 200
+    assert response.body == {"status": "ready"}
+    assert host.runtime_control_status() is None
+
+
+def _pull_document():
+    document = _config_document()
+    document.pop("bundle")
+    document.pop("promotionAttestation")
+    document["controlPlanePull"] = {
+        "baseUrl": "https://orchestra.example.test",
+        "attestationId": "runtime-kernel-attestation-v1",
+        "apiKeyEnv": "ORCHESTRA_RUNTIME_CONTROL_PLANE_API_KEY",
+    }
+    return document
+
+
+def test_runtime_control_config_binds_to_the_pull_seam_that_carries_it(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.json"
+    document = _pull_document()
+    document["runtimeControl"] = {
+        "refreshIntervalSeconds": 30,
+        "maxLeaseSeconds": 600,
+        "staleAction": "stop",
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.runtime_control_enabled is True
+    assert config.runtime_control_refresh_interval_seconds == 30
+    assert config.runtime_control_max_lease_seconds == 600
+    assert config.runtime_control_stale_action == "stop"
+
+    embedded = _config_document()
+    embedded["runtimeControl"] = {}
+    path.write_text(json.dumps(embedded), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "runtime_control_source_invalid"
+
+
+def test_a_trust_entry_may_declare_the_artifact_types_it_may_sign(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    document = _pull_document()
+    document["promotionTrust"][0]["allowedArtifactTypes"] = [
+        "orchestra.promotion-attestation"
+    ]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.promotion_trust_store.entries()[0].allowed_artifact_types == (
+        frozenset({"orchestra.promotion-attestation"})
+    )
+
+
+def test_a_kill_switch_no_provisioned_key_can_operate_fails_at_startup(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.json"
+    document = _pull_document()
+    path.write_text(json.dumps(document), encoding="utf-8")
+    config = load_runtime_host_config(path)
+
+    with pytest.raises(RuntimeHostError) as caught:
+        _require_runtime_control_signing_key(config.promotion_trust_store)
+    assert caught.value.code == "runtime_control_signing_key_missing"
+
+    document["promotionTrust"][0]["allowedArtifactTypes"] = [
+        "orchestra.promotion-attestation"
+    ]
+    document["promotionTrust"].append(
+        {
+            **document["promotionTrust"][0],
+            "keyId": "runtime-control-lease-key",
+            "allowedAudiences": None,
+            "allowedArtifactTypes": ["orchestra.runtime-control-lease"],
+        }
+    )
+    document["promotionTrust"][1].pop("allowedAudiences")
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    _require_runtime_control_signing_key(
+        load_runtime_host_config(path).promotion_trust_store
+    )
+
+
+def test_human_escalation_insecure_http_reaches_the_client_that_enforces_it(
+    tmp_path,
+) -> None:
+    # The option used to be validated here and never passed on, so a config
+    # that parsed cleanly failed at client construction instead.
+    path = tmp_path / "config.json"
+    document = _config_document()
+    document["humanEscalation"] = {
+        "baseUrl": "http://approvals.internal.test",
+        "apiKeyEnv": "ORCHESTRA_APPROVAL_API_KEY",
+        "allowInsecureHttp": True,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.human_escalation_allow_insecure_http is True
+    assert config.human_escalation_base_url == "http://approvals.internal.test"
+    ControlPlaneHumanEscalation(
+        config.human_escalation_base_url,
+        "x" * 32,
+        runtime_id="runtime-golden",
+        allow_insecure_http=config.human_escalation_allow_insecure_http,
+    )
+
+
+def test_a_refresh_slower_than_the_lease_ceiling_is_refused(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    document = _pull_document()
+    document["runtimeControl"] = {
+        "refreshIntervalSeconds": 900,
+        "maxLeaseSeconds": 900,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+
+    assert caught.value.code == "runtime_control_refresh_too_slow"
+
+    document["runtimeControl"] = {"staleAction": "pause"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "runtime_control_stale_action_invalid"
+
+
+def test_human_escalation_config_requires_a_reviewer_it_can_actually_reach(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.json"
+    document = _config_document()
+    document["humanEscalation"] = {
+        "baseUrl": "https://orchestra.example.test",
+        "apiKeyEnv": "ORCHESTRA_APPROVAL_API_KEY",
+        "localDirectory": "/var/lib/prometa/approvals",
+        "decisionTimeoutSeconds": 120,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.human_escalation_base_url == "https://orchestra.example.test"
+    assert config.human_escalation_api_key_env == "ORCHESTRA_APPROVAL_API_KEY"
+    assert str(config.human_escalation_local_directory).endswith("approvals")
+    assert config.human_escalation_decision_timeout_seconds == 120
+
+    document["humanEscalation"] = {"decisionTimeoutSeconds": 120}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "human_escalation_config_invalid"
+
+    document["humanEscalation"] = {"baseUrl": "https://orchestra.example.test"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "human_escalation_api_key_env_missing"
+
+    document["humanEscalation"] = {"localDirectory": "/var/lib/prometa/approvals"}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    local_only = load_runtime_host_config(path)
+    assert local_only.human_escalation_base_url is None
+
+
+def test_mcp_tool_limits_must_name_a_configured_grant(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    document = _config_document()
+    document["mcpBroker"] = _mcp_broker_document()
+    document["mcpBroker"]["toolLimits"] = {
+        "default": {"maxCallsPerWindow": 30, "maxConcurrentCalls": 2},
+        "perTool": {"orders.write": {"maxCallsPerWindow": 5}},
+    }
+    document["mcpBroker"]["toolDescriptors"] = {
+        "requireSignedDigest": True,
+        "cacheSeconds": 60,
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.mcp_broker.policy.default_tool_limits.max_calls_per_window == 30
+    assert config.mcp_broker.policy.require_signed_tool_descriptor_digest is True
+    assert config.mcp_broker.policy.tool_descriptor_cache_seconds == 60
+    assert config.mcp_broker.tool_limits["orders.write"].max_calls_per_window == 5
+
+    document["mcpBroker"]["toolLimits"]["perTool"] = {"orders.delete": {}}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(RuntimeHostError) as caught:
+        load_runtime_host_config(path)
+    assert caught.value.code == "mcp_tool_limits_tool_unknown"
+
+
+def _status(state, *, stale=False, lease_id="lease-1", revision=7):
+    return RuntimeControlStatus(
+        state=state,
+        admitting=state != "quarantined",
+        stale=stale,
+        stale_action="continue",
+        lease_id=None if state == "unknown" else lease_id,
+        revision=None if state == "unknown" else revision,
+    )
+
+
+@pytest.mark.parametrize(
+    "previous,current,expected",
+    [
+        (
+            _status("unknown"),
+            _status("quarantined"),
+            (("quarantined", "succeeded"), ("controls_stale", "succeeded")),
+        ),
+        (
+            _status("serving"),
+            _status("quarantined"),
+            (("quarantined", "succeeded"), ("controls_stale", "succeeded")),
+        ),
+        (
+            _status("quarantined"),
+            _status("serving"),
+            (("resumed", "succeeded"), ("controls_stale", "succeeded")),
+        ),
+        # No edge, and still an acknowledgement: a replica that only spoke on
+        # edges would drop out of the enforcement count it is judged by.
+        (_status("unknown"), _status("serving"), (("controls_stale", "succeeded"),)),
+        (_status("serving"), _status("serving"), (("controls_stale", "succeeded"),)),
+        (
+            _status("quarantined"),
+            _status("quarantined"),
+            (("controls_stale", "succeeded"),),
+        ),
+        (
+            _status("serving"),
+            _status("serving", stale=True),
+            (("controls_stale", "failed"),),
+        ),
+        (
+            _status("serving", stale=True),
+            _status("serving"),
+            (("controls_stale", "succeeded"),),
+        ),
+        (
+            _status("unknown"),
+            _status("unknown", stale=True),
+            (("controls_stale", "failed"),),
+        ),
+        (
+            # A quarantine still enforced from a lease nobody is refreshing is
+            # worth saying out loud, and `quarantined` is refused on a stale
+            # replica, so only the freshness acknowledgement is owed.
+            _status("quarantined"),
+            _status("quarantined", stale=True),
+            (("controls_stale", "failed"),),
+        ),
+        (
+            _status("serving"),
+            _status("quarantined", stale=True),
+            (("controls_stale", "failed"),),
+        ),
+    ],
+)
+def test_every_refresh_owes_an_acknowledgement_and_edges_owe_two(
+    previous, current, expected
+) -> None:
+    assert _runtime_control_transitions(current, previous) == expected
+
+
+def test_receipt_identity_separates_a_refresh_from_a_flap() -> None:
+    config = SimpleNamespace(
+        tenant_id="tenant-1",
+        runtime_id="runtime-1",
+        deployment_id="deployment-1",
+        release_id="release-1",
+    )
+    identity = functools.partial(_runtime_control_receipt_id, config, "attestation-1")
+
+    steady = identity("controls_stale", "succeeded", "lease-fleet", 7, 0)
+
+    # Same lease, same revision, same event: idempotent, so "acknowledge on
+    # every refresh" costs one outbox row per revision rather than one per
+    # interval.
+    assert identity("controls_stale", "succeeded", "lease-fleet", 7, 0) == steady
+    # leaseId is deliberately stable across refreshes, so revision has to be in
+    # the identity or a new control set would reuse the old receipt id.
+    assert identity("controls_stale", "succeeded", "lease-fleet", 8, 0) != steady
+    # A stale/refresh flap under one lease and revision is two events.
+    assert identity("controls_stale", "failed", "lease-fleet", 7, 0) != steady
+    assert identity("quarantined", "succeeded", "lease-fleet", 7, 0) != steady
+
+
+def test_a_recovery_under_one_revision_is_not_deduped_into_the_first_report() -> None:
+    # fresh -> stale -> fresh, all at one revision. Without the episode the
+    # recovery derives the id the first `succeeded` row already used, the
+    # outbox drops it as a duplicate, and the control plane keeps showing a
+    # replica that recovered as stale.
+    config = SimpleNamespace(
+        tenant_id="tenant-1",
+        runtime_id="runtime-1",
+        deployment_id="deployment-1",
+        release_id="release-1",
+    )
+    identity = functools.partial(_runtime_control_receipt_id, config, "attestation-1")
+    episodes = _RuntimeControlEpisodes()
+
+    first = episodes.observe(False)
+    went_stale = episodes.observe(True)
+    recovered = episodes.observe(False)
+    still_fresh = episodes.observe(False)
+
+    assert (first, went_stale, recovered, still_fresh) == (0, 1, 2, 2)
+    assert identity(
+        "controls_stale", "succeeded", "lease-fleet", 7, recovered
+    ) != identity("controls_stale", "succeeded", "lease-fleet", 7, first)
+    # And a replica sitting steady still collapses to one row.
+    assert identity(
+        "controls_stale", "succeeded", "lease-fleet", 7, still_fresh
+    ) == identity("controls_stale", "succeeded", "lease-fleet", 7, recovered)

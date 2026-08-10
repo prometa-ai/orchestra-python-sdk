@@ -56,6 +56,13 @@ class RuntimeReleaseHandoff:
     promotion_attestation: Mapping[str, Any]
     checked_at: datetime
     fetched_at: datetime
+    runtime_control: Optional[Mapping[str, Any]] = None
+    """Signed runtime-control lease riding along on this response, if any.
+
+    Transport carries it; nothing here trusts it. It is verified against the
+    tenant trust store by ``runtime_control.RuntimeControlGate`` before it can
+    change what the runtime enforces.
+    """
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -278,6 +285,10 @@ class RuntimeControlPlaneClient:
         ):
             raise RuntimeControlPlaneError("control_plane_binding_mismatch")
 
+        runtime_control = document.get("runtimeControl")
+        if runtime_control is not None and not isinstance(runtime_control, Mapping):
+            raise RuntimeControlPlaneError("control_plane_response_invalid")
+
         checked_at = _instant(document.get("checkedAt"))
         if (
             abs((checked_at - fetched_at).total_seconds())
@@ -296,6 +307,9 @@ class RuntimeControlPlaneClient:
             promotion_attestation=dict(promotion),
             checked_at=checked_at,
             fetched_at=fetched_at,
+            runtime_control=(
+                dict(runtime_control) if runtime_control is not None else None
+            ),
         )
 
 

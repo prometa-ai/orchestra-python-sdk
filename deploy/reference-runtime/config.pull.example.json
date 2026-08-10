@@ -34,7 +34,16 @@
       "publicKeySpkiDerBase64": "tenant-provisioned-public-key",
       "allowedOrgIds": ["org-from-signed-release"],
       "allowedAudiences": ["prometa-runtime-admission"],
-      "allowedEnvironments": ["prod"]
+      "allowedEnvironments": ["prod"],
+      "allowedArtifactTypes": ["orchestra.promotion-attestation"]
+    },
+    {
+      "issuer": "https://orchestra.example/runtime-control-lease",
+      "keyId": "runtime-control-lease-signing-key-id",
+      "publicKeySpkiDerBase64": "tenant-provisioned-public-key",
+      "allowedOrgIds": ["org-from-signed-release"],
+      "allowedEnvironments": ["prod"],
+      "allowedArtifactTypes": ["orchestra.runtime-control-lease"]
     }
   ],
   "modelGateway": {
@@ -48,6 +57,11 @@
   "apiTokenEnv": "PROMETA_RUNTIME_API_TOKEN",
   "requestTimeoutSeconds": 60,
   "maxRequestBytes": 1048576,
+  "runtimeControl": {
+    "refreshIntervalSeconds": 60,
+    "maxLeaseSeconds": 900,
+    "staleAction": "continue"
+  },
   "taskRecovery": {
     "leaseSeconds": 90,
     "maxAttempts": 3,

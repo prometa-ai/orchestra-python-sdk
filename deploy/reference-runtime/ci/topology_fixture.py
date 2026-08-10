@@ -40,6 +40,7 @@ _TOOL_POLICY_KEYS = (
     "approvalRequired",
     "requiredGuardrails",
 )
+# Kept identical to ``admission._TOOL_CONFIGURATION_KEYS``; a test asserts it.
 _TOOL_CONFIGURATION_KEYS = (
     "name",
     "source",
@@ -47,6 +48,7 @@ _TOOL_CONFIGURATION_KEYS = (
     "operation",
     "inputSchema",
     "rateLimitPerMin",
+    "mcpToolDescriptorDigest",
 )
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")

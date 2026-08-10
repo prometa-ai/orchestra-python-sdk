@@ -15,7 +15,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Mapping, Optional, Protocol
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
@@ -32,7 +32,33 @@ _OUTCOME_BY_TRANSITION = {
     "rolled_back": frozenset({"succeeded"}),
     "failed": frozenset({"failed"}),
     "stopped": frozenset({"succeeded"}),
+    "quarantined": frozenset({"succeeded"}),
+    "resumed": frozenset({"succeeded"}),
+    "controls_stale": frozenset({"failed", "succeeded"}),
 }
+_RUNTIME_CONTROL_TRANSITIONS = frozenset(
+    {"quarantined", "resumed", "controls_stale"}
+)
+_ENFORCEMENT_VALUES = frozenset({"enforcing", "advisory"})
+_SCOPES = frozenset({"org", "tenant", "deployment", "solution", "agent"})
+#: The acknowledgement direction's key and its exact membership, pinned by the
+#: runtime-control lease contract §7b and covered by the shared ``acks/``
+#: vectors. Every member is required: defaulting an absent one would silently
+#: rewrite what the replica said. Notably absent is ``mode`` — that is the
+#: issuer's instruction, which already travels in the lease, and reporting it
+#: back would say what this replica was told rather than what it did.
+RUNTIME_CONTROL_ACK_KEY = "runtimeControlAck"
+_ACK_FIELDS = (
+    "leaseId",
+    "revision",
+    "enforcement",
+    "enforceableScopes",
+    "enforcedControlCount",
+    "ignoredControlCount",
+    "stale",
+    "leaseExpiresAt",
+    "leaseParseFailed",
+)
 
 
 class RuntimeReceiptError(ValueError):
@@ -104,6 +130,88 @@ def _instant(value: Optional[datetime]) -> str:
     return utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _bounded_count(name: str, value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise RuntimeReceiptError("%s must be a non-negative integer" % name)
+    return value
+
+
+def _normalized_acknowledgement(value: Any) -> Dict[str, Any]:
+    """Validate one ``runtimeControlAck`` and return it in the pinned shape.
+
+    Unknown members are dropped rather than stored, and every pinned member is
+    required. The one cross-field rule is the contract's opening premise: a
+    surface may only claim enforcement it can prove, so ``enforcing`` without a
+    lease to name is refused rather than counted.
+    """
+
+    if not isinstance(value, Mapping):
+        raise RuntimeReceiptError("runtime_control_ack must be a mapping")
+    missing = [field for field in _ACK_FIELDS if field not in value]
+    if missing:
+        raise RuntimeReceiptError(
+            "runtime_control_ack is missing: %s" % ",".join(missing)
+        )
+    lease_id = value["leaseId"]
+    revision = value["revision"]
+    if lease_id is not None:
+        _identifier("runtime_control_ack.leaseId", lease_id)
+    if revision is not None and (type(revision) is not int or revision < 0):
+        raise RuntimeReceiptError(
+            "runtime_control_ack.revision must be a non-negative integer"
+        )
+    if (lease_id is None) != (revision is None):
+        raise RuntimeReceiptError(
+            "runtime_control_ack.leaseId and revision must be supplied together"
+        )
+    enforcement = value["enforcement"]
+    if enforcement not in _ENFORCEMENT_VALUES:
+        raise RuntimeReceiptError(
+            "runtime_control_ack.enforcement must be enforcing or advisory"
+        )
+    if enforcement == "enforcing" and lease_id is None:
+        raise RuntimeReceiptError(
+            "runtime_control_ack cannot claim enforcement without a lease"
+        )
+    scopes = value["enforceableScopes"]
+    if not isinstance(scopes, (list, tuple)):
+        raise RuntimeReceiptError(
+            "runtime_control_ack.enforceableScopes must be a sequence"
+        )
+    scopes = list(scopes)
+    if not scopes or not set(scopes) <= _SCOPES or len(set(scopes)) != len(scopes):
+        raise RuntimeReceiptError(
+            "runtime_control_ack.enforceableScopes must be distinct control scopes"
+        )
+    expires_at = value["leaseExpiresAt"]
+    if expires_at is not None and not isinstance(expires_at, str):
+        raise RuntimeReceiptError(
+            "runtime_control_ack.leaseExpiresAt must be an instant or null"
+        )
+    if (lease_id is None) and expires_at is not None:
+        raise RuntimeReceiptError(
+            "runtime_control_ack.leaseExpiresAt requires a lease"
+        )
+    for flag in ("stale", "leaseParseFailed"):
+        if type(value[flag]) is not bool:
+            raise RuntimeReceiptError("runtime_control_ack.%s must be a bool" % flag)
+    return {
+        "leaseId": lease_id,
+        "revision": revision,
+        "enforcement": enforcement,
+        "enforceableScopes": scopes,
+        "enforcedControlCount": _bounded_count(
+            "runtime_control_ack.enforcedControlCount", value["enforcedControlCount"]
+        ),
+        "ignoredControlCount": _bounded_count(
+            "runtime_control_ack.ignoredControlCount", value["ignoredControlCount"]
+        ),
+        "stale": value["stale"],
+        "leaseExpiresAt": expires_at,
+        "leaseParseFailed": value["leaseParseFailed"],
+    }
+
+
 def build_runtime_receipt(
     *,
     attestation_id: str,
@@ -121,11 +229,22 @@ def build_runtime_receipt(
     receipt_id: Optional[str] = None,
     event_at: Optional[datetime] = None,
     reason: Optional[str] = None,
+    runtime_control_ack: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the normalized platform receipt payload.
 
     Keep the returned ``receiptId`` when retrying. The platform treats the
     same ID + semantic payload as idempotent and rejects reuse with new bytes.
+
+    ``runtime_control_ack`` is the acknowledgement direction of the
+    runtime-control lease contract, carried under the additive top-level
+    ``runtimeControlAck`` key in exactly the shape §7b pins. It is what lets
+    the control plane separate desired from enforced state: which lease this
+    replica is applying, at what revision, whether it is still fresh, which
+    scopes this replica can resolve at all, and how many controls it is
+    actually enforcing rather than how many the lease names. It is required on
+    the runtime-control transitions and rejected on every other transition, so
+    a lifecycle receipt can never imply an acknowledgement it did not make.
     """
 
     if target_environment not in _ENVIRONMENTS:
@@ -150,6 +269,32 @@ def build_runtime_receipt(
         raise RuntimeReceiptError("outcome is invalid for transition")
     if reason is not None and (not isinstance(reason, str) or len(reason) > 1000):
         raise RuntimeReceiptError("reason must be at most 1000 characters")
+    control_transition = transition in _RUNTIME_CONTROL_TRANSITIONS
+    if not control_transition and runtime_control_ack is not None:
+        raise RuntimeReceiptError(
+            "runtime_control_ack requires a runtime-control transition"
+        )
+    acknowledgement = None
+    if control_transition:
+        if runtime_control_ack is None:
+            raise RuntimeReceiptError(
+                "runtime_control_ack is required on runtime-control transitions"
+            )
+        acknowledgement = _normalized_acknowledgement(runtime_control_ack)
+        if acknowledgement["leaseId"] is None and transition != "controls_stale":
+            raise RuntimeReceiptError(
+                "a lease is required to acknowledge %s" % transition
+            )
+        if transition == "controls_stale" and acknowledgement["stale"] != (
+            outcome == "failed"
+        ):
+            raise RuntimeReceiptError(
+                "runtime_control_ack.stale must agree with the controls_stale outcome"
+            )
+        if transition in {"quarantined", "resumed"} and acknowledgement["stale"]:
+            raise RuntimeReceiptError(
+                "a stale replica cannot acknowledge a control transition"
+            )
 
     receipt = {
         "receiptId": _identifier("receipt_id", receipt_id or str(uuid.uuid4())),
@@ -169,6 +314,8 @@ def build_runtime_receipt(
     if policy_digest is not None and configuration_digest is not None:
         receipt["policyDigest"] = policy_digest
         receipt["configurationDigest"] = configuration_digest
+    if acknowledgement is not None:
+        receipt[RUNTIME_CONTROL_ACK_KEY] = acknowledgement
     return receipt
 
 
@@ -391,6 +538,7 @@ class RuntimeReceiptDispatcher:
 
 
 __all__ = [
+    "RUNTIME_CONTROL_ACK_KEY",
     "RuntimeReceiptClient",
     "RuntimeReceiptDispatcher",
     "RuntimeReceiptError",

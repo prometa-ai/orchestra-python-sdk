@@ -13,19 +13,47 @@ import binascii
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, MutableSet, Optional, Tuple
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Mapping,
+    MutableSet,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 
 ENVELOPE_VERSION = 1
 ENVELOPE_CANONICALIZATION = "signed-payload-json-v1"
 SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+AGENT_BUNDLE_TYPE = "orchestra.agent-bundle"
 PROMOTION_ATTESTATION_VERSION = 1
 PROMOTION_ATTESTATION_TYPE = "orchestra.promotion-attestation"
 PROMOTION_ATTESTATION_CANONICALIZATION = "signed-payload-json-v1"
 MAX_PROMOTION_APPROVALS = 10
 SUPPORTED_TARGET_ENVIRONMENTS = frozenset({"dev", "test", "staging", "prod"})
+RUNTIME_CONTROL_LEASE_VERSION = 1
+RUNTIME_CONTROL_LEASE_TYPE = "orchestra.runtime-control-lease"
+RUNTIME_CONTROL_LEASE_CANONICALIZATION = "signed-payload-json-v1"
+RUNTIME_CONTROL_STATES = frozenset({"serving", "quarantined"})
+RUNTIME_CONTROL_SCOPES = frozenset(
+    {"org", "tenant", "deployment", "solution", "agent"}
+)
+RUNTIME_CONTROL_MODES = frozenset({"advisory", "enforcing"})
+RUNTIME_CONTROL_STALE_ACTIONS = frozenset({"continue", "stop"})
+MAX_RUNTIME_CONTROLS = 256
+# Contract §3.6 pins the lease timestamp format instead of accepting whatever
+# ISO-8601 each implementation's parser happens to allow. Three runtimes that
+# each accept a different subset is how the wire drifted in the first place.
+_CANONICAL_INSTANT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
+)
 
 
 class BundleVerificationError(ValueError):
@@ -42,6 +70,13 @@ class BundleTrustEntry:
 
     The transport bundle's embedded public key is intentionally absent from
     this type. Trust is provisioned out of band and selected by issuer/key ID.
+
+    ``allowed_artifact_types`` is the key's purpose. When it is set, this key
+    may only sign the artifact types it names, so a bundle, promotion or
+    routing key cannot be turned into a kill switch. Runtime-control lease
+    verification requires it: enforcement by the issuer alone is not
+    enforcement, because a misconfigured issuer is the case the check exists
+    for.
     """
 
     issuer: str
@@ -52,6 +87,7 @@ class BundleTrustEntry:
     allowed_environments: Optional[FrozenSet[str]] = None
     active_from: Optional[datetime] = None
     retired_at: Optional[datetime] = None
+    allowed_artifact_types: Optional[FrozenSet[str]] = None
 
 
 class BundleTrustStore:
@@ -67,6 +103,11 @@ class BundleTrustStore:
                 raise ValueError("duplicate trust entry: %s/%s" % key)
             indexed[key] = entry
         self._entries = indexed
+
+    def entries(self) -> Tuple[BundleTrustEntry, ...]:
+        """Every provisioned entry, so a host can check purposes at startup."""
+
+        return tuple(self._entries.values())
 
     def resolve(self, issuer: str, key_id: str) -> BundleTrustEntry:
         try:
@@ -111,6 +152,58 @@ class VerifiedPromotionAttestation:
     @property
     def artifact_digest(self) -> str:
         return str(self.claims["artifactDigest"])
+
+    @property
+    def jti(self) -> str:
+        return str(self.claims["jti"])
+
+
+@dataclass(frozen=True)
+class RuntimeControl:
+    """One scope-typed desired state carried by a runtime-control lease."""
+
+    scope: str
+    subject_id: str
+    state: str
+    reason_code: Optional[str] = None
+
+    @property
+    def quarantined(self) -> bool:
+        return self.state == "quarantined"
+
+
+@dataclass(frozen=True)
+class VerifiedRuntimeControlLease:
+    """One short-TTL runtime-control decision parsed only from verified bytes."""
+
+    claims: Mapping[str, Any]
+    signed_payload: str
+    trust_entry: BundleTrustEntry
+    lease_id: str
+    revision: int
+    mode: str
+    stale_action: str
+    controls: Tuple[RuntimeControl, ...]
+    not_before: datetime
+    expires_at: datetime
+
+    @property
+    def advisory(self) -> bool:
+        return self.mode == "advisory"
+
+    @property
+    def digest(self) -> str:
+        """The lease identity every implementation must agree on.
+
+        This is the same digest rule the bundle envelope uses for its signed
+        content: sha256 over the exact ``signedPayload`` bytes that were
+        verified, never over a re-serialization of the parsed claims.
+        """
+
+        return (
+            "sha256:"
+            + hashlib.sha256(self.signed_payload.encode("utf-8")).hexdigest()
+        )
 
     @property
     def jti(self) -> str:
@@ -233,11 +326,26 @@ def _verify_ed25519(
         raise BundleVerificationError("invalid_signature") from exc
 
 
+def _validate_key_purpose(
+    entry: BundleTrustEntry, artifact_type: str, *, required: bool
+) -> None:
+    """Refuse a key that was not provisioned to sign this artifact type."""
+
+    if entry.allowed_artifact_types is None:
+        if required:
+            raise BundleVerificationError("signing_key_purpose_unknown")
+        return
+    if artifact_type not in entry.allowed_artifact_types:
+        raise BundleVerificationError("signing_key_purpose_denied")
+
+
 def _validate_trust_constraints(
     entry: BundleTrustEntry,
     claims: Mapping[str, Any],
     current: datetime,
     skew: timedelta,
+    *,
+    constrained_claims: Sequence[str] = ("orgId", "audience", "targetEnvironment"),
 ) -> None:
     active_from = _entry_time(entry.active_from, "active_from")
     retired_at = _entry_time(entry.retired_at, "retired_at")
@@ -256,7 +364,14 @@ def _validate_trust_constraints(
         ),
     )
     for allowed, claim_name, error_code in constrained:
-        if allowed is not None and claims.get(claim_name) not in allowed:
+        if allowed is None:
+            continue
+        if claim_name not in constrained_claims:
+            # The artifact being verified has no such claim, so this constraint
+            # cannot be evaluated. Ignoring it silently would let an operator
+            # believe a key is narrowed when it is not.
+            raise BundleVerificationError("invalid_trust_entry")
+        if claims.get(claim_name) not in allowed:
             raise BundleVerificationError(error_code)
 
 
@@ -353,6 +468,7 @@ def verify_bundle_envelope(
 
     current = _as_utc(now)
     skew = timedelta(seconds=max_clock_skew_seconds)
+    _validate_key_purpose(trust_entry, AGENT_BUNDLE_TYPE, required=False)
     _validate_trust_constraints(trust_entry, claims, current, skew)
 
     issued_at = _parse_instant(claims, "issuedAt")
@@ -631,6 +747,7 @@ def verify_promotion_attestation(
 
     current = _as_utc(now)
     skew = timedelta(seconds=max_clock_skew_seconds)
+    _validate_key_purpose(trust_entry, PROMOTION_ATTESTATION_TYPE, required=False)
     _validate_trust_constraints(trust_entry, claims, current, skew)
 
     decision_evaluated_at = _parse_instant(claims, "decisionEvaluatedAt")
@@ -852,8 +969,216 @@ def verify_promotion_attestation(
     )
 
 
+def _canonical_instant(claims: Mapping[str, Any], key: str) -> datetime:
+    raw = _required_string(claims, key, "invalid_time_claim")
+    if _CANONICAL_INSTANT.fullmatch(raw) is None:
+        raise BundleVerificationError(
+            "invalid_time_claim", "%s must be YYYY-MM-DDTHH:MM:SS.mmmZ" % key
+        )
+    return _parse_instant(claims, key)
+
+
+def _parse_runtime_controls(value: Any) -> Tuple[RuntimeControl, ...]:
+    if not isinstance(value, list) or len(value) > MAX_RUNTIME_CONTROLS:
+        raise BundleVerificationError("invalid_controls")
+    parsed = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise BundleVerificationError("invalid_controls")
+        scope = _required_string(item, "scope", "invalid_controls")
+        subject_id = _required_string(item, "subjectId", "invalid_controls")
+        state = _required_string(item, "state", "invalid_controls")
+        if scope not in RUNTIME_CONTROL_SCOPES:
+            raise BundleVerificationError("unsupported_control_scope")
+        if state not in RUNTIME_CONTROL_STATES:
+            raise BundleVerificationError("unsupported_control_state")
+        if subject_id != subject_id.strip() or len(subject_id) > 200:
+            raise BundleVerificationError("invalid_controls")
+        reason_code = item.get("reasonCode")
+        if reason_code is not None and (
+            not isinstance(reason_code, str)
+            or not reason_code
+            or reason_code != reason_code.strip()
+            or len(reason_code) > 200
+        ):
+            raise BundleVerificationError("invalid_reason_code")
+        key = (scope, subject_id)
+        if key in seen:
+            # Two states for one subject has no defined winner, and picking one
+            # would make enforcement depend on array order.
+            raise BundleVerificationError("ambiguous_control")
+        seen.add(key)
+        parsed.append(RuntimeControl(scope, subject_id, state, reason_code))
+    return tuple(parsed)
+
+
+def verify_runtime_control_lease(
+    lease: Mapping[str, Any],
+    trust_store: BundleTrustStore,
+    *,
+    expected_org_id: str,
+    expected_environment: str,
+    now: Optional[datetime] = None,
+    revoked_key_ids: Iterable[str] = (),
+    revoked_jtis: Iterable[str] = (),
+    max_clock_skew_seconds: int = 60,
+    max_lease_seconds: int = 900,
+    max_signed_payload_bytes: int = 64 * 1024,
+) -> VerifiedRuntimeControlLease:
+    """Verify one signed runtime-control lease against the tenant trust store.
+
+    The envelope, canonicalization, Ed25519 check and trust-store lookup are
+    the ones the routing-policy and promotion artifacts already use; only the
+    artifact type and the claims differ.
+
+    Subject matching is deliberately not done here. A lease carries
+    scope-typed controls (``org``/``tenant``/``deployment``/``solution``/
+    ``agent``) and only the runtime knows which of those identities it holds,
+    so ``RuntimeControlGate`` matches them. This verifier answers exactly one
+    question: are these bytes an authentic, in-window, purpose-signed lease for
+    this org and environment.
+
+    ``max_lease_seconds`` bounds the signed validity window
+    (``expiresAt - notBefore``) a lease may declare. It does not bound how long
+    an adopted lease keeps governing once refreshes stop: a quarantine
+    deliberately survives its own expiry so it cannot be evaded by making the
+    control plane unreachable. What happens after expiry is decided by the
+    signed ``staleAction``.
+    """
+
+    if not expected_org_id or not expected_environment:
+        raise BundleVerificationError("missing_expected_binding")
+    if expected_environment not in SUPPORTED_TARGET_ENVIRONMENTS:
+        raise BundleVerificationError("unsupported_expected_environment")
+    if type(max_clock_skew_seconds) is not int or max_clock_skew_seconds < 0:
+        raise BundleVerificationError("invalid_clock_skew")
+    if type(max_lease_seconds) is not int or not 1 <= max_lease_seconds <= 86_400:
+        raise BundleVerificationError("invalid_lease_ceiling")
+    if type(max_signed_payload_bytes) is not int or max_signed_payload_bytes < 1:
+        raise BundleVerificationError("invalid_payload_limit")
+
+    if lease.get("signed") is not True:
+        raise BundleVerificationError("unsigned_control_lease")
+    if lease.get("algorithm") != "ed25519":
+        raise BundleVerificationError("unsupported_algorithm")
+    if lease.get("artifactType") != RUNTIME_CONTROL_LEASE_TYPE:
+        raise BundleVerificationError("wrong_artifact_type")
+    if (
+        type(lease.get("leaseVersion")) is not int
+        or lease.get("leaseVersion") != RUNTIME_CONTROL_LEASE_VERSION
+    ):
+        raise BundleVerificationError("unsupported_lease_version")
+    if lease.get("canonicalization") != RUNTIME_CONTROL_LEASE_CANONICALIZATION:
+        raise BundleVerificationError("unsupported_lease_canonicalization")
+
+    signed_payload = _required_string(lease, "signedPayload", "missing_signed_payload")
+    signature = _required_string(lease, "signature", "missing_signature")
+    if len(signed_payload.encode("utf-8")) > max_signed_payload_bytes:
+        raise BundleVerificationError("signed_payload_too_large")
+
+    transport_issuer = _required_string(lease, "issuer", "missing_issuer")
+    transport_key_id = _required_string(lease, "keyId", "missing_key_id")
+    if transport_key_id in frozenset(revoked_key_ids):
+        raise BundleVerificationError("revoked_signing_key")
+
+    trust_entry = trust_store.resolve(transport_issuer, transport_key_id)
+    _validate_key_purpose(trust_entry, RUNTIME_CONTROL_LEASE_TYPE, required=True)
+    _verify_ed25519(trust_entry, signed_payload, signature)
+    claims = _parse_json_object(signed_payload, "malformed_signed_payload")
+
+    if claims.get("artifactType") != RUNTIME_CONTROL_LEASE_TYPE:
+        raise BundleVerificationError("wrong_artifact_type")
+    if (
+        type(claims.get("leaseVersion")) is not int
+        or claims.get("leaseVersion") != RUNTIME_CONTROL_LEASE_VERSION
+    ):
+        raise BundleVerificationError("unsupported_lease_version")
+
+    issuer = _required_string(claims, "issuer", "invalid_claims")
+    key_id = _required_string(claims, "keyId", "invalid_claims")
+    org_id = _required_string(claims, "orgId", "invalid_claims")
+    environment = _required_string(claims, "targetEnvironment", "invalid_claims")
+    lease_id = _required_string(claims, "leaseId", "invalid_claims")
+    mode = _required_string(claims, "mode", "invalid_claims")
+    stale_action = _required_string(claims, "staleAction", "invalid_claims")
+    jti = _required_string(claims, "jti", "invalid_claims")
+    revision = claims.get("revision")
+
+    if issuer != transport_issuer or key_id != transport_key_id:
+        raise BundleVerificationError("trust_selector_mismatch")
+    if org_id != expected_org_id:
+        raise BundleVerificationError("wrong_org")
+    if environment != expected_environment:
+        raise BundleVerificationError("wrong_environment")
+    if environment not in SUPPORTED_TARGET_ENVIRONMENTS:
+        raise BundleVerificationError("unsupported_target_environment")
+    if lease_id != lease_id.strip() or len(lease_id) > 200:
+        raise BundleVerificationError("invalid_claims")
+    if type(revision) is not int or revision < 0:
+        raise BundleVerificationError("invalid_lease_revision")
+    if mode not in RUNTIME_CONTROL_MODES:
+        raise BundleVerificationError("unsupported_control_mode")
+    # staleAction is inside the signed claims on purpose: it decides behaviour
+    # while the issuer is unreachable, so a runtime must not be able to reach
+    # the permissive branch by dropping an unsigned transport field.
+    if stale_action not in RUNTIME_CONTROL_STALE_ACTIONS:
+        raise BundleVerificationError("unsupported_stale_action")
+
+    controls = _parse_runtime_controls(claims.get("controls"))
+
+    current = _as_utc(now)
+    skew = timedelta(seconds=max_clock_skew_seconds)
+    _validate_trust_constraints(
+        trust_entry,
+        claims,
+        current,
+        skew,
+        constrained_claims=("orgId", "targetEnvironment"),
+    )
+
+    issued_at = _canonical_instant(claims, "issuedAt")
+    not_before = _canonical_instant(claims, "notBefore")
+    expires_at = _canonical_instant(claims, "expiresAt")
+    if not (issued_at <= not_before < expires_at):
+        raise BundleVerificationError("invalid_validity_window")
+    if (expires_at - not_before).total_seconds() > max_lease_seconds:
+        raise BundleVerificationError("control_lease_too_long")
+    if current + skew < not_before:
+        raise BundleVerificationError("not_yet_valid")
+    if current >= expires_at:
+        raise BundleVerificationError("expired_control_lease")
+    if jti in frozenset(revoked_jtis):
+        raise BundleVerificationError("revoked_control_lease")
+
+    return VerifiedRuntimeControlLease(
+        claims=claims,
+        signed_payload=signed_payload,
+        trust_entry=trust_entry,
+        lease_id=lease_id,
+        revision=revision,
+        mode=mode,
+        stale_action=stale_action,
+        controls=controls,
+        not_before=not_before,
+        expires_at=expires_at,
+    )
+
+
 __all__ = [
+    "AGENT_BUNDLE_TYPE",
     "SUPPORTED_BUNDLE_SCHEMA_VERSIONS",
+    "MAX_RUNTIME_CONTROLS",
+    "RUNTIME_CONTROL_LEASE_CANONICALIZATION",
+    "RUNTIME_CONTROL_LEASE_TYPE",
+    "RUNTIME_CONTROL_LEASE_VERSION",
+    "RUNTIME_CONTROL_MODES",
+    "RUNTIME_CONTROL_SCOPES",
+    "RUNTIME_CONTROL_STALE_ACTIONS",
+    "RUNTIME_CONTROL_STATES",
+    "RuntimeControl",
+    "VerifiedRuntimeControlLease",
+    "verify_runtime_control_lease",
     "BundleTrustEntry",
     "BundleTrustStore",
     "BundleVerificationError",

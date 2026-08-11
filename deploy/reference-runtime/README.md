@@ -106,8 +106,147 @@ It also requires explicit HTTP origins or stdio commands, late-bound credential
 names, write/destructive approval and idempotency policy, and a reservation
 timeout longer than any tool call. Missing official transport dependencies or a
 weakened/mismatched binding fails closed. The stock CLI can execute read-only
-tools; write or destructive bundles additionally require a tenant-supplied
-`HumanEscalation` adapter through `build_reference_runtime_host()`.
+tools; write or destructive bundles additionally require a reviewer, configured
+through the optional `humanEscalation` block below or injected through
+`build_reference_runtime_host()`.
+
+Two optional sub-blocks harden the broker further:
+
+```json
+{
+  "mcpBroker": {
+    "toolLimits": {
+      "default": {
+        "maxCallsPerWindow": 60,
+        "windowSeconds": 60,
+        "maxConcurrentCalls": 4
+      },
+      "perTool": {
+        "orders.lookup": { "maxCallsPerWindow": 10, "maxConcurrentCalls": 2 }
+      }
+    },
+    "toolDescriptors": { "requireSignedDigest": false, "cacheSeconds": 300 }
+  }
+}
+```
+
+`toolLimits` bounds per-tool call rate and in-flight calls **within one
+replica**; N replicas admit N times these numbers, and distributed rate
+limiting stays with the tenant gateway. Omit the block and no ceiling applies:
+the counters aggregate every request a replica serves at once, so a ceiling
+under this runtime's own request concurrency refuses ordinary traffic — size
+`maxConcurrentCalls` above the concurrency one replica accepts. Every name
+under `perTool` must be a configured grant.
+
+`toolDescriptors.cacheSeconds` is how long a server's advertised tool listing
+is reused before drift is re-checked, and therefore the longest a swapped tool
+description can go unnoticed. It also decides whether a credential the server
+has since rotated is caught by the listing re-read or by the tool call itself,
+which is the difference between a knowably-no-side-effect refusal and an
+indeterminate one. That is a first-attempt distinction only: a replay is
+answered from the idempotency record before the listing is read, so a replica
+holding no cached listing still reports the indeterminate outcome rather than
+its own failed re-read.
+
+`requireSignedDigest: true` refuses any MCP tool whose signed declaration does
+not pin `mcpToolDescriptorDigest`. When a tool does pin it, the value is inside
+the signed configuration-digest projection — the same projection the control
+plane signs — so the two sides compute the same digest.
+
+To require a human reviewer for write and destructive tools, add:
+
+```json
+{
+  "humanEscalation": {
+    "baseUrl": "https://orchestra.example.com",
+    "apiKeyEnv": "ORCHESTRA_APPROVAL_API_KEY",
+    "pollIntervalSeconds": 2,
+    "decisionTimeoutSeconds": 300,
+    "localDirectory": "/var/lib/prometa/approvals"
+  }
+}
+```
+
+Either `baseUrl` (with `apiKeyEnv`) or `localDirectory` is required; supplying
+both falls back to the local directory when the control plane is unreachable.
+`allowInsecureHttp` permits an `http://` `baseUrl` for a local or test approval
+endpoint, and is passed through to the client, so the whole block agrees on
+one answer instead of accepting the option and then refusing to start.
+Requests carry identities, the tool, and a payload digest — never the payload
+itself. A reviewer who does not answer inside `decisionTimeoutSeconds` fails
+the step. Anything able to write into `localDirectory/decisions` can approve a
+destructive call, so mount it with the same care as a credential, and write
+decision files atomically — a half-written file is read as an invalid decision
+and fails the step.
+
+To enable the operator kill switch, add `runtimeControl` alongside
+`controlPlanePull` (it is carried on that same pull and requires it):
+
+```json
+{
+  "runtimeControl": {
+    "refreshIntervalSeconds": 60,
+    "maxLeaseSeconds": 900,
+    "staleAction": "continue"
+  }
+}
+```
+
+The lease's signing key is provisioned in `promotionTrust` as its own entry
+declaring `"allowedArtifactTypes": ["orchestra.runtime-control-lease"]`. The
+host refuses to start with `runtime_control_signing_key_missing` if no entry
+declares that purpose, because a kill switch whose every lease is refused is
+configured and inert. That entry must not set `allowedAudiences`: a lease
+carries no audience claim, and a constraint that cannot be evaluated is
+refused rather than skipped.
+
+An enforcing lease whose `quarantined` control names a scope this pod holds an
+identity for makes `POST /v1/runtime/execute` answer `503` with
+`runtime_quarantined`. A control naming another subject, a scope this pod
+cannot resolve, or a matched control that says `serving` is not enforcement and
+is not counted as enforcement. An `advisory` lease never refuses anything,
+however stale it gets.
+
+A lease whose `revision` is below the highest this pod has accepted is refused
+as out-of-order whatever `leaseId` it carries: revisions are ordered globally
+per `(orgId, targetEnvironment)`, so a captured `serving` lease cannot lift a
+live quarantine by arriving under a fresh lease stream.
+
+`GET /readyz` answers `503` while not admitting, but carries counts and
+booleans only — it is unauthenticated, so it never names the lease, its expiry,
+the subject, or the operator's reason. It is an operator view, not a probe: all
+three chart probes use `/healthz`, so a quarantined pod keeps its Service
+endpoint and answers every request with the typed `503` and the full control
+state. Gating readiness on `/readyz` instead would empty the Service under a
+fleet-wide quarantine, and callers would get a connection error indistinguishable
+from a crash — the one outcome the typed refusal exists to prevent. It would add
+no enforcement either: the probe and the refusal both read the same gate in the
+same process, so a replica dishonest enough to admit quarantined work would
+report itself ready anyway. Holding a compromised replica out of service is a
+job for NetworkPolicy or the endpoint, not for that replica's own probe.
+
+Quarantine keeps applying after the lease expires, so it cannot be evaded by
+cutting the runtime off from the control plane. A `serving` runtime whose lease
+expires keeps serving and reports `stale` — a control-plane outage must not
+become an inference outage. The signed `staleAction: "stop"` inverts that
+second rule for deployments that prefer a hard stop; the cost is that the
+runtime stops whenever refreshes stop, including on restart during an outage,
+because the lease is not persisted across restarts. The `staleAction` in this
+mounted block applies only until the first lease is adopted; after that the
+signed one governs.
+
+Every refresh acknowledges through the receipt outbox, not only state edges, so
+a pod sitting steady in `quarantined` stays in the enforcement count.
+Acknowledgements travel under the additive top-level `runtimeControlAck` key,
+in the nine-member shape the lease contract pins; repeats within one revision
+collapse to a single outbox row, while a pod that goes stale and recovers under
+one revision reports both.
+
+Each refresh re-reads the whole release handoff, because the lease rides that
+response — 8.5x the lease's own bytes for a handoff built from the SDK's
+bundle, promotion-attestation and lease fixtures, and
+`controlPlaneMaxResponseBytes` allows up to 12 MiB for a real release. Raise
+`refreshIntervalSeconds` to trade detection latency for bandwidth.
 
 To enable asynchronous lifecycle receipts, add this optional block to the
 mounted configuration. HTTPS is required unless `allowInsecureHttp` is set
@@ -686,8 +825,8 @@ synchronous control-plane calls and never includes keys or signed payloads.
 
 ## Request API
 
-- `GET /healthz`: process liveness;
-- `GET /readyz`: payload-free readiness;
+- `GET /healthz`: process liveness, and every chart probe;
+- `GET /readyz`: payload-free runtime-control state for operators;
 - `GET /v1/runtime/tasks/{requestId}`: authenticated payload-free lifecycle
   projection when task recovery is configured;
 - `POST /v1/runtime/execute`: bearer-authenticated execution.

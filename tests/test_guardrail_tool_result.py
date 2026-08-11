@@ -584,6 +584,15 @@ class _Transport:
     def __init__(self, output) -> None:
         self.output = output
 
+    async def list_tools(self, server, credentials):
+        return (
+            {
+                "name": "search.query",
+                "description": "Search the corpus.",
+                "inputSchema": {"type": "object"},
+            },
+        )
+
     async def call_tool(self, server, operation, arguments, credentials, metadata):
         return self.output
 

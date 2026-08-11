@@ -9,6 +9,150 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Runtime-control leases: the enforced half of the operator kill switch, on the
+  wire shape pinned by the runtime-control lease contract and exercised by the
+  shared conformance vectors in `tests/fixtures/lease-vectors/` — nine
+  lease-direction vectors and ten acknowledgement-direction cases, shared
+  because the previous round produced three implementations that could not read
+  each other's leases. This SDK passes all nineteen. Two verifiers have been run
+  against the fixtures so far: this one, and the inference engine's, which
+  reports no failures on the nine lease-direction vectors and does not consume
+  the acknowledgement direction. The control plane has been run against neither,
+  so this is not yet three-way agreement.
+  `verify_runtime_control_lease` reuses the existing Ed25519 trust-store code
+  path to verify a short-TTL statement carrying a stable `leaseId`, a monotonic
+  `revision`, `mode`, `staleAction`, and scope-typed `controls`;
+  `RuntimeControlGate` matches those controls against the identities this
+  replica actually holds and refuses to admit work under a matched quarantine;
+  `RuntimeControlRefresher` revalidates on the release-pull seam the host
+  already uses, so no inbound port is opened and the request path gains no
+  control-plane dependency.
+  - The signing key's purpose is verified: a trust entry must declare
+    `allowed_artifact_types` containing `orchestra.runtime-control-lease`, so a
+    bundle, promotion or routing key cannot stop a runtime even with a genuine
+    signature, and a key with no declared purpose is refused rather than
+    trusted. The lease is also the first artifact whose claims cannot carry
+    every trust-entry constraint — it has no `audience` — so a trust entry
+    narrowing a key by a claim the artifact under verification does not have is
+    now refused as `invalid_trust_entry` rather than skipped, and an operator
+    cannot believe a key is narrowed when nothing narrows it. Bundle and
+    promotion verification carry all three constrained claims and are
+    unaffected.
+  - Scope is typed (`org`/`tenant`/`deployment`/`solution`/`agent`) and this
+    host declares what it can enforce. `enforcedControlCount` counts only
+    controls this replica matched, can enforce, and is quarantined by — never
+    the number the lease names, and never a matched `serving` control, since
+    agreeing to serve is not a control being applied. Zero enforcement reports
+    `enforcement: "advisory"` however it was reached, and controls at scopes
+    this replica cannot resolve are reported as `ignoredControlCount`, so an
+    agent-scoped quarantine issued into a fleet that has no agent identity
+    renders as a visible gap rather than as enforcement.
+  - `mode` is checked before staleness, always: an advisory lease reports and
+    never refuses a request under any staleness condition.
+  - `GET /readyz` has no authorization check, so it carries counts and booleans
+    only — never the `leaseId`, the lease expiry, a subject, or the operator's
+    free-text `reasonCode`. The authenticated `POST /v1/runtime/execute` denial
+    carries the full state. `/readyz` is an operator view and no longer any
+    chart probe: all three now use `/healthz`, so a quarantined replica stays
+    routable and delivers that typed denial. Gating readiness on `/readyz`
+    would empty the Service under a fleet-wide quarantine and leave callers a
+    connection error indistinguishable from a crash, while adding no
+    enforcement — the probe and the denial read the same gate in the same
+    process, so a replica dishonest enough to admit quarantined work would
+    report itself ready.
+  - After expiry a quarantine keeps applying — it must not be evadable by
+    making the control plane unreachable — while a serving runtime keeps
+    serving and reports its controls stale, because a control-plane outage must
+    not become a fleet-wide inference outage. The signed `staleAction: "stop"`
+    is the opt-in for the opposite trade, and its cost is that the runtime
+    stops whenever refreshes stop, including on restart during an outage,
+    because the lease is not persisted. `staleAction` lives inside the signed
+    claims so a runtime cannot reach the permissive branch by dropping an
+    unsigned transport field; the mounted `runtimeControl.staleAction` applies
+    only until the first lease is adopted.
+  - Replay ordering is global per `(orgId, targetEnvironment)`, the pair the
+    contract makes `revision` monotonic within, and not per `leaseId`: a
+    revision below the highest ever accepted is refused as out-of-order
+    whatever lease carries it. Ordering scoped to one `leaseId` would leave a
+    live quarantine liftable by replaying a genuine, correctly signed,
+    unexpired `serving` lease from an unseen stream. The same revision
+    re-signed with a later expiry is still adopted, which is how an unchanged
+    control set stays fresh.
+  - Each refresh re-reads the whole release handoff, because the lease rides
+    that response: 8,332 bytes of handoff for 977 bytes of lease — 8.5x — when
+    composed from this repo's own bundle, promotion-attestation and lease
+    fixtures, and up to the default 12 MiB `controlPlaneMaxResponseBytes` for a
+    real release. A test recomputes that figure from the fixtures so it cannot
+    rot. `refreshIntervalSeconds` trades detection latency for bandwidth;
+    removing the overhead needs a lease-only projection the control plane does
+    not yet expose.
+- Enforced state is acknowledged through the existing receipt outbox on **every
+  refresh**, not only on a state edge — a replica sitting steady in
+  `quarantined` that spoke only on edges would drop out of the enforcement count
+  the control is judged by. `controls_stale` is the per-refresh acknowledgement
+  (`succeeded` fresh, `failed` once refreshes stop); `quarantined` and `resumed`
+  are additionally emitted on the edges. All carry the acknowledgement under the
+  additive top-level `runtimeControlAck` key, in exactly the nine-member shape
+  the contract pins (`leaseId`, `revision`, `enforcement`, `enforceableScopes`,
+  `enforcedControlCount`, `ignoredControlCount`, `stale`, `leaseExpiresAt`,
+  `leaseParseFailed`); unknown members are dropped, a missing one is refused
+  rather than defaulted, enforcement cannot be claimed without a lease to name,
+  and every other lifecycle transition rejects the key outright. There is no
+  `mode`: that is the issuer's instruction and already travels in the lease.
+  Receipt identity is `(leaseId, revision, transition)` plus the outcome for
+  `controls_stale` and the freshness episode — `leaseId` is deliberately stable
+  across refreshes so counting can key on it, which makes it useless as an
+  identity on its own, and both ends of a stale-and-recovered round trip can
+  land on one revision. Repeats within a revision and episode collapse to one
+  outbox row.
+- MCP tool-description drift detection. The broker fetches the server's own
+  tool listing at session open, digests each descriptor over its name,
+  description, and input/output schemas, and denies `mcp_tool_not_advertised`
+  or `mcp_tool_descriptor_drift` before touching the transport, with a typed
+  audit reason. A signed bundle may pin `mcpToolDescriptorDigest` per MCP tool
+  (`mcp_tool_descriptor_digest` computes it) and
+  `require_signed_tool_descriptor_digest` refuses unpinned tools; otherwise the
+  first descriptor a replica observes is the pin. The key is inside the tool's
+  configuration-digest projection, matching the projection the control plane
+  signs — projected on one side only, every bundle pinning a descriptor digest
+  would fail admission as `runtime_configuration_digest_mismatch`. The listing
+  is cached per connection, so this is not a per-call round trip. A transport
+  that cannot list tools is now refused at broker construction.
+- A call the idempotency store has already settled is answered from the record
+  before credentials are resolved or the tool listing is read. Drift detection
+  put a network round trip in front of the reservation, and the listing is
+  cached per replica, so a replay could reach a replica that had to re-read it:
+  the re-read failed first and reported `mcp_transport_failed` over the
+  `mcp_tool_call_indeterminate` the record already held. That reads as "retry"
+  for a call whose side effect may have happened, which is the one thing the
+  caller must not do. The consult is read-only, so an authorization that goes
+  on to be denied leaves the key untouched, and no tool is called on this path,
+  so the drift check has nothing left to protect. `McpIdempotencyStore` gains
+  `peek`, answering in the same vocabulary as `reserve`; a store that cannot be
+  consulted is refused at broker construction. Replaces the unused
+  `get` on `InMemoryMcpIdempotencyStore` and `PostgresMcpIdempotencyStore`.
+- `McpToolLimits`: per-tool sliding-window rate and in-flight ceilings, refused
+  as `mcp_tool_rate_limited` / `mcp_tool_concurrency_limited` and audited under
+  a `rate_limit` phase. These are per replica, and deliberately not derived
+  from the signed fleet-wide `rateLimitPerMin`, which stays inert. They are
+  also opt-in: a tool is uncounted until `mcpBroker.toolLimits` states its
+  numbers. The counters key on the connection and the tool, so they aggregate
+  every request one replica serves at once rather than one agent's loop, and
+  the only number that separates an overrun from ordinary traffic is how much
+  concurrency the deployment admits. An assumed ceiling would refuse work the
+  replica had already accepted — the reference runtime's own two-replica
+  topology certification drives eight concurrent requests through one tool, so
+  a default of four in-flight calls denied it with
+  `mcp_tool_concurrency_limited`.
+- Two shipped `HumanEscalation` references, so the approval path is exercised
+  end to end rather than only failing closed. `ControlPlaneHumanEscalation`
+  opens and polls an approval request against the control plane's approval
+  models; `FileSystemHumanEscalation` is the air-gapped fallback. Both send
+  identities, the tool, and a payload digest — never the payload — and treat an
+  unanswered review as `human_review_timeout`, not an approval. Neither is
+  wired unless the host's new `humanEscalation` block is configured, so the
+  no-config default remains `human_escalation_unavailable`.
+
 - `prometa.guardrail`, the first shipped `GuardEvaluator` implementations, so a
   signed bundle that declares guardrails is admissible without every tenant
   writing a detector first. `HttpGuardEvaluator` speaks

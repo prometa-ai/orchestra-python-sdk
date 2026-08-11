@@ -938,6 +938,9 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
             self.release = asyncio.Event()
             self.calls = 0
 
+        async def list_tools(self, server, credentials):
+            return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
+
         async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.calls += 1
             self.started.set()
@@ -1008,10 +1011,14 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
             runtime_id=runtime_id,
             reservation_timeout_seconds=0.05,
         )
+        # The consult reads an elapsed reservation as indeterminate on its own,
+        # so a replica that has not yet reserved anything still hears that a
+        # prior one may have reached the tool.
+        assert await replacement.peek(stale_key, stale_digest) == "indeterminate"
         assert await replacement.reserve(stale_key, stale_digest) == "indeterminate"
-        stale_record = await replacement.get(stale_key)
-        assert stale_record is not None
-        assert stale_record.status == "indeterminate"
+        assert await replacement.peek(stale_key, stale_digest) == "indeterminate"
+        assert await replacement.peek(stale_key, "sha256:" + "f" * 64) == "conflict"
+        assert await replacement.peek("mcp1:" + "a" * 64, stale_digest) == "absent"
 
         uncertain_request = _mcp_tool_request(
             request_id="request-uncertain",
@@ -1019,6 +1026,9 @@ def test_postgres_mcp_side_effects_are_replica_safe_and_tenant_isolated() -> Non
         )
 
         class UncertainTransport:
+            async def list_tools(self, server, credentials):
+                return ({"name": "orders.write", "inputSchema": {"type": "object"}},)
+
             async def call_tool(self, *args, **kwargs):
                 raise McpTransportError("mcp_transport_failed", outcome_unknown=True)
 

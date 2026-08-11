@@ -22,11 +22,11 @@ import sys
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, TextIO, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, Tuple
 
 from .admission import (
     AdmittedRuntimeRelease,
@@ -61,6 +61,7 @@ from .mcp import (
     McpBrokerPolicy,
     McpCredentialBinding,
     McpServerConfig,
+    McpToolLimits,
     McpTransportClient,
     McpToolGrant,
     OfficialMcpTransportClient,
@@ -80,10 +81,23 @@ from .postgres import (
     RuntimePersistenceError,
     check_postgres_runtime_compatibility,
 )
+from .escalation import (
+    ControlPlaneHumanEscalation,
+    FileSystemHumanEscalation,
+)
 from .receipts import (
     RuntimeReceiptClient,
     RuntimeReceiptDispatcher,
     build_runtime_receipt,
+)
+from .runtime_control import (
+    DEFAULT_RUNTIME_CONTROL_MAX_LEASE_SECONDS,
+    DEFAULT_RUNTIME_CONTROL_REFRESH_SECONDS,
+    RUNTIME_CONTROL_STALE_ACTIONS,
+    RuntimeControlDenied,
+    RuntimeControlGate,
+    RuntimeControlRefresher,
+    RuntimeControlStatus,
 )
 from .security_assurance import (
     DurableSecurityDecisionEmitter,
@@ -99,7 +113,12 @@ from .tasks import (
     RuntimeTaskStore,
     canonical_payload_digest,
 )
-from .trust import BundleTrustEntry, BundleTrustStore, BundleVerificationError
+from .trust import (
+    RUNTIME_CONTROL_LEASE_TYPE,
+    BundleTrustEntry,
+    BundleTrustStore,
+    BundleVerificationError,
+)
 from .workflow_ontology import (
     WorkflowContextResolver,
     WorkflowDecisionEmitter,
@@ -148,6 +167,7 @@ class RuntimeHostMcpConfig:
     credential_bindings: Tuple[McpCredentialBinding, ...]
     tool_timeout_seconds: float
     reservation_timeout_seconds: float
+    tool_limits: Mapping[str, McpToolLimits] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -212,6 +232,19 @@ class RuntimeHostConfig:
     workflow_decision_lease_seconds: float = 30.0
     workflow_decision_initial_backoff_seconds: float = 1.0
     workflow_decision_max_backoff_seconds: float = 300.0
+    human_escalation_base_url: Optional[str] = None
+    human_escalation_api_key_env: Optional[str] = None
+    human_escalation_timeout_seconds: float = 5.0
+    human_escalation_poll_interval_seconds: float = 2.0
+    human_escalation_decision_timeout_seconds: float = 300.0
+    human_escalation_local_directory: Optional[Path] = None
+    human_escalation_allow_insecure_http: bool = False
+    runtime_control_enabled: bool = False
+    runtime_control_refresh_interval_seconds: float = (
+        DEFAULT_RUNTIME_CONTROL_REFRESH_SECONDS
+    )
+    runtime_control_max_lease_seconds: int = DEFAULT_RUNTIME_CONTROL_MAX_LEASE_SECONDS
+    runtime_control_stale_action: str = "continue"
     task_recovery_enabled: bool = False
     task_recovery_lease_seconds: float = 90.0
     task_recovery_max_attempts: int = 3
@@ -379,7 +412,12 @@ def _parse_trust_store(value: Any, code: str) -> BundleTrustStore:
         _exact_keys(
             item,
             required=("issuer", "keyId", "publicKeySpkiDerBase64"),
-            optional=("allowedOrgIds", "allowedAudiences", "allowedEnvironments"),
+            optional=(
+                "allowedOrgIds",
+                "allowedAudiences",
+                "allowedEnvironments",
+                "allowedArtifactTypes",
+            ),
             code=code,
         )
         entries.append(
@@ -395,6 +433,9 @@ def _parse_trust_store(value: Any, code: str) -> BundleTrustStore:
                 ),
                 allowed_environments=_string_set(
                     "trust_environment", item.get("allowedEnvironments")
+                ),
+                allowed_artifact_types=_string_set(
+                    "trust_artifact_type", item.get("allowedArtifactTypes")
                 ),
             )
         )
@@ -413,6 +454,8 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
             "credentialBindings",
             "toolTimeoutSeconds",
             "reservationTimeoutSeconds",
+            "toolLimits",
+            "toolDescriptors",
         ),
         code="mcp_broker_config_invalid",
     )
@@ -594,6 +637,85 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
         minimum_side_effect_policy.issubset(idempotency_classes)
     ):
         raise RuntimeHostError("mcp_policy_weakened")
+
+    def _tool_limits(value: Any) -> McpToolLimits:
+        item = _mapping(value, "mcp_tool_limits_invalid")
+        _exact_keys(
+            item,
+            required=(),
+            optional=(
+                "maxCallsPerWindow",
+                "windowSeconds",
+                "maxConcurrentCalls",
+            ),
+            code="mcp_tool_limits_invalid",
+        )
+        try:
+            return McpToolLimits(
+                max_calls_per_window=_positive_integer(
+                    "mcp_max_calls_per_window",
+                    item.get("maxCallsPerWindow", 60),
+                    1_000_000,
+                ),
+                window_seconds=_positive_number(
+                    "mcp_window_seconds", item.get("windowSeconds", 60), 3600
+                ),
+                max_concurrent_calls=_positive_integer(
+                    "mcp_max_concurrent_calls",
+                    item.get("maxConcurrentCalls", 4),
+                    4096,
+                ),
+            )
+        except ValueError:
+            raise RuntimeHostError("mcp_tool_limits_invalid") from None
+
+    # No ceiling unless the deployment states one: the counters aggregate every
+    # request a replica serves at once, so a number chosen here would refuse
+    # traffic the runtime had already accepted.
+    default_tool_limits: Optional[McpToolLimits] = None
+    per_tool_limits: Dict[str, McpToolLimits] = {}
+    if document.get("toolLimits") is not None:
+        raw_limits = _mapping(document["toolLimits"], "mcp_tool_limits_invalid")
+        _exact_keys(
+            raw_limits,
+            required=(),
+            optional=("default", "perTool"),
+            code="mcp_tool_limits_invalid",
+        )
+        if raw_limits.get("default") is not None:
+            default_tool_limits = _tool_limits(raw_limits["default"])
+        raw_per_tool = _mapping(
+            raw_limits.get("perTool", {}), "mcp_tool_limits_invalid"
+        )
+        if len(raw_per_tool) > 1024:
+            raise RuntimeHostError("mcp_tool_limits_invalid")
+        for tool_name, limits in raw_per_tool.items():
+            name = _bounded_string("mcp_tool_limits_tool_name", tool_name, 200)
+            per_tool_limits[name] = _tool_limits(limits)
+    require_signed_descriptor_digest = False
+    descriptor_cache_seconds = 300.0
+    if document.get("toolDescriptors") is not None:
+        raw_descriptors = _mapping(
+            document["toolDescriptors"], "mcp_tool_descriptors_invalid"
+        )
+        _exact_keys(
+            raw_descriptors,
+            required=(),
+            optional=("requireSignedDigest", "cacheSeconds"),
+            code="mcp_tool_descriptors_invalid",
+        )
+        require_signed_descriptor_digest = _boolean(
+            "mcp_require_signed_tool_descriptor_digest",
+            raw_descriptors.get("requireSignedDigest", False),
+        )
+        descriptor_cache_seconds = _positive_number(
+            "mcp_tool_descriptor_cache_seconds",
+            raw_descriptors.get("cacheSeconds", 300),
+            3600,
+        )
+    unknown_limited = set(per_tool_limits) - {grant.tool_name for grant in grants}
+    if unknown_limited:
+        raise RuntimeHostError("mcp_tool_limits_tool_unknown")
     try:
         policy = McpBrokerPolicy(
             max_risk_level=_identifier(
@@ -601,6 +723,9 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
             ),
             require_approval_for=approval_classes,
             require_idempotency_for=idempotency_classes,
+            default_tool_limits=default_tool_limits,
+            require_signed_tool_descriptor_digest=(require_signed_descriptor_digest),
+            tool_descriptor_cache_seconds=descriptor_cache_seconds,
         )
     except ValueError:
         raise RuntimeHostError("mcp_policy_config_invalid") from None
@@ -708,6 +833,7 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
         credential_bindings=tuple(bindings),
         tool_timeout_seconds=tool_timeout_seconds,
         reservation_timeout_seconds=reservation_timeout_seconds,
+        tool_limits=per_tool_limits,
     )
 
 
@@ -747,6 +873,8 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             "bundle",
             "promotionAttestation",
             "controlPlanePull",
+            "runtimeControl",
+            "humanEscalation",
             "receiptDelivery",
             "securityDecisionDelivery",
             "workflowDecisionDelivery",
@@ -849,6 +977,126 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             control.get("maxCacheAgeSeconds", 300),
             7 * 86_400,
         )
+    human_escalation_base_url = None
+    human_escalation_api_key_env = None
+    human_escalation_timeout_seconds = 5.0
+    human_escalation_poll_interval_seconds = 2.0
+    human_escalation_decision_timeout_seconds = 300.0
+    human_escalation_local_directory = None
+    human_escalation_allow_insecure_http = False
+    if document.get("humanEscalation") is not None:
+        escalation = _mapping(
+            document["humanEscalation"], "human_escalation_config_invalid"
+        )
+        _exact_keys(
+            escalation,
+            required=(),
+            optional=(
+                "baseUrl",
+                "apiKeyEnv",
+                "allowInsecureHttp",
+                "timeoutSeconds",
+                "pollIntervalSeconds",
+                "decisionTimeoutSeconds",
+                "localDirectory",
+            ),
+            code="human_escalation_config_invalid",
+        )
+        allow_insecure_http = _boolean(
+            "human_escalation_allow_insecure_http",
+            escalation.get("allowInsecureHttp", False),
+        )
+        human_escalation_allow_insecure_http = allow_insecure_http
+        if escalation.get("baseUrl") is not None:
+            if escalation.get("apiKeyEnv") is None:
+                raise RuntimeHostError("human_escalation_api_key_env_missing")
+            human_escalation_base_url = _service_base_url(
+                "human_escalation", escalation["baseUrl"], allow_insecure_http
+            )
+            human_escalation_api_key_env = _environment_name(
+                "human_escalation_api_key_env", escalation["apiKeyEnv"]
+            )
+        elif escalation.get("apiKeyEnv") is not None:
+            raise RuntimeHostError("human_escalation_config_invalid")
+        if escalation.get("localDirectory") is not None:
+            human_escalation_local_directory = Path(
+                _bounded_string(
+                    "human_escalation_local_directory",
+                    escalation["localDirectory"],
+                    1024,
+                )
+            )
+        if (
+            human_escalation_base_url is None
+            and human_escalation_local_directory is None
+        ):
+            # An escalation block that configures no reviewer would advertise
+            # the capability and then never resolve a review.
+            raise RuntimeHostError("human_escalation_config_invalid")
+        human_escalation_timeout_seconds = _positive_number(
+            "human_escalation_timeout_seconds",
+            escalation.get("timeoutSeconds", 5),
+            60,
+        )
+        human_escalation_poll_interval_seconds = _positive_number(
+            "human_escalation_poll_interval_seconds",
+            escalation.get("pollIntervalSeconds", 2),
+            300,
+        )
+        human_escalation_decision_timeout_seconds = _positive_number(
+            "human_escalation_decision_timeout_seconds",
+            escalation.get("decisionTimeoutSeconds", 300),
+            86_400,
+        )
+    runtime_control_enabled = "runtimeControl" in document
+    runtime_control_refresh_interval_seconds = DEFAULT_RUNTIME_CONTROL_REFRESH_SECONDS
+    runtime_control_max_lease_seconds = DEFAULT_RUNTIME_CONTROL_MAX_LEASE_SECONDS
+    runtime_control_stale_action = "continue"
+    if runtime_control_enabled:
+        if not has_control_plane_pull:
+            # The lease rides on the release pull. Without that seam there is
+            # nothing to carry it, and a configured kill switch that can never
+            # receive a lease is worse than an absent one.
+            raise RuntimeHostError("runtime_control_source_invalid")
+        control_block = _mapping(
+            document["runtimeControl"], "runtime_control_config_invalid"
+        )
+        _exact_keys(
+            control_block,
+            required=(),
+            optional=(
+                "refreshIntervalSeconds",
+                "maxLeaseSeconds",
+                "staleAction",
+            ),
+            code="runtime_control_config_invalid",
+        )
+        runtime_control_refresh_interval_seconds = _positive_number(
+            "runtime_control_refresh_interval_seconds",
+            control_block.get(
+                "refreshIntervalSeconds", DEFAULT_RUNTIME_CONTROL_REFRESH_SECONDS
+            ),
+            3600,
+        )
+        runtime_control_max_lease_seconds = _positive_integer(
+            "runtime_control_max_lease_seconds",
+            control_block.get(
+                "maxLeaseSeconds", DEFAULT_RUNTIME_CONTROL_MAX_LEASE_SECONDS
+            ),
+            86_400,
+        )
+        runtime_control_stale_action = _identifier(
+            "runtime_control_stale_action",
+            control_block.get("staleAction", "continue"),
+            32,
+        )
+        if runtime_control_stale_action not in RUNTIME_CONTROL_STALE_ACTIONS:
+            raise RuntimeHostError("runtime_control_stale_action_invalid")
+        if (
+            runtime_control_refresh_interval_seconds
+            >= runtime_control_max_lease_seconds
+        ):
+            raise RuntimeHostError("runtime_control_refresh_too_slow")
     task_recovery_enabled = "taskRecovery" in document
     task_recovery_lease_seconds = max(60.0, request_timeout_seconds + 30.0)
     task_recovery_max_attempts = 3
@@ -1168,6 +1416,23 @@ def load_runtime_host_config(path: Path) -> RuntimeHostConfig:
             workflow_decision_initial_backoff_seconds
         ),
         workflow_decision_max_backoff_seconds=(workflow_decision_max_backoff_seconds),
+        human_escalation_base_url=human_escalation_base_url,
+        human_escalation_api_key_env=human_escalation_api_key_env,
+        human_escalation_timeout_seconds=human_escalation_timeout_seconds,
+        human_escalation_poll_interval_seconds=(
+            human_escalation_poll_interval_seconds
+        ),
+        human_escalation_decision_timeout_seconds=(
+            human_escalation_decision_timeout_seconds
+        ),
+        human_escalation_local_directory=human_escalation_local_directory,
+        human_escalation_allow_insecure_http=human_escalation_allow_insecure_http,
+        runtime_control_enabled=runtime_control_enabled,
+        runtime_control_refresh_interval_seconds=(
+            runtime_control_refresh_interval_seconds
+        ),
+        runtime_control_max_lease_seconds=runtime_control_max_lease_seconds,
+        runtime_control_stale_action=runtime_control_stale_action,
         task_recovery_enabled=task_recovery_enabled,
         task_recovery_lease_seconds=task_recovery_lease_seconds,
         task_recovery_max_attempts=task_recovery_max_attempts,
@@ -1281,6 +1546,8 @@ class ReferenceRuntimeHost:
         task_lease_seconds: float = 90.0,
         task_max_attempts: int = 3,
         task_history_limit: int = 50,
+        runtime_control_gate: Optional[RuntimeControlGate] = None,
+        runtime_control_refresher: Optional[RuntimeControlRefresher] = None,
     ) -> None:
         if not isinstance(api_token, str) or len(api_token.encode("utf-8")) < 32:
             raise RuntimeHostError("api_token_too_short")
@@ -1296,6 +1563,10 @@ class ReferenceRuntimeHost:
         self._inflight_condition = threading.Condition()
         self._closing = False
         self._receipt_dispatcher = receipt_dispatcher
+        if runtime_control_refresher is not None and runtime_control_gate is None:
+            raise RuntimeHostError("runtime_control_gate_missing")
+        self._runtime_control_gate = runtime_control_gate
+        self._runtime_control_refresher = runtime_control_refresher
         self._security_decision_dispatcher = security_decision_dispatcher
         self._workflow_decision_dispatcher = workflow_decision_dispatcher
         if release_source not in {"embedded", "control_plane", "cache"}:
@@ -1331,8 +1602,30 @@ class ReferenceRuntimeHost:
     def _error(status: int, code: str) -> RuntimeHostResponse:
         return RuntimeHostResponse(status=status, body={"error": {"code": code}})
 
+    def runtime_control_status(self) -> Optional[RuntimeControlStatus]:
+        """The control state this replica is enforcing right now, if gated."""
+
+        if self._runtime_control_gate is None:
+            return None
+        return self._runtime_control_gate.status()
+
     def _readiness(self) -> RuntimeHostResponse:
-        return RuntimeHostResponse(status=200, body={"status": "ready"})
+        """Answer /readyz, which has no authorization check.
+
+        Counts and booleans only. A probe endpoint that named the lease, its
+        expiry, or the operator's free-text reason would publish the incident
+        to anyone who can reach the port; subject detail belongs on the
+        authenticated surfaces.
+        """
+
+        status = self.runtime_control_status()
+        if status is None:
+            return RuntimeHostResponse(status=200, body={"status": "ready"})
+        body = {
+            "status": "ready" if status.admitting else "not_admitting",
+            "runtimeControl": status.to_public_wire(),
+        }
+        return RuntimeHostResponse(status=200 if status.admitting else 503, body=body)
 
     @staticmethod
     def _iso(value: Optional[datetime]) -> Optional[str]:
@@ -1491,6 +1784,19 @@ class ReferenceRuntimeHost:
             return self._error(405, "method_not_allowed")
         if not self._authorized(normalized_headers):
             return self._error(401, "unauthorized")
+        if self._runtime_control_gate is not None:
+            try:
+                self._runtime_control_gate.admit()
+            except RuntimeControlDenied as exc:
+                return RuntimeHostResponse(
+                    status=503,
+                    body={
+                        "error": {"code": exc.code},
+                        "runtimeControl": (
+                            self._runtime_control_gate.status().to_wire()
+                        ),
+                    },
+                )
         content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
         if content_type.strip().lower() != "application/json":
             return self._error(415, "content_type_unsupported")
@@ -1684,6 +1990,15 @@ class ReferenceRuntimeHost:
                 self._inflight_condition.wait(timeout=remaining)
             drained = not self._inflight
         try:
+            if self._runtime_control_refresher is not None:
+                self._runtime_control_refresher.close()
+        finally:
+            self._close_planes()
+        if not drained:
+            raise RuntimeHostError("runtime_shutdown_timeout")
+
+    def _close_planes(self) -> None:
+        try:
             self._runner.close()
         finally:
             try:
@@ -1696,8 +2011,6 @@ class ReferenceRuntimeHost:
                 finally:
                     if self._workflow_decision_dispatcher is not None:
                         self._workflow_decision_dispatcher.close()
-        if not drained:
-            raise RuntimeHostError("runtime_shutdown_timeout")
 
 
 def _lifecycle_receipt_id(
@@ -1717,6 +2030,124 @@ def _lifecycle_receipt_id(
     return "runtime-%s-%s" % (transition, digest)
 
 
+def _require_runtime_control_signing_key(trust_store: BundleTrustStore) -> None:
+    """Refuse to start a kill switch that no provisioned key can operate.
+
+    Without an entry declaring the lease purpose, every lease this host is
+    handed is refused for the same reason, and the operator sees a configured
+    control that can never fire. That is the failure mode the whole feature
+    exists to remove, so it is a startup error rather than a per-refresh one.
+    """
+
+    if not any(
+        entry.allowed_artifact_types is not None
+        and RUNTIME_CONTROL_LEASE_TYPE in entry.allowed_artifact_types
+        for entry in trust_store.entries()
+    ):
+        raise RuntimeHostError("runtime_control_signing_key_missing")
+
+
+def _runtime_control_transitions(
+    status: RuntimeControlStatus, previous: RuntimeControlStatus
+) -> Tuple[Tuple[str, str], ...]:
+    """Map one refresh onto the acknowledgements it owes.
+
+    Every refresh owes a freshness acknowledgement, not only a state edge. A
+    replica sitting steady in ``quarantined`` that spoke only on edges would
+    stop acknowledging and vanish from the enforcement count — which is the
+    count the whole control is judged by.
+
+    The quarantine edges are reported on top of that, because entering and
+    leaving a quarantine are events an auditor reads, while a steady state is
+    not. Adopting a first lease that says "serving" is still not an event.
+    """
+
+    acknowledgements = []
+    entering_quarantine = (
+        status.state == "quarantined" and previous.state != "quarantined"
+    )
+    leaving_quarantine = (
+        previous.state == "quarantined" and status.state != "quarantined"
+    )
+    if entering_quarantine and not status.stale:
+        acknowledgements.append(("quarantined", "succeeded"))
+    elif leaving_quarantine and not status.stale:
+        acknowledgements.append(("resumed", "succeeded"))
+    acknowledgements.append(
+        ("controls_stale", "failed" if status.stale else "succeeded")
+    )
+    return tuple(acknowledgements)
+
+
+class _RuntimeControlEpisodes:
+    """Number the freshness episodes a replica passes through.
+
+    Receipt identity keys on the lease and revision, which is what collapses
+    repeated refreshes of an unchanged control set to one outbox row. On its
+    own that also collapses a *recovery*: a replica that goes stale and is then
+    refreshed at the same revision derives the same id it already used before
+    going stale, the outbox dedupes the row away, and the control plane goes on
+    showing a recovered replica as stale until the revision moves.
+
+    The counter advances only when freshness actually changes, so the recovery
+    is a distinct row while a steady state is still one row per revision.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stale: Optional[bool] = None
+        self._episode = 0
+
+    def observe(self, stale: bool) -> int:
+        with self._lock:
+            if self._stale is None:
+                self._stale = stale
+            elif stale != self._stale:
+                self._stale = stale
+                self._episode += 1
+            return self._episode
+
+
+def _runtime_control_receipt_id(
+    config: RuntimeHostConfig,
+    attestation_id: str,
+    transition: str,
+    outcome: str,
+    lease_id: Optional[str],
+    revision: Optional[int],
+    episode: int,
+) -> str:
+    """Derive a stable id for one runtime-control acknowledgement.
+
+    Identity is ``(leaseId, revision, transition, outcome, episode)``.
+    ``leaseId`` alone is not an identity: it is deliberately stable across
+    refreshes so replica-count arithmetic can key on it. ``outcome`` separates
+    going stale from coming back, and ``episode`` separates one such round trip
+    from the next, since both ends of it can land on the same revision.
+
+    Repeats within one revision and one episode therefore collapse to one row
+    in the outbox, which is what keeps "acknowledge on every refresh" from
+    becoming one receipt per interval per replica.
+    """
+
+    identity = "\x00".join(
+        (
+            config.tenant_id,
+            config.runtime_id,
+            config.deployment_id,
+            config.release_id,
+            attestation_id,
+            transition,
+            outcome,
+            lease_id or "",
+            "" if revision is None else str(revision),
+            str(episode),
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return "runtime-control-%s" % digest
+
+
 @dataclass(frozen=True)
 class _ResolvedReleaseMaterial:
     bundle: Mapping[str, Any]
@@ -1724,6 +2155,7 @@ class _ResolvedReleaseMaterial:
     source: str
     pulled_handoff: Optional[RuntimeReleaseHandoff] = None
     cache: Optional[PostgresRuntimeReleaseCache] = None
+    client: Optional[RuntimeControlPlaneClient] = None
 
 
 def _resolve_release_material(
@@ -1793,6 +2225,7 @@ def _resolve_release_material(
             promotion_attestation=cached.promotion_attestation,
             source="cache",
             cache=cache,
+            client=client,
         )
     return _ResolvedReleaseMaterial(
         bundle=handoff.bundle,
@@ -1800,6 +2233,7 @@ def _resolve_release_material(
         source="control_plane",
         pulled_handoff=handoff,
         cache=cache,
+        client=client,
     )
 
 
@@ -1991,7 +2425,48 @@ def build_reference_runtime_host(
                     config.mcp_broker.reservation_timeout_seconds
                 ),
             ),
+            tool_limits=config.mcp_broker.tool_limits,
         )
+    effective_human_escalation = human_escalation
+    if effective_human_escalation is None and (
+        config.human_escalation_base_url is not None
+        or config.human_escalation_local_directory is not None
+    ):
+        local_reviewer = None
+        if config.human_escalation_local_directory is not None:
+            local_reviewer = FileSystemHumanEscalation(
+                config.human_escalation_local_directory,
+                runtime_id=config.runtime_id,
+                poll_interval_seconds=(config.human_escalation_poll_interval_seconds),
+                decision_timeout_seconds=(
+                    config.human_escalation_decision_timeout_seconds
+                ),
+            )
+        if config.human_escalation_base_url is None:
+            effective_human_escalation = local_reviewer
+        else:
+            if config.human_escalation_api_key_env is None:
+                raise RuntimeHostError("human_escalation_api_key_env_missing")
+            escalation_api_key = env.get(config.human_escalation_api_key_env, "")
+            if not escalation_api_key:
+                raise RuntimeHostError("human_escalation_api_key_missing")
+            try:
+                effective_human_escalation = ControlPlaneHumanEscalation(
+                    config.human_escalation_base_url,
+                    escalation_api_key,
+                    runtime_id=config.runtime_id,
+                    timeout_seconds=config.human_escalation_timeout_seconds,
+                    poll_interval_seconds=(
+                        config.human_escalation_poll_interval_seconds
+                    ),
+                    decision_timeout_seconds=(
+                        config.human_escalation_decision_timeout_seconds
+                    ),
+                    allow_insecure_http=config.human_escalation_allow_insecure_http,
+                    fallback=local_reviewer,
+                )
+            except ValueError:
+                raise RuntimeHostError("human_escalation_config_invalid") from None
     admission_now = now or datetime.now(timezone.utc)
     material = _resolve_release_material(
         config,
@@ -2125,7 +2600,7 @@ def build_reference_runtime_host(
             guard_evaluator=guard_evaluator,
             security_decision_emitter=security_decision_emitter,
             tool_broker=tool_broker,
-            human_escalation=human_escalation,
+            human_escalation=effective_human_escalation,
             workflow_context_resolver=workflow_context_resolver,
             workflow_state_store=effective_workflow_state_store,
             workflow_decision_emitter=effective_workflow_decision_emitter,
@@ -2198,6 +2673,164 @@ def build_reference_runtime_host(
             shutdown_timeout_seconds=min(300, config.receipt_timeout_seconds + 2),
             on_status=receipt_status,
         )
+    runtime_control_gate = None
+    runtime_control_refresher = None
+    if config.runtime_control_enabled:
+        control_client = material.client
+        control_attestation_id = config.control_plane_attestation_id
+        if control_client is None or control_attestation_id is None:
+            raise RuntimeHostError("runtime_control_source_invalid")
+        _require_runtime_control_signing_key(config.promotion_trust_store)
+        # The lease is verified against the promotion trust store: it is issued
+        # by the same control-plane signing identity as the promotion
+        # attestation, and adding a second trust root would mean a second way
+        # to be wrong about who may stop this runtime.
+        manifest = admitted.config.manifest
+        # ``solution`` and ``agent`` are only enforceable when this release
+        # actually names them. Declaring a scope with no identity behind it
+        # would report coverage this replica cannot provide.
+        enforceable_scopes = {"org", "tenant", "deployment"}
+        if manifest.solution_id:
+            enforceable_scopes.add("solution")
+        if manifest.agent_id:
+            enforceable_scopes.add("agent")
+        runtime_control_gate = RuntimeControlGate(
+            trust_store=config.promotion_trust_store,
+            expected_org_id=config.org_id,
+            expected_environment=config.environment,
+            tenant_id=config.tenant_id,
+            deployment_id=config.deployment_id,
+            solution_id=manifest.solution_id,
+            agent_id=manifest.agent_id,
+            enforceable_scopes=frozenset(enforceable_scopes),
+            stale_action=config.runtime_control_stale_action,
+            max_lease_seconds=config.runtime_control_max_lease_seconds,
+            max_clock_skew_seconds=config.control_plane_max_clock_skew_seconds,
+        )
+
+        def fetch_runtime_control() -> Optional[Mapping[str, Any]]:
+            return control_client.fetch_release(
+                control_attestation_id,
+                expected_release_id=config.release_id,
+                expected_deployment_id=config.deployment_id,
+                expected_environment=config.environment,
+                expected_runtime=config.runtime_target,
+            ).runtime_control
+
+        def runtime_control_evidence(
+            outcome: str, status: RuntimeControlStatus
+        ) -> None:
+            attributes = {
+                "prometa.runtime.id": config.runtime_id,
+                "prometa.runtime.version": config.runtime_version,
+                "prometa.release.id": config.release_id,
+                "prometa.deployment.id": config.deployment_id,
+                "prometa.environment": config.environment,
+                "prometa.control.state": status.state,
+                "prometa.control.mode": status.mode,
+                "prometa.control.enforcement": status.enforcement,
+                "prometa.control.enforced_count": str(status.enforced_control_count),
+                "prometa.control.admitting": "true" if status.admitting else "false",
+                "prometa.control.stale": "true" if status.stale else "false",
+            }
+            if status.lease_id is not None:
+                attributes["prometa.control.lease_id"] = status.lease_id
+            if status.revision is not None:
+                attributes["prometa.control.revision"] = str(status.revision)
+            if status.reason_code is not None:
+                attributes["prometa.control.reason_code"] = status.reason_code
+            if status.last_refresh_error is not None:
+                attributes["prometa.control.error_code"] = status.last_refresh_error
+            emitter.emit(
+                RuntimeEvidenceEvent(
+                    name="runtime.control.refresh",
+                    outcome=outcome,
+                    occurred_at=datetime.now(timezone.utc)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    attributes=attributes,
+                )
+            )
+
+        control_episodes = _RuntimeControlEpisodes()
+
+        def acknowledge_runtime_control(
+            status: RuntimeControlStatus, previous: RuntimeControlStatus
+        ) -> None:
+            if receipt_outbox is None or receipt_dispatcher is None:
+                return
+            enqueued = False
+            episode = control_episodes.observe(status.stale)
+            acknowledgement = status.to_acknowledgement()
+            for transition, outcome in _runtime_control_transitions(status, previous):
+                receipt = build_runtime_receipt(
+                    attestation_id=admitted.promotion.attestation_id,
+                    artifact_digest=admitted.artifact_digest,
+                    release_id=config.release_id,
+                    deployment_id=config.deployment_id,
+                    target_environment=config.environment,
+                    runtime_target=config.runtime_target,
+                    runtime_id=config.runtime_id,
+                    runtime_version=config.runtime_version,
+                    transition=transition,
+                    outcome=outcome,
+                    reason=status.reason_code or status.last_refresh_error,
+                    runtime_control_ack=acknowledgement,
+                    receipt_id=_runtime_control_receipt_id(
+                        config,
+                        admitted.promotion.attestation_id,
+                        transition,
+                        outcome,
+                        status.lease_id,
+                        status.revision,
+                        episode,
+                    ),
+                    event_at=datetime.now(timezone.utc),
+                )
+                try:
+                    enqueued = receipt_outbox.enqueue(receipt) or enqueued
+                except Exception:
+                    # Enforcement already happened locally; a failed
+                    # acknowledgement must not undo it. The next refresh
+                    # re-reports the state.
+                    return
+            if enqueued:
+                receipt_dispatcher.wake()
+
+        boot_lease = (
+            material.pulled_handoff.runtime_control
+            if material.pulled_handoff is not None
+            else None
+        )
+        if boot_lease is not None:
+            try:
+                runtime_control_gate.apply(boot_lease, now=admission_now)
+            except BundleVerificationError as exc:
+                runtime_control_gate.record_refresh_failure(exc.code)
+        else:
+            runtime_control_gate.record_refresh_failure("control_lease_absent")
+        # A replica that boots straight into a quarantine, or boots with no
+        # lease at all, changes nothing on its first refresh and would
+        # otherwise never acknowledge the state it is already enforcing.
+        acknowledge_runtime_control(
+            runtime_control_gate.status(admission_now),
+            RuntimeControlStatus(
+                state="unknown",
+                admitting=True,
+                stale=False,
+                stale_action=config.runtime_control_stale_action,
+            ),
+        )
+        runtime_control_refresher = RuntimeControlRefresher(
+            runtime_control_gate,
+            fetch_runtime_control,
+            interval_seconds=config.runtime_control_refresh_interval_seconds,
+            on_refresh=acknowledge_runtime_control,
+            on_status=runtime_control_evidence,
+            shutdown_timeout_seconds=min(
+                300.0, config.control_plane_timeout_seconds + 2
+            ),
+        )
     kernel = RuntimeKernel(
         admitted,
         model_adapter=model_adapter,
@@ -2216,7 +2849,7 @@ def build_reference_runtime_host(
         guard_evaluator=guard_evaluator,
         security_decision_emitter=security_decision_emitter,
         tool_broker=tool_broker,
-        human_escalation=human_escalation,
+        human_escalation=effective_human_escalation,
         state_store=PostgresRuntimeStateStore(
             dsn,
             tenant_id=config.tenant_id,
@@ -2263,6 +2896,8 @@ def build_reference_runtime_host(
         task_lease_seconds=config.task_recovery_lease_seconds,
         task_max_attempts=config.task_recovery_max_attempts,
         task_history_limit=config.task_recovery_history_limit,
+        runtime_control_gate=runtime_control_gate,
+        runtime_control_refresher=runtime_control_refresher,
     )
     if receipt_outbox is not None and receipt_dispatcher is not None:
         activation_at = activation.activated_at or admission_now
@@ -2316,6 +2951,8 @@ def build_reference_runtime_host(
     if workflow_decision_dispatcher is not None:
         workflow_decision_dispatcher.start()
         workflow_decision_dispatcher.wake()
+    if runtime_control_refresher is not None:
+        runtime_control_refresher.start()
     return host, activation.created
 
 
@@ -2559,6 +3196,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             build_runtime_server_ssl_context(tls_config)
         config = load_runtime_host_config(Path(args.config))
         application, created = build_reference_runtime_host(config)
+        control_status = application.runtime_control_status()
         print(
             json.dumps(
                 {
@@ -2569,6 +3207,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "releaseId": config.release_id,
                     "deploymentId": config.deployment_id,
                     "releaseSource": application.release_source,
+                    "runtimeControl": (
+                        control_status.to_wire()
+                        if control_status is not None
+                        else None
+                    ),
                     "taskRecovery": application.task_recovery_enabled,
                     "serverTls": tls_config is not None,
                     "clientCertificateRequired": require_client_certificate,

@@ -150,6 +150,14 @@ runtime_pod_name() {
     -o jsonpath='{.items[0].metadata.name}'
 }
 
+runtime_pod_address() {
+  tenant=$1
+  KUBECONFIG="$kubeconfig" "$kubectl_command" get pods -n "runtime-$tenant" \
+    -l app.kubernetes.io/component=runtime \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].status.podIP}'
+}
+
 mcp_count() {
   tenant=$1
   pod=$(runtime_pod_name "$tenant")
@@ -729,6 +737,15 @@ if [ "$workload" = mcp-read-only ]; then
       other=a
     fi
     stale_request="credential-stale-$tenant"
+    # The drift check re-reads the server's tool listing whenever the replica
+    # serving the call has no cached one, so a stale credential fails at
+    # discovery on a cold replica and at the tool call on a warm one. Only the
+    # second leaves a reservation, so pin the first attempt to one replica and
+    # drive a successful call through it here. Without this the scenario is
+    # decided by which pod the Service picks.
+    stale_runtime="http://$(runtime_pod_address "$tenant"):8080"
+    probe "gateway-$tenant" probe request --url "$stale_runtime" \
+      --request-id "credential-warm-$tenant" --expect-answer "tenant-$tenant"
     apply_secret_env "tools-$tenant" mcp-server-credentials \
       "$assets/tenant-$tenant-rotated-mcp-server.env"
     apply_secret_env "runtime-$tenant" runtime-mcp-credentials \
@@ -741,10 +758,12 @@ if [ "$workload" = mcp-read-only ]; then
       "$assets/tenant-$tenant-rotated-mcp-server.env"
     count_before=$(mcp_count "$tenant")
 
-    probe "gateway-$tenant" probe request --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
+    probe "gateway-$tenant" probe request --url "$stale_runtime" \
       --request-id "$stale_request" --expect-status 500 \
       --expect-error mcp_transport_failed --timeout 12
     test "$(mcp_count "$tenant")" -eq "$count_before"
+    # Back through the Service on purpose: any replica must answer the replay
+    # from the reservation, including one that would fail its own discovery.
     probe "gateway-$tenant" probe request --url "http://runtime.runtime-$tenant.svc.cluster.local:8080" \
       --request-id "$stale_request" --expect-status 500 \
       --expect-error mcp_tool_call_indeterminate --timeout 12

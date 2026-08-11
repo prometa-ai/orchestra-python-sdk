@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from .admission import RuntimeActivationResult
 from .control_plane import RuntimeReleaseHandoff
-from .mcp import McpAuditEvent, McpIdempotencyRecord
+from .mcp import McpAuditEvent
 from .receipts import RuntimeReceiptOutboxItem
 from .security_assurance import (
     MAX_SECURITY_DECISION_BODY_BYTES,
@@ -3255,17 +3255,33 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
         except Exception:
             raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
 
-    async def get(self, key: str) -> Optional[McpIdempotencyRecord]:
-        identity = _validate_identifier("idempotency_key", key, 256)
-        return await asyncio.to_thread(self._get_sync, identity)
+    async def peek(self, key: str, request_digest: str) -> str:
+        """Report the reservation state without taking or changing it.
 
-    def _get_sync(self, key: str) -> Optional[McpIdempotencyRecord]:
+        An elapsed reservation reads as indeterminate. The row keeps its
+        ``reserved`` status until some attempt reaches ``reserve`` and
+        quarantines it; ``reserved_until`` in the past is the stored evidence
+        either way, and a consult that writes would not be a consult.
+        """
+
+        identity = _validate_identifier("idempotency_key", key, 256)
+        digest = _validate_digest(request_digest)
+        return await asyncio.to_thread(self._peek_sync, identity, digest)
+
+    def _peek_sync(self, key: str, request_digest: str) -> str:
         try:
             with self._connect(self._dsn) as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT request_digest, status, output_digest
+                        SELECT request_digest,
+                               CASE
+                                   WHEN status = 'reserved'
+                                        AND reserved_until <= CURRENT_TIMESTAMP
+                                   THEN 'indeterminate'
+                                   ELSE status
+                               END,
+                               output_digest
                         FROM prometa_runtime_mcp_idempotency
                         WHERE tenant_id = %s AND runtime_id = %s
                           AND idempotency_key = %s
@@ -3278,11 +3294,11 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
         except Exception:
             raise RuntimePersistenceError("mcp_idempotency_store_unavailable") from None
         if row is None:
-            return None
-        request_digest, status, output_digest = row
+            return "absent"
+        stored_digest, status, output_digest = row
         if (
-            not isinstance(request_digest, str)
-            or _SHA256_DIGEST.fullmatch(request_digest) is None
+            not isinstance(stored_digest, str)
+            or _SHA256_DIGEST.fullmatch(stored_digest) is None
             or status not in {"reserved", "completed", "indeterminate"}
             or (
                 output_digest is not None
@@ -3293,11 +3309,9 @@ class PostgresMcpIdempotencyStore(_PostgresTenantStore):
             )
         ):
             raise RuntimePersistenceError("mcp_idempotency_record_invalid")
-        return McpIdempotencyRecord(
-            request_digest=request_digest,
-            status=status,
-            output_digest=output_digest,
-        )
+        if stored_digest != request_digest:
+            return "conflict"
+        return status
 
 
 class PostgresMcpAuditSink(_PostgresTenantStore):

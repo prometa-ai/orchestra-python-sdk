@@ -271,8 +271,12 @@ deterministic policy and execution-configuration digests, and typed logical
 secret references. Admission recomputes both digests and cross-checks the range
 form against the exact `name.vN` compatibility mirror. A signed tool's
 `rateLimitPerMin` is covered by that configuration digest but is not a runtime
-control: no kernel or host component reads it, and the tenant gateway owns rate
-limiting. Secret references name a tenant-resolved provider and purpose only;
+control: no kernel or host component reads it. It states a fleet-wide number,
+and a replica can only enforce its own share, so honoring it locally would
+admit N times the signed limit across N replicas. The MCP broker's per-replica
+`McpToolLimits` is a separate, locally configured ceiling and is deliberately
+not derived from this field; distributed rate limiting stays with the tenant
+gateway. Secret references name a tenant-resolved provider and purpose only;
 credential values never enter the signed artifact. Contract v3 adds the signed
 Company Workflow Ontology and its four workflow capabilities (see
 [Company Workflow Ontology](#company-workflow-ontology-runtime-contract-v3)).
@@ -314,9 +318,11 @@ gateway, tool broker, replay/state stores, human escalation, rollout, rollback,
 and emergency stop are tenant-owned. The tenant-deployed reference host can
 wire a strictly configured MCP broker for signed read-only tools. It requires
 exact release/config binding, explicit egress, late-bound credentials, and
-shared PostgreSQL idempotency and payload-free audit. The stock host CLI does
-not supply a human-escalation adapter, so write or destructive bundles remain
-fail-closed; tenants may inject that adapter only through the library builder.
+shared PostgreSQL idempotency and payload-free audit. The stock host CLI wires
+no human-escalation adapter unless a `humanEscalation` block is configured, so
+write or destructive bundles stay fail-closed by default; two references ship
+(see [Human escalation](#human-escalation)) and tenants may still inject their
+own through the library builder.
 The shipped increment does not include stored-payload or automatic task replay,
 resumable HITL checkpoints, memory, compression, A2A, rollout automation,
 write/destructive MCP topology evidence, or managed-CNI/database proof. Pinned
@@ -451,6 +457,57 @@ require a tenant reviewer reference and an idempotency store by default. Audit
 records contain identities and SHA-256 digests, not arguments or outputs, and
 an uncertain transport or post-call audit outcome is marked indeterminate so
 the runtime cannot retry it automatically.
+
+A valid signature proves who published a tool declaration, not what the server
+behind it does today — a server can be benign for fifteen versions and ship a
+rewritten tool description in the sixteenth. At session open the broker fetches
+the server's own tool listing, digests each descriptor over its name,
+description, and input/output schemas, and compares. A tool the server no
+longer advertises is `mcp_tool_not_advertised`; a changed descriptor is
+`mcp_tool_descriptor_drift`. Both are denied before the transport is touched
+and audited with a typed reason. The listing is cached per connection for
+`tool_descriptor_cache_seconds` (default 300), so this is not a per-call round
+trip; that TTL is also the longest a swapped description can go unnoticed. A
+transport that cannot list tools is refused at broker construction, because an
+unchecked broker is exactly the gap this closes.
+
+What the digest is compared *against* has two levels. A signed bundle may pin
+`mcpToolDescriptorDigest` per MCP tool (compute it with
+`mcp_tool_descriptor_digest`), which is authoritative from the first call; set
+`require_signed_tool_descriptor_digest` to refuse unpinned tools outright. An
+unpinned tool is instead pinned to whatever this replica first observed. That
+is weaker — it cannot prove the first observation was benign — but it does
+catch the version that changes underneath a running fleet, and it does not deny
+on cosmetic differences between the bundle's recorded schema and the server's
+own advertisement.
+
+`mcpToolDescriptorDigest` is one of the tool keys inside the signed
+configuration-digest projection, matching the projection the control plane
+signs. Tools that do not declare it are unaffected — the projection carries
+only the keys a tool actually has.
+
+`McpToolLimits` bounds per-tool call rate (sliding window) and in-flight calls,
+so a looping or compromised agent cannot call one tool without bound. Refusals
+are `mcp_tool_rate_limited` and `mcp_tool_concurrency_limited`, audited under a
+`rate_limit` phase. These counters are in-process and key on the connection and
+the tool, so they aggregate every request one replica is serving at once: a
+fleet of N replicas admits up to N times these numbers, and a ceiling below a
+replica's own request concurrency refuses ordinary traffic rather than an
+overrun. There is therefore **no default ceiling** — a tool is uncounted until
+a deployment states its numbers, because only the deployment knows what
+concurrency it admits. They are not the signed `rateLimitPerMin`, which stays
+inert for that exact reason.
+
+A call the store has already settled is answered from the record before
+credentials are resolved or the listing is read, because an earlier attempt may
+already have reached the tool and that outranks anything a fresh round trip can
+report. Without it a replay could land on a replica holding no cached listing,
+whose re-read failed first and answered `mcp_transport_failed` — "retry" — over
+the `mcp_tool_call_indeterminate` the record already held. The consult is
+read-only, so an authorization that goes on to be denied leaves the key exactly
+as it found it, and no tool is called on this path, so the drift check has
+nothing left to protect. A store that cannot be consulted is refused at broker
+construction, for the same reason a transport that cannot list tools is.
 
 `InMemoryMcpIdempotencyStore` and `InMemoryMcpAuditSink` are for tests and
 single-process development only. `PostgresMcpIdempotencyStore` and
@@ -816,7 +873,7 @@ changed activation identity, promotion-JTI reuse, or a bundle JTI bound to a
 different artifact digest fails closed. The host then serves:
 
 - `GET /healthz` for liveness;
-- `GET /readyz` for payload-free readiness;
+- `GET /readyz` for payload-free runtime-control state;
 - `GET /v1/runtime/tasks/{requestId}` for authenticated payload-free lifecycle
   replay when `taskRecovery` is configured;
 - `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
@@ -863,6 +920,8 @@ required release/model/database fields, these optional blocks are recognized:
 | Block | Adds |
 |---|---|
 | `controlPlanePull` | bootstrap-only outbound release handoff instead of an embedded pair |
+| `runtimeControl` | signed short-TTL quarantine leases carried on the `controlPlanePull` seam |
+| `humanEscalation` | a shipped reviewer for write/destructive approvals instead of failing closed |
 | `receiptDelivery` | durable asynchronous `admitted` / `active` lifecycle receipts |
 | `securityDecisionDelivery` | `prometa.security-decision.v1` evidence (required by guarded v2+ releases) |
 | `workflowDecisionDelivery` | `prometa.workflow-decision.v1` evidence for contract v3 workflow releases |
@@ -903,6 +962,243 @@ may use that cache, and only within `maxCacheAgeSeconds` and the signed offline
 lease. Revocation, authorization, binding, or signature failures never fall
 back. Changing the attestation ID still requires tenant CI/CD to update the
 mounted config and roll the workload; this is not a hot-reload controller.
+
+### Runtime-control leases (operator quarantine)
+
+Optional `runtimeControl` configuration lets an operator stop a scope from
+serving. It requires `controlPlanePull`, because the lease rides on the answer
+to the release pull the host already makes: no inbound port is opened, no new
+connection is made, and the request path gains no control-plane dependency.
+
+```json
+{
+  "runtimeControl": {
+    "refreshIntervalSeconds": 60,
+    "maxLeaseSeconds": 900,
+    "staleAction": "continue"
+  }
+}
+```
+
+The wire shape is the one pinned in the runtime-control lease contract, and the
+conformance vectors under `tests/fixtures/lease-vectors/` are shared rather than
+this SDK's, because the previous round produced three implementations that could
+not read each other's leases. They cover both directions: nine lease-direction
+vectors and ten acknowledgement-direction cases, all reproducible from fixed
+seeds so every implementation verifies the same bytes. This SDK passes all of
+them (`tests/test_runtime_control_lease_vectors.py`).
+
+Two verifiers have been run against these fixtures so far — this one, and the
+inference engine's, through the `engine_check.py` runner that sits beside the
+shared copy; that runner reports no failures on the nine lease-direction
+vectors. It does not consume the acknowledgement direction, which so far only
+this SDK runs, and the control plane has been run against neither. Nothing here
+should be read as three-way agreement.
+
+The lease is an Ed25519 envelope with the same canonicalization
+(`signed-payload-json-v1`) and trust-store code path as the promotion
+attestation, verified against the same `promotionTrust` entries. It binds
+`orgId` and `targetEnvironment`, carries a `leaseId` that is stable across
+refreshes, a `revision` that is monotonic, `mode`, `staleAction`, and a list of
+scope-typed `controls`.
+
+**The signing key's purpose is verified.** A `promotionTrust` entry used to
+verify a lease must declare `allowed_artifact_types` containing
+`orchestra.runtime-control-lease`. A key provisioned for bundles, promotions or
+routing policy cannot stop a runtime, even though its signature is genuine, and
+a key with no declared purpose at all is refused rather than trusted. Enforcement
+by the issuer alone is not enforcement: a misconfigured issuer is the case this
+check exists for.
+
+**Scope is typed, and this host declares what it can enforce.** Controls carry
+`scope: org | tenant | deployment | solution | agent`. The host enforces the
+scopes it holds an identity for — always `org`, `tenant` and `deployment`, plus
+`solution` and `agent` when the admitted bundle names them. A control whose
+scope the host cannot resolve, or whose `subjectId` names something this
+replica is not, is **not** enforcement and is **not** counted as enforcement.
+Neither is a matched control that says `serving`: agreeing to serve is not a
+control being applied. `enforcedControlCount` is therefore the number of
+controls this replica matched, can enforce, *and* is quarantined by — plus, when
+`staleAction: "stop"` is hard-refusing, the controls it is refusing for. Zero
+enforcement reports `enforcement: "advisory"` however it was reached, and the
+controls at scopes this replica never declared enforceable are reported
+separately as `ignoredControlCount`, so the gap is visible. An agent-scoped
+quarantine issued into a fleet of inference engines is a no-op, and the operator
+has to be told that rather than shown a green tick.
+
+**Precedence is fixed, and `mode` is first.** An advisory lease is reported and
+never refuses a request, under any staleness condition and whatever its controls
+say — testing staleness first is what lets a dry run hard-stop a fleet:
+
+1. `mode: "advisory"` → never refuse. Report and stop here.
+2. no matched control → serve.
+3. matched, `quarantined`, lease live → refuse.
+4. matched, `quarantined`, lease expired → the signed `staleAction` decides.
+5. matched, `serving` → serve.
+
+**Replay ordering is global, not per lease.** A `revision` below the highest
+this replica has ever accepted is refused as out-of-order whatever `leaseId` it
+carries, because `revision` is monotonic per `(orgId, targetEnvironment)` and
+the gate is bound to one such pair. Scoping the check to a single `leaseId`
+would leave a live quarantine liftable by replaying a genuine, correctly
+signed, unexpired `serving` lease from a stream this replica has not seen — the
+same evasion, bought by changing one string. The same `revision` re-signed with
+a later expiry *is* adopted: that is how an unchanged control set stays fresh,
+and a higher revision under a new `leaseId` is adopted normally.
+
+**What happens when refreshes stop is asymmetric, and both halves are
+deliberate.** `staleAction` is inside the signed claims, so a runtime cannot
+reach the permissive branch by dropping an unsigned transport field. The
+`runtimeControl.staleAction` in mounted config applies only before any lease has
+been adopted.
+
+| Last enforced state | Lease still valid | Lease expired, no refresh |
+|---|---|---|
+| `quarantined` | refuses work | still refuses work |
+| `serving` | serves | signed `staleAction: "continue"` keeps serving and reports stale; `"stop"` refuses work |
+| none yet | — | mounted `staleAction` decides, same table |
+
+A quarantine keeps governing after expiry because otherwise it could be evaded
+by making the control plane unreachable. A serving runtime keeps serving after
+expiry because a control-plane outage must not become a fleet-wide inference
+outage — this platform's stated invariant is that the runtime continues without
+the control plane. `staleAction: "stop"` is the opt-in for deployments that
+prefer the opposite trade, and its cost is exactly that: when refreshes stop,
+the runtime stops.
+
+`maxLeaseSeconds` bounds the validity window a lease may *declare*
+(`expiresAt - notBefore`). It does not bound how long an adopted quarantine
+keeps governing after refreshes stop — nothing does, by design, per the table
+above.
+
+The trade has one more edge worth stating plainly. The lease is not persisted,
+so a replica that restarts while the control plane is unreachable comes up with
+no lease at all — state `unknown`, controls stale. Under the default it serves;
+under `staleAction: "stop"` it refuses. A deployment that needs quarantine to
+survive restart-during-outage must choose `"stop"`.
+
+Refused requests answer `503` on the authenticated `POST /v1/runtime/execute`
+with `runtime_quarantined` or `runtime_controls_stale` and the full control
+state, including `leaseId`, `revision` and the operator's `reasonCode`.
+
+`GET /readyz` has no authorization check, so it gets **counts and booleans
+only** — never a lease id, an expiry, a subject, or an operator's free text —
+and answers `503` while not admitting:
+
+```json
+{
+  "status": "not_admitting",
+  "runtimeControl": {
+    "admitting": false, "quarantined": true, "stale": false,
+    "enforcing": true, "enforcedControlCount": 1
+  }
+}
+```
+
+`quarantined` there is the *enforced* state, so an advisory lease naming this
+replica reports `false`: advisory enforces nothing.
+
+It is an operator view, not a probe. The reference chart points liveness,
+readiness and startup at `/healthz`, so a quarantined replica stays routable
+and every caller receives the typed refusal above instead of the connection
+error an emptied Service would give them.
+
+Enforcement is acknowledged back through the existing receipt outbox so desired
+and enforced state can be told apart per replica. **Every refresh acknowledges**,
+not only a state edge, or a replica sitting steady in `quarantined` would stop
+speaking and drop out of the count the control is judged by. Each refresh emits
+a `controls_stale` acknowledgement (`succeeded` while fresh, `failed` once
+refreshes stop); entering or leaving a quarantine additionally emits
+`quarantined` or `resumed`.
+
+All of them carry the acknowledgement in the shape the contract pins, under the
+additive top-level `runtimeControlAck` key, and every other lifecycle transition
+rejects it — so a receipt can never imply an acknowledgement it did not make:
+
+```json
+{
+  "runtimeControlAck": {
+    "leaseId": "lease-fleet", "revision": 42,
+    "enforcement": "enforcing",
+    "enforceableScopes": ["deployment", "org", "tenant"],
+    "enforcedControlCount": 1, "ignoredControlCount": 0,
+    "stale": false, "leaseExpiresAt": "2026-08-11T09:05:00.000Z",
+    "leaseParseFailed": false
+  }
+}
+```
+
+Those nine members are the whole object; unknown members are dropped and a
+missing one is refused rather than defaulted, since defaulting would rewrite
+what the replica said. There is deliberately no `mode`: that is the issuer's
+instruction and already travels in the lease, while `enforcement` is what this
+replica did with it. `leaseParseFailed` is set when a lease arrived that this
+replica could not read — never for a transport failure, an absent lease, or a
+lease refused as out-of-order, all of which were understood.
+
+Receipt identity is `(leaseId, revision, transition)` — plus the outcome for
+`controls_stale`, the one transition that carries two, and the freshness episode,
+because both ends of a stale-and-recovered round trip can land on one revision
+and would otherwise derive the same id and be deduped away. `leaseId` alone is
+not an identity, because it is deliberately stable across refreshes so
+replica-count arithmetic can key on it. Repeats within one revision and one
+episode collapse to a single outbox row, so "acknowledge on every refresh" costs
+one receipt per revision per replica, not one per interval.
+
+A control plane counting enforcement must take its denominator from its own
+live-replica projection, never from the acknowledgement rows, and scope the
+query by `(orgId, targetEnvironment, deploymentId)`.
+
+**Cost.** The lease rides the release-pull response, and that response is the
+whole handoff. Each refresh therefore re-downloads the signed bundle and
+promotion attestation to read a lease that is a small fraction of them. Composing
+a handoff from this repo's own fixtures — `tests/fixtures/bundle-envelope-v1.json`
+as the bundle, `tests/fixtures/promotion-attestation-v1.json` as the promotion
+attestation, the handoff's own binding fields from
+`tests/fixtures/runtime-release-handoff-v1.json`, and `lease-valid-v1` from the
+shared vectors as the lease — gives 8,332 bytes of compact JSON to carry 977
+bytes of lease: 8.5x. `test_the_documented_refresh_cost_is_what_the_fixtures_say`
+recomputes it, so this number cannot rot silently.
+
+At the default 60s interval that is 1,440 pulls per replica per day: about
+12 MB/day per replica, or 0.6 GB/day across 50 replicas, for a release this
+size. A real bundle is larger and `controlPlaneMaxResponseBytes` allows a
+handoff up to 12 MiB at its default, so treat that figure as a floor rather
+than a budget.
+Raise `refreshIntervalSeconds` to trade detection latency for bytes; removing
+the overhead needs a lease-only projection on the control plane's release
+endpoint, which does not exist yet.
+
+### Human escalation
+
+Two `HumanEscalation` references ship. Neither is wired unless configured, so
+the fail-closed `human_escalation_unavailable` default is unchanged.
+
+```json
+{
+  "humanEscalation": {
+    "baseUrl": "https://app.prometa.io",
+    "apiKeyEnv": "PROMETA_APPROVAL_API_KEY",
+    "pollIntervalSeconds": 2,
+    "decisionTimeoutSeconds": 300,
+    "localDirectory": "/var/lib/prometa/approvals"
+  }
+}
+```
+
+`ControlPlaneHumanEscalation` opens an approval request against the control
+plane's approval models and polls until a reviewer answers. It sends
+identities, the tool being asked about, and a digest of the material under
+review — never the payload — and carries its API key in a request header only.
+A reviewer who does not answer within `decisionTimeoutSeconds` is a
+`human_review_timeout`, not an approval.
+
+`FileSystemHumanEscalation` is the air-gapped fallback: it writes the same
+payload-free request under `requests/` and waits for a matching file under
+`decisions/`. Configure `localDirectory` alone to use it directly, or alongside
+`baseUrl` to fall back to it when the control plane is unreachable. That
+directory is a trust boundary — anything that can write to it can approve a
+destructive tool call — so treat it like the runtime's own credentials.
 
 Optional `taskRecovery` configuration enables lifecycle contract v1 only for a
 model-only host:

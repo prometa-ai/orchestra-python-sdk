@@ -143,10 +143,10 @@ spec:
               command:
                 - python
                 - -c
-                - {{ printf "import http.client,ssl,sys;c=ssl.create_default_context(cafile='/etc/prometa-runtime-probe-tls/ca.crt');c.check_hostname=False;c.load_cert_chain('/etc/prometa-runtime-probe-tls/tls.crt','/etc/prometa-runtime-probe-tls/tls.key');h=http.client.HTTPSConnection('127.0.0.1',%d,timeout=%d,context=c);h.request('GET','/readyz');r=h.getresponse();sys.exit(0 if r.status == 200 else 1)" (int .Values.containerPort) (int .Values.probes.startup.timeoutSeconds) | quote }}
+                - {{ printf "import http.client,ssl,sys;c=ssl.create_default_context(cafile='/etc/prometa-runtime-probe-tls/ca.crt');c.check_hostname=False;c.load_cert_chain('/etc/prometa-runtime-probe-tls/tls.crt','/etc/prometa-runtime-probe-tls/tls.key');h=http.client.HTTPSConnection('127.0.0.1',%d,timeout=%d,context=c);h.request('GET','/healthz');r=h.getresponse();sys.exit(0 if r.status == 200 else 1)" (int .Values.containerPort) (int .Values.probes.startup.timeoutSeconds) | quote }}
             {{- else }}
             httpGet:
-              path: /readyz
+              path: /healthz
               port: {{ ternary "https" "http" .Values.serverTls.enabled }}
               {{- if .Values.serverTls.enabled }}
               scheme: HTTPS
@@ -175,10 +175,10 @@ spec:
               command:
                 - python
                 - -c
-                - {{ printf "import http.client,ssl,sys;c=ssl.create_default_context(cafile='/etc/prometa-runtime-probe-tls/ca.crt');c.check_hostname=False;c.load_cert_chain('/etc/prometa-runtime-probe-tls/tls.crt','/etc/prometa-runtime-probe-tls/tls.key');h=http.client.HTTPSConnection('127.0.0.1',%d,timeout=%d,context=c);h.request('GET','/readyz');r=h.getresponse();sys.exit(0 if r.status == 200 else 1)" (int .Values.containerPort) (int .Values.probes.readiness.timeoutSeconds) | quote }}
+                - {{ printf "import http.client,ssl,sys;c=ssl.create_default_context(cafile='/etc/prometa-runtime-probe-tls/ca.crt');c.check_hostname=False;c.load_cert_chain('/etc/prometa-runtime-probe-tls/tls.crt','/etc/prometa-runtime-probe-tls/tls.key');h=http.client.HTTPSConnection('127.0.0.1',%d,timeout=%d,context=c);h.request('GET','/healthz');r=h.getresponse();sys.exit(0 if r.status == 200 else 1)" (int .Values.containerPort) (int .Values.probes.readiness.timeoutSeconds) | quote }}
             {{- else }}
             httpGet:
-              path: /readyz
+              path: /healthz
               port: {{ ternary "https" "http" .Values.serverTls.enabled }}
               {{- if .Values.serverTls.enabled }}
               scheme: HTTPS

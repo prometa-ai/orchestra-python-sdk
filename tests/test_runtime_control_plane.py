@@ -183,3 +183,34 @@ def test_client_requires_https_and_enforces_response_limit() -> None:
         with pytest.raises(RuntimeControlPlaneError) as caught:
             _client(server, max_response_bytes=1024).fetch_release("attestation-1")
     assert caught.value.code == "control_plane_response_too_large"
+
+
+def _fetch(server):
+    return _client(server).fetch_release(
+        "attestation-1",
+        expected_release_id="release-1",
+        expected_deployment_id="deployment-1",
+        expected_environment="prod",
+        expected_runtime="tenant-runtime",
+    )
+
+
+def test_the_release_response_carries_the_runtime_control_lease_untrusted() -> None:
+    lease = {"signed": True, "leaseId": "lease-1", "signature": "not-checked-here"}
+    with _Server(document=_handoff(runtimeControl=lease)) as server:
+        result = _fetch(server)
+
+    assert result.runtime_control == lease
+
+
+def test_a_release_response_without_a_lease_reports_none() -> None:
+    with _Server(document=_handoff()) as server:
+        assert _fetch(server).runtime_control is None
+
+
+def test_a_non_object_runtime_control_field_is_rejected() -> None:
+    with _Server(document=_handoff(runtimeControl="quarantined")) as server:
+        with pytest.raises(RuntimeControlPlaneError) as caught:
+            _fetch(server)
+
+    assert caught.value.code == "control_plane_response_invalid"

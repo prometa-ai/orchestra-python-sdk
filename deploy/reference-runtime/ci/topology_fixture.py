@@ -40,6 +40,7 @@ _TOOL_POLICY_KEYS = (
     "approvalRequired",
     "requiredGuardrails",
 )
+# Kept identical to ``admission._TOOL_CONFIGURATION_KEYS``; a test asserts it.
 _TOOL_CONFIGURATION_KEYS = (
     "name",
     "source",
@@ -47,6 +48,7 @@ _TOOL_CONFIGURATION_KEYS = (
     "operation",
     "inputSchema",
     "rateLimitPerMin",
+    "mcpToolDescriptorDigest",
 )
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -533,6 +535,14 @@ def _runtime_config(
                     "stdioEnvironment": {},
                 }
             ],
+            # Pinned past the run's own duration. The certification asserts
+            # that a stale credential fails at the tool call and leaves an
+            # indeterminate reservation, and it drives a successful call
+            # through the replica it then uses so that listing is cached. A TTL
+            # that expired between the two would move the failure to the
+            # listing re-read, before any reservation exists, and decide the
+            # assertion by how long the cluster took rather than by behaviour.
+            "toolDescriptors": {"cacheSeconds": 3600},
             "toolTimeoutSeconds": 5,
             "reservationTimeoutSeconds": 15,
         }

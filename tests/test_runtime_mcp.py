@@ -64,6 +64,7 @@ class RecordingTransport:
     def __init__(self, output=None, error=None, descriptors=None) -> None:
         self.output = output if output is not None else {"status": "found"}
         self.error = error
+        self.listing_error = None
         self.calls = []
         self.descriptors = (
             descriptors
@@ -84,6 +85,8 @@ class RecordingTransport:
         self.listings = 0
 
     async def list_tools(self, server, credentials):
+        if self.listing_error is not None:
+            raise self.listing_error
         self.listings += 1
         return tuple(self.descriptors)
 
@@ -129,8 +132,11 @@ class FailAfterAuditSink:
 
 
 class FailingIdempotencyStore:
-    async def reserve(self, key, request_digest):
+    async def peek(self, key, request_digest):
         raise OSError("idempotency store unavailable")
+
+    async def reserve(self, key, request_digest):
+        raise AssertionError("reserve should not be called")
 
     async def complete(self, key, request_digest, output_digest):
         raise AssertionError("complete should not be called")
@@ -434,6 +440,7 @@ def test_idempotency_store_outage_is_audited_and_prevents_transport() -> None:
 
     assert _error(broker, _request()) == "mcp_idempotency_store_failed"
     assert transport.calls == []
+    assert transport.listings == 0
     assert audit.events[-1].phase == "idempotency"
     assert audit.events[-1].outcome == "failed"
     assert audit.events[-1].reason == "mcp_idempotency_store_failed"
@@ -654,6 +661,72 @@ def test_a_transport_that_cannot_list_tools_is_refused_at_construction() -> None
 
     with pytest.raises(ValueError):
         _broker(transport=BlindTransport())
+
+
+def test_a_store_that_cannot_be_consulted_is_refused_at_construction() -> None:
+    class WriteOnlyStore:
+        async def reserve(self, key, request_digest):
+            return "acquired"
+
+        async def complete(self, key, request_digest, output_digest):
+            return None
+
+        async def release(self, key, request_digest):
+            return None
+
+        async def mark_indeterminate(self, key, request_digest):
+            return None
+
+    with pytest.raises(ValueError):
+        _broker(idempotency_store=WriteOnlyStore())
+
+
+def test_an_indeterminate_replay_outranks_a_replica_that_cannot_discover() -> None:
+    """A replay must hear the dangerous answer, not a retryable one.
+
+    The second broker stands in for a replica whose descriptor cache is cold:
+    it has to re-read the listing before it can check for drift, and with a
+    rotated credential that read fails. The reservation from the first attempt
+    still decides the answer, because a transport failure reads as "retry" and
+    a side effect may already have happened.
+    """
+
+    store = InMemoryMcpIdempotencyStore()
+    transport = RecordingTransport()
+    serving, _, _ = _broker(transport=transport, idempotency_store=store)
+    cold, _, _ = _broker(transport=transport, idempotency_store=store)
+
+    asyncio.run(serving.invoke(_request(call_id="warm-up")))
+    transport.error = McpTransportError("socket_closed", outcome_unknown=True)
+    assert _error(serving, _request()) == "socket_closed"
+
+    transport.listing_error = McpTransportError(
+        "mcp_transport_failed", outcome_unknown=False
+    )
+    assert _error(cold, _request()) == "mcp_tool_call_indeterminate"
+    assert transport.listings == 1
+    assert len(transport.calls) == 2
+
+
+def test_a_duplicate_is_answered_without_asking_the_server_anything() -> None:
+    store = InMemoryMcpIdempotencyStore()
+    transport = RecordingTransport()
+    audit = InMemoryMcpAuditSink()
+    serving, _, _ = _broker(transport=transport, idempotency_store=store)
+    cold, _, _ = _broker(
+        transport=transport, idempotency_store=store, audit_sink=audit
+    )
+
+    asyncio.run(serving.invoke(_request()))
+    transport.listing_error = McpTransportError(
+        "mcp_transport_failed", outcome_unknown=False
+    )
+
+    assert _error(cold, _request()) == "mcp_duplicate_tool_call"
+    assert len(transport.calls) == 1
+    assert transport.listings == 1
+    assert audit.events[-1].phase == "idempotency"
+    assert audit.events[-1].server_connection_id == SERVER.connection_id
 
 
 def test_a_looping_agent_is_stopped_by_the_per_tool_rate_ceiling() -> None:

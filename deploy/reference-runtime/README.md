@@ -143,7 +143,10 @@ is reused before drift is re-checked, and therefore the longest a swapped tool
 description can go unnoticed. It also decides whether a credential the server
 has since rotated is caught by the listing re-read or by the tool call itself,
 which is the difference between a knowably-no-side-effect refusal and an
-indeterminate one.
+indeterminate one. That is a first-attempt distinction only: a replay is
+answered from the idempotency record before the listing is read, so a replica
+holding no cached listing still reports the indeterminate outcome rather than
+its own failed re-read.
 
 `requireSignedDigest: true` refuses any MCP tool whose signed declaration does
 not pin `mcpToolDescriptorDigest`. When a tool does pin it, the value is inside

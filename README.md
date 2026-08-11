@@ -498,6 +498,17 @@ a deployment states its numbers, because only the deployment knows what
 concurrency it admits. They are not the signed `rateLimitPerMin`, which stays
 inert for that exact reason.
 
+A call the store has already settled is answered from the record before
+credentials are resolved or the listing is read, because an earlier attempt may
+already have reached the tool and that outranks anything a fresh round trip can
+report. Without it a replay could land on a replica holding no cached listing,
+whose re-read failed first and answered `mcp_transport_failed` — "retry" — over
+the `mcp_tool_call_indeterminate` the record already held. The consult is
+read-only, so an authorization that goes on to be denied leaves the key exactly
+as it found it, and no tool is called on this path, so the drift check has
+nothing left to protect. A store that cannot be consulted is refused at broker
+construction, for the same reason a transport that cannot list tools is.
+
 `InMemoryMcpIdempotencyStore` and `InMemoryMcpAuditSink` are for tests and
 single-process development only. `PostgresMcpIdempotencyStore` and
 `PostgresMcpAuditSink` provide the reference multi-replica implementation. A

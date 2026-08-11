@@ -118,6 +118,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   would fail admission as `runtime_configuration_digest_mismatch`. The listing
   is cached per connection, so this is not a per-call round trip. A transport
   that cannot list tools is now refused at broker construction.
+- A call the idempotency store has already settled is answered from the record
+  before credentials are resolved or the tool listing is read. Drift detection
+  put a network round trip in front of the reservation, and the listing is
+  cached per replica, so a replay could reach a replica that had to re-read it:
+  the re-read failed first and reported `mcp_transport_failed` over the
+  `mcp_tool_call_indeterminate` the record already held. That reads as "retry"
+  for a call whose side effect may have happened, which is the one thing the
+  caller must not do. The consult is read-only, so an authorization that goes
+  on to be denied leaves the key untouched, and no tool is called on this path,
+  so the drift check has nothing left to protect. `McpIdempotencyStore` gains
+  `peek`, answering in the same vocabulary as `reserve`; a store that cannot be
+  consulted is refused at broker construction. Replaces the unused
+  `get` on `InMemoryMcpIdempotencyStore` and `PostgresMcpIdempotencyStore`.
 - `McpToolLimits`: per-tool sliding-window rate and in-flight ceilings, refused
   as `mcp_tool_rate_limited` / `mcp_tool_concurrency_limited` and audited under
   a `rate_limit` phase. These are per replica, and deliberately not derived

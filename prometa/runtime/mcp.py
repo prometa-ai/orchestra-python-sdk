@@ -540,6 +540,16 @@ class McpIdempotencyStore(Protocol):
     async def reserve(self, key: str, request_digest: str) -> str:
         """Atomically return acquired, reserved, completed, indeterminate, or conflict."""
 
+    async def peek(self, key: str, request_digest: str) -> str:
+        """Return absent, reserved, completed, indeterminate, or conflict.
+
+        Read-only, and it answers in the same vocabulary as ``reserve`` so the
+        broker can settle a replay without reserving anything. A reservation
+        whose deadline has passed reports ``indeterminate`` here for the same
+        reason ``reserve`` quarantines it: the replica that held it may have
+        reached the tool.
+        """
+
     async def complete(self, key: str, request_digest: str, output_digest: str) -> None:
         """Record a completed tool call."""
 
@@ -594,9 +604,14 @@ class InMemoryMcpIdempotencyStore:
                 raise ValueError("MCP idempotency digest mismatch")
             self._records[key] = McpIdempotencyRecord(request_digest, "indeterminate")
 
-    def get(self, key: str) -> Optional[McpIdempotencyRecord]:
+    async def peek(self, key: str, request_digest: str) -> str:
         with self._lock:
-            return self._records.get(key)
+            record = self._records.get(key)
+            if record is None:
+                return "absent"
+            if record.request_digest != request_digest:
+                return "conflict"
+            return record.status
 
 
 MCP_TOOL_DESCRIPTOR_DIGEST_VERSION = 1
@@ -828,11 +843,28 @@ class McpGuardrailPolicy:
 
 
 @dataclass(frozen=True)
-class _Authorization:
+class _PolicyDecision:
+    """What the signed bundle and local policy decide without any network."""
+
     server: McpServerConfig
     grant: McpToolGrant
     effective_risk: str
+
+
+@dataclass(frozen=True)
+class _Authorization(_PolicyDecision):
     credentials: McpTransportCredentials
+
+
+# ``reserve`` and ``peek`` answer in one vocabulary, so one table maps both.
+# Anything absent from it is a store that answered something the broker does
+# not understand, which is refused rather than guessed at.
+_SETTLED_CODES = {
+    "reserved": "mcp_tool_call_in_progress",
+    "completed": "mcp_duplicate_tool_call",
+    "indeterminate": "mcp_tool_call_indeterminate",
+    "conflict": "mcp_idempotency_conflict",
+}
 
 
 class _McpToolLimiter:
@@ -930,6 +962,17 @@ class GovernedMcpToolBroker(ToolBroker):
             # back to itself, which proves origin and nothing about the server.
             raise ValueError(
                 "transport_client must implement list_tools for drift detection"
+            )
+        if idempotency_store is not None and not callable(
+            getattr(idempotency_store, "peek", None)
+        ):
+            # Without a read-only consult the broker can only learn that a call
+            # is already settled by reserving it, which is too late: everything
+            # the reservation sits behind gets to fail first and answer in its
+            # place.
+            raise ValueError(
+                "idempotency_store must implement peek so a settled call is "
+                "answered before the transport is reached"
             )
         self._servers = by_name
         self._grants = tuple(grants)
@@ -1130,7 +1173,14 @@ class GovernedMcpToolBroker(ToolBroker):
         if not hmac.compare_digest(pinned, advertised):
             raise RuntimeExecutionError("mcp_tool_descriptor_drift")
 
-    async def _authorize(self, request: ToolInvocationRequest) -> _Authorization:
+    def _authorize_policy(self, request: ToolInvocationRequest) -> _PolicyDecision:
+        """Decide the call from the signed bundle and local policy alone.
+
+        Nothing here touches the network, so its answer is the same on every
+        replica. Credential resolution and the drift check are separate because
+        they can fail for reasons that have nothing to do with this request.
+        """
+
         tool = request.tool
         if tool.source != "mcp" or tool.mcp_server is None:
             raise RuntimeExecutionError("mcp_tool_source_invalid")
@@ -1194,13 +1244,22 @@ class GovernedMcpToolBroker(ToolBroker):
             and self._idempotency is None
         ):
             raise RuntimeExecutionError("mcp_idempotency_store_required")
-        credentials = await self._credentials(server)
-        await self._verify_tool_descriptor(request, server, credentials)
-        return _Authorization(server, grant, effective_risk, credentials)
+        return _PolicyDecision(server, grant, effective_risk)
+
+    async def _bind_transport(
+        self, request: ToolInvocationRequest, decision: _PolicyDecision
+    ) -> _Authorization:
+        """Resolve credentials and refuse a tool the server no longer matches."""
+
+        credentials = await self._credentials(decision.server)
+        await self._verify_tool_descriptor(request, decision.server, credentials)
+        return _Authorization(
+            decision.server, decision.grant, decision.effective_risk, credentials
+        )
 
     @staticmethod
     def _idempotency_key(
-        request: ToolInvocationRequest, authorization: _Authorization
+        request: ToolInvocationRequest, decision: _PolicyDecision
     ) -> str:
         identity = {
             "version": 1,
@@ -1209,7 +1268,7 @@ class GovernedMcpToolBroker(ToolBroker):
             "requestId": request.request_id,
             "callId": request.call_id,
             "agentId": request.agent_id,
-            "serverConnectionId": authorization.server.connection_id,
+            "serverConnectionId": decision.server.connection_id,
             "operation": request.tool.operation,
         }
         return "mcp1:" + hashlib.sha256(_canonical_json(identity)).hexdigest()
@@ -1221,7 +1280,7 @@ class GovernedMcpToolBroker(ToolBroker):
         phase: str,
         outcome: str,
         *,
-        authorization: Optional[_Authorization] = None,
+        authorization: Optional[_PolicyDecision] = None,
         argument_digest: Optional[str] = None,
         output_digest: Optional[str] = None,
         guarded_output_digest: Optional[str] = None,
@@ -1452,7 +1511,7 @@ class GovernedMcpToolBroker(ToolBroker):
         argument_digest: Optional[str] = None
         try:
             argument_digest = _digest(_canonical_json(request.arguments))
-            authorization = await self._authorize(request)
+            decision = self._authorize_policy(request)
         except RuntimeExecutionError as exc:
             await self._record(
                 self._event(
@@ -1460,6 +1519,27 @@ class GovernedMcpToolBroker(ToolBroker):
                     audit_reference,
                     "authorization",
                     "denied",
+                    argument_digest=argument_digest,
+                    reason=exc.code,
+                )
+            )
+            raise
+
+        idempotency_key = self._idempotency_key(request, decision)
+        await self._refuse_if_settled(
+            request, audit_reference, argument_digest, decision, idempotency_key
+        )
+
+        try:
+            authorization = await self._bind_transport(request, decision)
+        except RuntimeExecutionError as exc:
+            await self._record(
+                self._event(
+                    request,
+                    audit_reference,
+                    "authorization",
+                    "denied",
+                    authorization=decision,
                     argument_digest=argument_digest,
                     reason=exc.code,
                 )
@@ -1484,11 +1564,76 @@ class GovernedMcpToolBroker(ToolBroker):
             raise
         try:
             return await self._invoke_authorized(
-                request, audit_reference, argument_digest, authorization
+                request,
+                audit_reference,
+                argument_digest,
+                authorization,
+                idempotency_key,
             )
         finally:
             if limited:
                 self._limiter.release(limiter_key)
+
+    async def _refuse_if_settled(
+        self,
+        request: ToolInvocationRequest,
+        audit_reference: str,
+        argument_digest: Optional[str],
+        decision: _PolicyDecision,
+        idempotency_key: str,
+    ) -> None:
+        """Refuse a call the idempotency store has already settled.
+
+        This runs before credentials and the drift check because a settled call
+        is answered by the record alone: an earlier attempt may already have
+        reached the tool, and that is what the caller has to hear. Letting a
+        stale credential or an unreadable listing answer first would report a
+        retryable transport failure over a side effect that may have happened,
+        and retrying is the one thing the caller must not do.
+
+        Nothing is reserved here, so an authorization that goes on to be denied
+        leaves the key exactly as it found it. No tool is called on this path,
+        so the drift check has nothing left to protect.
+        """
+
+        if self._idempotency is None:
+            return
+        try:
+            status = await self._store_call(
+                self._idempotency.peek,
+                idempotency_key,
+                argument_digest or "",
+            )
+        except RuntimeExecutionError as exc:
+            await self._record(
+                self._event(
+                    request,
+                    audit_reference,
+                    "idempotency",
+                    "failed",
+                    authorization=decision,
+                    argument_digest=argument_digest,
+                    idempotency_key=idempotency_key,
+                    reason=exc.code,
+                )
+            )
+            raise
+        if status == "absent":
+            return
+        code = _SETTLED_CODES.get(status, "mcp_idempotency_state_invalid")
+        await self._record(
+            self._event(
+                request,
+                audit_reference,
+                "idempotency",
+                "denied",
+                authorization=decision,
+                argument_digest=argument_digest,
+                idempotency_key=idempotency_key,
+                reason=code,
+            )
+        )
+        raise RuntimeExecutionError(code)
 
     async def _invoke_authorized(
         self,
@@ -1496,8 +1641,8 @@ class GovernedMcpToolBroker(ToolBroker):
         audit_reference: str,
         argument_digest: Optional[str],
         authorization: _Authorization,
+        idempotency_key: str,
     ) -> ToolInvocationResult:
-        idempotency_key = self._idempotency_key(request, authorization)
         request_digest = argument_digest or ""
         if self._idempotency is not None:
             try:
@@ -1521,12 +1666,9 @@ class GovernedMcpToolBroker(ToolBroker):
                 )
                 raise
             if status != "acquired":
-                code = {
-                    "reserved": "mcp_tool_call_in_progress",
-                    "completed": "mcp_duplicate_tool_call",
-                    "indeterminate": "mcp_tool_call_indeterminate",
-                    "conflict": "mcp_idempotency_conflict",
-                }.get(status, "mcp_idempotency_state_invalid")
+                # A call settled between the consult and here: the reservation
+                # is still the authority on who holds the key.
+                code = _SETTLED_CODES.get(status, "mcp_idempotency_state_invalid")
                 await self._record(
                     self._event(
                         request,

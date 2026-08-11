@@ -535,6 +535,12 @@ def _runtime_config(
                     "stdioEnvironment": {},
                 }
             ],
+            # Pinned past the run's own duration. The certification asserts that
+            # a stale credential fails at the tool call and leaves an
+            # indeterminate reservation; a listing re-read that expired mid-run
+            # would fail earlier, before any reservation exists, and decide that
+            # assertion by how long the cluster took rather than by behaviour.
+            "toolDescriptors": {"cacheSeconds": 3600},
             "toolTimeoutSeconds": 5,
             "reservationTimeoutSeconds": 15,
         }

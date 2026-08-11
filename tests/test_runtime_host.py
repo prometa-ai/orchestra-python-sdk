@@ -2235,6 +2235,18 @@ def test_human_escalation_config_requires_a_reviewer_it_can_actually_reach(
     assert local_only.human_escalation_base_url is None
 
 
+def test_a_broker_without_tool_limits_gets_no_ceiling(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    document = _config_document()
+    document["mcpBroker"] = _mcp_broker_document()
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = load_runtime_host_config(path)
+
+    assert config.mcp_broker.policy.default_tool_limits is None
+    assert config.mcp_broker.tool_limits == {}
+
+
 def test_mcp_tool_limits_must_name_a_configured_grant(tmp_path) -> None:
     path = tmp_path / "config.json"
     document = _config_document()

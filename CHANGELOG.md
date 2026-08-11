@@ -52,7 +52,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   - `GET /readyz` has no authorization check, so it carries counts and booleans
     only — never the `leaseId`, the lease expiry, a subject, or the operator's
     free-text `reasonCode`. The authenticated `POST /v1/runtime/execute` denial
-    carries the full state.
+    carries the full state. `/readyz` is an operator view and no longer any
+    chart probe: all three now use `/healthz`, so a quarantined replica stays
+    routable and delivers that typed denial. Gating readiness on `/readyz`
+    would empty the Service under a fleet-wide quarantine and leave callers a
+    connection error indistinguishable from a crash, while adding no
+    enforcement — the probe and the denial read the same gate in the same
+    process, so a replica dishonest enough to admit quarantined work would
+    report itself ready.
   - After expiry a quarantine keeps applying — it must not be evadable by
     making the control plane unreachable — while a serving runtime keeps
     serving and reports its controls stale, because a control-plane outage must
@@ -114,7 +121,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `McpToolLimits`: per-tool sliding-window rate and in-flight ceilings, refused
   as `mcp_tool_rate_limited` / `mcp_tool_concurrency_limited` and audited under
   a `rate_limit` phase. These are per replica, and deliberately not derived
-  from the signed fleet-wide `rateLimitPerMin`, which stays inert.
+  from the signed fleet-wide `rateLimitPerMin`, which stays inert. They are
+  also opt-in: a tool is uncounted until `mcpBroker.toolLimits` states its
+  numbers. The counters key on the connection and the tool, so they aggregate
+  every request one replica serves at once rather than one agent's loop, and
+  the only number that separates an overrun from ordinary traffic is how much
+  concurrency the deployment admits. An assumed ceiling would refuse work the
+  replica had already accepted — the reference runtime's own two-replica
+  topology certification drives eight concurrent requests through one tool, so
+  a default of four in-flight calls denied it with
+  `mcp_tool_concurrency_limited`.
 - Two shipped `HumanEscalation` references, so the approval path is exercised
   end to end rather than only failing closed. `ControlPlaneHumanEscalation`
   opens and polls an approval request against the control plane's approval

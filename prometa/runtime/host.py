@@ -669,7 +669,10 @@ def _parse_mcp_host_config(value: Any) -> RuntimeHostMcpConfig:
         except ValueError:
             raise RuntimeHostError("mcp_tool_limits_invalid") from None
 
-    default_tool_limits = McpToolLimits()
+    # No ceiling unless the deployment states one: the counters aggregate every
+    # request a replica serves at once, so a number chosen here would refuse
+    # traffic the runtime had already accepted.
+    default_tool_limits: Optional[McpToolLimits] = None
     per_tool_limits: Dict[str, McpToolLimits] = {}
     if document.get("toolLimits") is not None:
         raw_limits = _mapping(document["toolLimits"], "mcp_tool_limits_invalid")

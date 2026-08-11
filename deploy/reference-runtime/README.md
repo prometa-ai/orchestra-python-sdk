@@ -132,10 +132,19 @@ Two optional sub-blocks harden the broker further:
 
 `toolLimits` bounds per-tool call rate and in-flight calls **within one
 replica**; N replicas admit N times these numbers, and distributed rate
-limiting stays with the tenant gateway. Every name under `perTool` must be a
-configured grant. `toolDescriptors.cacheSeconds` is how long a server's
-advertised tool listing is reused before drift is re-checked, and therefore the
-longest a swapped tool description can go unnoticed.
+limiting stays with the tenant gateway. Omit the block and no ceiling applies:
+the counters aggregate every request a replica serves at once, so a ceiling
+under this runtime's own request concurrency refuses ordinary traffic — size
+`maxConcurrentCalls` above the concurrency one replica accepts. Every name
+under `perTool` must be a configured grant.
+
+`toolDescriptors.cacheSeconds` is how long a server's advertised tool listing
+is reused before drift is re-checked, and therefore the longest a swapped tool
+description can go unnoticed. It also decides whether a credential the server
+has since rotated is caught by the listing re-read or by the tool call itself,
+which is the difference between a knowably-no-side-effect refusal and an
+indeterminate one.
+
 `requireSignedDigest: true` refuses any MCP tool whose signed declaration does
 not pin `mcpToolDescriptorDigest`. When a tool does pin it, the value is inside
 the signed configuration-digest projection — the same projection the control
@@ -202,11 +211,16 @@ live quarantine by arriving under a fresh lease stream.
 
 `GET /readyz` answers `503` while not admitting, but carries counts and
 booleans only — it is unauthenticated, so it never names the lease, its expiry,
-the subject, or the operator's reason. The chart's readiness probe uses
-`/readyz`, so a quarantined pod also leaves its Service endpoints. Its startup
-and liveness probes use `/healthz`, which keeps answering `200`: a pod that
-boots straight into a quarantine must be held out of service, not restarted
-into a crash loop, and it resumes the moment a `serving` lease arrives.
+the subject, or the operator's reason. It is an operator view, not a probe: all
+three chart probes use `/healthz`, so a quarantined pod keeps its Service
+endpoint and answers every request with the typed `503` and the full control
+state. Gating readiness on `/readyz` instead would empty the Service under a
+fleet-wide quarantine, and callers would get a connection error indistinguishable
+from a crash — the one outcome the typed refusal exists to prevent. It would add
+no enforcement either: the probe and the refusal both read the same gate in the
+same process, so a replica dishonest enough to admit quarantined work would
+report itself ready anyway. Holding a compromised replica out of service is a
+job for NetworkPolicy or the endpoint, not for that replica's own probe.
 
 Quarantine keeps applying after the lease expires, so it cannot be evaded by
 cutting the runtime off from the control plane. A `serving` runtime whose lease
@@ -808,8 +822,8 @@ synchronous control-plane calls and never includes keys or signed payloads.
 
 ## Request API
 
-- `GET /healthz`: process liveness;
-- `GET /readyz`: payload-free readiness;
+- `GET /healthz`: process liveness, and every chart probe;
+- `GET /readyz`: payload-free runtime-control state for operators;
 - `GET /v1/runtime/tasks/{requestId}`: authenticated payload-free lifecycle
   projection when task recovery is configured;
 - `POST /v1/runtime/execute`: bearer-authenticated execution.

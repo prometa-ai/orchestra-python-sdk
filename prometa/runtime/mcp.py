@@ -266,9 +266,10 @@ class McpToolGrant:
 class McpToolLimits:
     """Per-tool call-rate and in-flight ceilings for one runtime replica.
 
-    These are counted in this process only. A fleet of N replicas therefore
-    admits up to N times these numbers; size them per replica, and do not read
-    them as a tenant-wide quota.
+    These are counted in this process only, across every request the replica is
+    serving. A fleet of N replicas therefore admits up to N times these numbers;
+    size them against one replica's own request concurrency, not against a
+    tenant-wide quota, or ordinary traffic is refused as an overrun.
     """
 
     max_calls_per_window: int = 60
@@ -299,14 +300,16 @@ class McpBrokerPolicy:
     max_risk_level: str
     require_approval_for: FrozenSet[str] = frozenset({"write", "destructive"})
     require_idempotency_for: FrozenSet[str] = frozenset({"write", "destructive"})
-    default_tool_limits: McpToolLimits = field(default_factory=McpToolLimits)
+    default_tool_limits: Optional[McpToolLimits] = None
     require_signed_tool_descriptor_digest: bool = False
     tool_descriptor_cache_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         if self.max_risk_level not in _RISK_RANK:
             raise ValueError("unsupported MCP risk ceiling")
-        if not isinstance(self.default_tool_limits, McpToolLimits):
+        if self.default_tool_limits is not None and not isinstance(
+            self.default_tool_limits, McpToolLimits
+        ):
             raise ValueError("default_tool_limits must be McpToolLimits")
         if type(self.require_signed_tool_descriptor_digest) is not bool:
             raise ValueError("require_signed_tool_descriptor_digest must be a boolean")
@@ -836,13 +839,18 @@ class _McpToolLimiter:
     """In-process per-tool call-rate and in-flight ceilings.
 
     Deliberately not shared across replicas. A cross-replica limiter would put
-    a store in the tool path and turn its outage into a tool outage; the caps
-    that matter here bound a single looping agent inside one runtime.
+    a store in the tool path and turn its outage into a tool outage.
+
+    A tool with no limits configured is not counted at all. The counters key on
+    the connection and the tool, so they aggregate every request the replica is
+    serving concurrently, not one agent's loop; the only number that separates
+    an overrun from ordinary traffic is how much concurrency this deployment
+    admits, which is why no ceiling is assumed.
     """
 
     def __init__(
         self,
-        default_limits: McpToolLimits,
+        default_limits: Optional[McpToolLimits],
         overrides: Mapping[str, McpToolLimits],
         *,
         time_source=None,
@@ -854,11 +862,15 @@ class _McpToolLimiter:
         self._calls: Dict[Tuple[str, str], list] = {}
         self._inflight: Dict[Tuple[str, str], int] = {}
 
-    def limits_for(self, operation: str) -> McpToolLimits:
+    def limits_for(self, operation: str) -> Optional[McpToolLimits]:
         return self._overrides.get(operation, self._default)
 
-    def acquire(self, key: Tuple[str, str], operation: str) -> None:
+    def acquire(self, key: Tuple[str, str], operation: str) -> bool:
+        """Take one in-flight slot, and report whether one was taken."""
+
         limits = self.limits_for(operation)
+        if limits is None:
+            return False
         now = self._time()
         with self._lock:
             history = self._calls.setdefault(key, [])
@@ -873,6 +885,7 @@ class _McpToolLimiter:
                 raise RuntimeExecutionError("mcp_tool_concurrency_limited")
             history.append(now)
             self._inflight[key] = self._inflight.get(key, 0) + 1
+        return True
 
     def release(self, key: Tuple[str, str]) -> None:
         with self._lock:
@@ -1455,7 +1468,7 @@ class GovernedMcpToolBroker(ToolBroker):
 
         limiter_key = (authorization.server.connection_id, request.tool.operation)
         try:
-            self._limiter.acquire(limiter_key, request.tool.operation)
+            limited = self._limiter.acquire(limiter_key, request.tool.operation)
         except RuntimeExecutionError as exc:
             await self._record(
                 self._event(
@@ -1474,7 +1487,8 @@ class GovernedMcpToolBroker(ToolBroker):
                 request, audit_reference, argument_digest, authorization
             )
         finally:
-            self._limiter.release(limiter_key)
+            if limited:
+                self._limiter.release(limiter_key)
 
     async def _invoke_authorized(
         self,

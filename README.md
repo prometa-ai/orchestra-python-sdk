@@ -489,9 +489,14 @@ only the keys a tool actually has.
 `McpToolLimits` bounds per-tool call rate (sliding window) and in-flight calls,
 so a looping or compromised agent cannot call one tool without bound. Refusals
 are `mcp_tool_rate_limited` and `mcp_tool_concurrency_limited`, audited under a
-`rate_limit` phase. These counters are in-process: a fleet of N replicas admits
-up to N times these numbers, so size them per replica. They are not the signed
-`rateLimitPerMin`, which stays inert for that exact reason.
+`rate_limit` phase. These counters are in-process and key on the connection and
+the tool, so they aggregate every request one replica is serving at once: a
+fleet of N replicas admits up to N times these numbers, and a ceiling below a
+replica's own request concurrency refuses ordinary traffic rather than an
+overrun. There is therefore **no default ceiling** — a tool is uncounted until
+a deployment states its numbers, because only the deployment knows what
+concurrency it admits. They are not the signed `rateLimitPerMin`, which stays
+inert for that exact reason.
 
 `InMemoryMcpIdempotencyStore` and `InMemoryMcpAuditSink` are for tests and
 single-process development only. `PostgresMcpIdempotencyStore` and
@@ -857,7 +862,7 @@ changed activation identity, promotion-JTI reuse, or a bundle JTI bound to a
 different artifact digest fails closed. The host then serves:
 
 - `GET /healthz` for liveness;
-- `GET /readyz` for payload-free readiness;
+- `GET /readyz` for payload-free runtime-control state;
 - `GET /v1/runtime/tasks/{requestId}` for authenticated payload-free lifecycle
   replay when `taskRecovery` is configured;
 - `POST /v1/runtime/execute` for bounded bearer-authenticated JSON requests.
@@ -1081,6 +1086,11 @@ and answers `503` while not admitting:
 
 `quarantined` there is the *enforced* state, so an advisory lease naming this
 replica reports `false`: advisory enforces nothing.
+
+It is an operator view, not a probe. The reference chart points liveness,
+readiness and startup at `/healthz`, so a quarantined replica stays routable
+and every caller receives the typed refusal above instead of the connection
+error an emptied Service would give them.
 
 Enforcement is acknowledged back through the existing receipt outbox so desired
 and enforced state can be told apart per replica. **Every refresh acknowledges**,

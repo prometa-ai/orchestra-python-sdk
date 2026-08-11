@@ -702,8 +702,10 @@ def test_concurrent_calls_to_one_tool_are_bounded() -> None:
     class BlockingTransport(RecordingTransport):
         def __init__(self) -> None:
             super().__init__()
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
+            # Built in the coroutine below: before 3.10 an asyncio.Event binds
+            # to the running loop at construction, and there is none here.
+            self.started = None
+            self.release = None
 
         async def call_tool(self, server, operation, arguments, credentials, metadata):
             self.started.set()
@@ -712,30 +714,69 @@ def test_concurrent_calls_to_one_tool_are_bounded() -> None:
                 server, operation, arguments, credentials, metadata
             )
 
-    transport = BlockingTransport()
-    broker, _, audit = _broker(
-        transport=transport,
-        tool_limits={
-            "orders.lookup": McpToolLimits(
-                max_calls_per_window=100, window_seconds=60, max_concurrent_calls=1
-            )
-        },
-    )
-
     async def scenario():
+        transport = BlockingTransport()
+        transport.started = asyncio.Event()
+        transport.release = asyncio.Event()
+        broker, _, audit = _broker(
+            transport=transport,
+            tool_limits={
+                "orders.lookup": McpToolLimits(
+                    max_calls_per_window=100, window_seconds=60, max_concurrent_calls=1
+                )
+            },
+        )
         first = asyncio.ensure_future(broker.invoke(_request(call_id="call-first")))
         await transport.started.wait()
         with pytest.raises(RuntimeExecutionError) as caught:
             await broker.invoke(_request(call_id="call-second"))
         transport.release.set()
         await first
-        return caught.value.code
+        return caught.value.code, transport, audit
 
-    assert asyncio.run(scenario()) == "mcp_tool_concurrency_limited"
+    code, transport, audit = asyncio.run(scenario())
+    assert code == "mcp_tool_concurrency_limited"
     assert len(transport.calls) == 1
     assert [
         event.reason for event in audit.events if event.phase == "rate_limit"
     ] == ["mcp_tool_concurrency_limited"]
+
+
+def test_an_unconfigured_tool_carries_no_ceiling() -> None:
+    """A ceiling nobody sized would refuse the concurrency the replica accepts."""
+
+    class BlockingTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = None
+            self.release = None
+
+        async def call_tool(self, server, operation, arguments, credentials, metadata):
+            result = await super().call_tool(
+                server, operation, arguments, credentials, metadata
+            )
+            self.entered.release()
+            await self.release.wait()
+            return result
+
+    async def scenario():
+        transport = BlockingTransport()
+        transport.entered = asyncio.Semaphore(0)
+        transport.release = asyncio.Event()
+        broker, _, audit = _broker(transport=transport)
+        calls = [
+            asyncio.ensure_future(broker.invoke(_request(call_id="call-%d" % index)))
+            for index in range(8)
+        ]
+        for _ in calls:
+            await transport.entered.acquire()
+        transport.release.set()
+        await asyncio.gather(*calls)
+        return transport, audit
+
+    transport, audit = asyncio.run(scenario())
+    assert len(transport.calls) == 8
+    assert [event for event in audit.events if event.phase == "rate_limit"] == []
 
 
 def test_a_rate_denial_never_carries_arguments_or_credentials() -> None:
